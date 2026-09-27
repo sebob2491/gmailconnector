@@ -1,0 +1,153 @@
+# gmail-multi-mcp
+
+A Gmail connector (MCP server) for Claude that works with **several Gmail accounts at once**. It has
+the same tools as the built-in Gmail connector (`search_threads`, `get_thread`, `send_message`,
+`reply`, `forward`, drafts, labels, trash, spam, …). Each tool also takes an `account` argument, and
+there's a new `list_accounts` tool.
+
+```
+You:    Anything from my landlord this week, in either inbox?
+Claude: search_threads { query: "from:landlord newer_than:7d" }   → searches personal + work
+Claude: get_thread     { account: "personal", threadId: "…" }
+You:    Reply from my personal address saying Tuesday works.
+Claude: reply          { account: "personal", messageId: "…", body: "Tuesday works for me." }
+```
+
+## How multiple accounts work
+
+| Situation | Behaviour |
+|---|---|
+| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account and groups results by account. The returned `nextPageToken` continues every account at once. If one account fails, the others still return results. |
+| Any other tool with no `account` | Uses the only account if just one is linked, or the default (`accounts default …`). Otherwise the tool asks Claude to pick one. |
+| `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
+| IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
+| `account` values | The account's email address or an alias you pick (`work`, `personal`, …). |
+| Label arguments | Take label IDs **or** display names (e.g. `"Receipts"`), resolved per account. |
+
+### Differences from the built-in Gmail connector
+
+- New `list_accounts` tool, and an `account` argument on every tool.
+- `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
+- `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
+- `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
+- `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
+- `forward` re-attaches the original message's attachments.
+- The two legacy `apply_sensitive_*_label` tools are left out. `trash_*` and `mark_*_spam` cover them.
+
+## Setup
+
+You need Node.js 20 or newer. Setup has three parts: create a Google OAuth client (once), link each
+Gmail account (once per account), and add the server to Claude.
+
+### 1. Create a Google OAuth client (one time, about 5 minutes)
+
+Every Gmail account you link uses this one client.
+
+1. Go to <https://console.cloud.google.com/> and create a project (any name).
+2. Go to **APIs & Services → Library**, search for **Gmail API**, and click **Enable**.
+3. Go to **APIs & Services → OAuth consent screen** (called **Google Auth Platform** in newer consoles):
+   - User type **External**. Fill in an app name and your email.
+   - Under **Data access / Scopes**, add `https://www.googleapis.com/auth/gmail.modify`.
+   - Under **Audience**, click **Publish app** so the status reads **In production**.
+     If you leave it in **Testing**, Google expires your tokens every 7 days and you'd have to
+     re-link each account weekly. (In Testing you'd also have to add every Gmail address under
+     "Test users".) An unverified app is fine for personal use. When you link an account, Google shows
+     "Google hasn't verified this app": click **Advanced → Go to (app name)**.
+4. Go to **APIs & Services → Credentials → Create credentials → OAuth client ID**. Choose
+   application type **Desktop app**, then **Download JSON**.
+5. Save the downloaded file as `~/.config/gmail-multi-mcp/credentials.json`.
+   Instead, you can set the `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables, or
+   pass `--credentials /path/to/file.json` to `accounts add`.
+
+> Google Workspace (work/school) accounts: some admins block third-party apps. If linking fails
+> with "access blocked", ask your admin to allow the app's client ID. If your Cloud project is inside
+> that Workspace org, you can use user type **Internal** instead.
+
+### 2. Install and link your accounts
+
+```bash
+cd gmail-multi-connector
+npm install            # also builds dist/
+
+node dist/src/index.js accounts add --alias personal
+node dist/src/index.js accounts add --alias work
+node dist/src/index.js accounts list
+```
+
+`accounts add` opens Google's sign-in page. Pick the account to link and approve Gmail access.
+Repeat the command once for each account. If the browser is on another machine (for example over
+SSH), open the printed URL there. The last page will fail to load; copy that page's full URL
+(`http://127.0.0.1:…/?code=…`) and paste it into the terminal.
+
+Other account commands:
+
+```bash
+node dist/src/index.js accounts default work           # used by read tools when no account is given
+node dist/src/index.js accounts alias me@gmail.com home
+node dist/src/index.js accounts remove work            # unlinks and revokes the token
+```
+
+(Run `npm link` once if you'd rather type `gmail-multi-mcp` instead of `node dist/src/index.js`.)
+
+### 3. Add it to Claude
+
+**Claude Desktop:** edit `claude_desktop_config.json`, found under
+*Settings → Developer → Edit Config*. On macOS it's at `~/Library/Application Support/Claude/`,
+on Windows at `%APPDATA%\Claude\`. Add:
+
+```json
+{
+  "mcpServers": {
+    "gmail-multi": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/gmail-multi-connector/dist/src/index.js"]
+    }
+  }
+}
+```
+
+Then restart Claude Desktop.
+
+**Claude Code:**
+
+```bash
+claude mcp add --scope user gmail-multi -- node /ABSOLUTE/PATH/TO/gmail-multi-connector/dist/src/index.js
+```
+
+You can link more accounts at any time. The server picks them up without a restart.
+
+## Where things are stored
+
+- `~/.config/gmail-multi-mcp/accounts.json` holds each account's email, alias and **refresh token**.
+  The file is created with owner-only permissions (0600). Anyone who can read it can read and send
+  your mail, so treat it like a password. Set `GMAIL_MCP_CONFIG_DIR` to use another folder.
+- `~/.config/gmail-multi-mcp/credentials.json` holds your OAuth client.
+
+The only scope requested is `gmail.modify`: read, compose, send, label and trash. It can't
+permanently delete mail or change account settings. Revoke access at any time with
+`accounts remove`, or at <https://myaccount.google.com/permissions>.
+
+## Using it from claude.ai (web and mobile)
+
+This version runs locally, launched by Claude Desktop or Claude Code over stdio. To use it as a
+custom connector on claude.ai, it would need to run on a server with an HTTPS URL and its own OAuth
+login in front of it. That can be added on top of the same code, but it isn't included here.
+
+## Development
+
+```bash
+npm test        # builds, then runs the unit tests and the end-to-end MCP tests against a fake Gmail API
+npm run build
+```
+
+Code layout:
+
+| File | What it does |
+|---|---|
+| `src/index.ts` | CLI: `accounts …` subcommands, or runs the stdio server |
+| `src/server.ts` | MCP tool definitions and account routing (`account` → mailbox, fan-out across accounts) |
+| `src/mailbox.ts` | Gmail operations for one account: search, read, send, reply, forward, drafts, labels |
+| `src/gmailClient.ts` | Authenticated Gmail REST calls, token caching and refresh, retries |
+| `src/oauth.ts` | Google OAuth loopback flow with PKCE, token refresh and revoke |
+| `src/mime.ts`, `src/format.ts` | Building outgoing RFC 822 messages and turning Gmail API messages into tool output |
+| `src/accountStore.ts` | `accounts.json` persistence, aliases, default account |
