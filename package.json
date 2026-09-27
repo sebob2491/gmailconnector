@@ -16,17 +16,22 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "prepare": "npm run build",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "build:worker": "wrangler deploy --dry-run --outdir dist-worker",
+    "deploy": "wrangler deploy",
+    "test": "npm run build && npm run build:worker && node --test \"dist/test/*.test.js\"",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
+    "@cloudflare/workers-oauth-provider": "^1.1.0",
     "@modelcontextprotocol/sdk": "^1.30.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260927.1",
     "@types/node": "^26.6.3",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "wrangler": "^4.142.0"
   }
 }

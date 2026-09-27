@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { GmailClient } from "./gmailClient.js";
 import {
   METADATA_HEADERS,

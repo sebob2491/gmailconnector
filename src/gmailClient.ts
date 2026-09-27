@@ -1,5 +1,5 @@
-import type { LinkedAccount } from "./accountStore.js";
-import { AuthError, refreshAccessToken, type FetchLike, type OAuthClientConfig } from "./oauth.js";
+import type { LinkedAccount } from "./accounts.js";
+import { AuthError, defaultFetch, refreshAccessToken, type FetchLike, type OAuthClientConfig } from "./google.js";
 
 const API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me/";
 const UPLOAD_BASE = "https://gmail.googleapis.com/upload/gmail/v1/users/me/";
@@ -20,7 +20,9 @@ export class TokenProvider {
 
   constructor(
     private loadClient: () => Promise<OAuthClientConfig>,
-    private fetchImpl: FetchLike = fetch,
+    private fetchImpl: FetchLike = defaultFetch,
+    /** Tells the user how to re-link an account whose authorization was revoked. */
+    private relinkHint = "Re-link it with: gmail-multi-mcp accounts add",
   ) {}
 
   async get(account: LinkedAccount, forceRefresh = false): Promise<string> {
@@ -33,9 +35,7 @@ export class TokenProvider {
       return res.access_token;
     } catch (err) {
       if (err instanceof AuthError) {
-        throw new AuthError(
-          `Gmail account ${account.email}: ${err.message}. Re-link it with: gmail-multi-mcp accounts add`,
-        );
+        throw new AuthError(`Gmail account ${account.email}: ${err.message}. ${this.relinkHint}`);
       }
       throw err;
     }
@@ -56,7 +56,7 @@ export class GmailClient {
   constructor(
     readonly account: LinkedAccount,
     private tokens: TokenProvider,
-    private fetchImpl: FetchLike = fetch,
+    private fetchImpl: FetchLike = defaultFetch,
   ) {}
 
   get email(): string {

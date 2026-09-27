@@ -34,7 +34,71 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 - `forward` re-attaches the original message's attachments.
 - The two legacy `apply_sensitive_*_label` tools are left out. `trash_*` and `mark_*_spam` cover them.
 
-## Setup
+## Setup: hosted, for claude.ai on the web and phone
+
+The connector runs as a free Cloudflare Worker that deploys straight from this GitHub repo. You
+sign into it from claude.ai just like the built-in Gmail connector. Everything below works from a
+phone browser. It takes about 15 minutes, in three places: Cloudflare, Google Cloud, then Claude.
+
+### 1. Deploy to Cloudflare (about 5 minutes)
+
+1. Sign up at <https://dash.cloudflare.com/sign-up> (the free plan is enough).
+2. Go to **Workers & Pages → Create → Import a repository**. Connect GitHub and pick this repo.
+3. Fill in the form:
+   - **Project name:** `gmail-multi-mcp` (it must match `name` in `wrangler.jsonc`).
+   - **Root directory** (under *Advanced settings*): `gmail-multi-connector`
+   - **Deploy command:** `npx wrangler deploy` (the default). Leave the build command empty.
+   - **Branch:** the branch that contains this folder. Cloudflare uses your default branch unless
+     you change it under the Worker's *Settings → Build → Branch control*.
+4. Deploy. The first deploy creates the Worker's storage (a KV namespace) automatically.
+5. Open the Worker's URL, `https://gmail-multi-mcp.<your-subdomain>.workers.dev`. You'll see a
+   **setup page** that lists the exact URLs for the next steps, each with a Copy button.
+
+### 2. Create a Google OAuth client (about 8 minutes)
+
+Every Gmail account you link uses this one client. Google doesn't let anyone else create it for you.
+
+1. Go to <https://console.cloud.google.com/> and create a project (any name).
+2. Go to **APIs & Services → Library → Gmail API** and click **Enable**.
+3. Go to **Google Auth Platform** (also called *OAuth consent screen*):
+   - **Branding:** app name (e.g. "My Gmail connector") and your email.
+   - **Audience:** user type **External**, then **Publish app** so the status reads **In production**.
+     In *Testing*, Google expires logins every 7 days.
+   - **Data access:** add the scope `https://www.googleapis.com/auth/gmail.modify`.
+4. Go to **Clients → Create client**:
+   - Application type **Web application**.
+   - **Authorized redirect URIs:** paste the redirect URI from the setup page
+     (`https://gmail-multi-mcp.<your-subdomain>.workers.dev/google/callback`).
+   - Create, then copy the **Client ID** and **Client secret**.
+5. Back in Cloudflare, open your Worker → **Settings → Variables and Secrets → Add**. Add two
+   variables of type **Secret**: `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Then **Deploy**.
+
+Reload the setup page: step 1 should now show **✓ Done**.
+
+### 3. Add it to Claude and sign in (about 2 minutes)
+
+1. In claude.ai, go to **Customize → Connectors → Add custom connector**. Name it (e.g.
+   "Gmail (all accounts)") and paste the connector URL from the setup page (`…workers.dev/mcp`).
+2. Press **Connect**. You'll see a consent page. Press **Continue with Google** and sign in with
+   your main Gmail account. Google will warn "Google hasn't verified this app"; that's expected for
+   your own app. Tap **Advanced → Go to …** and allow Gmail access.
+3. On the account page, tap **＋ Link another Gmail account** for each extra inbox, then
+   **Done — connect to Claude**.
+
+You can add or remove accounts later at `…workers.dev/accounts`. Claude sees the change within a
+minute, without reconnecting.
+
+**Who can use it:** the first Google account that signs in becomes the owner. After that, only the
+owner or an already-linked account can sign in. Anyone else is turned away, and their token is
+revoked. To lock it down in advance, set a Worker variable `ALLOWED_EMAILS` (comma-separated).
+Tokens are only ever sent back to Claude (`claude.ai`, `claude.com`, or a local Claude app);
+override that with `ALLOWED_REDIRECT_HOSTS`.
+
+**If the first deploy fails to create storage:** in Cloudflare, go to **Storage & Databases → KV →
+Create** and make a namespace. Then under your Worker's **Settings → Bindings → Add → KV
+namespace**, name the binding `OAUTH_KV`, pick that namespace, and redeploy.
+
+## Setup: local, for Claude Desktop or Claude Code
 
 You need Node.js 20 or newer. Setup has three parts: create a Google OAuth client (once), link each
 Gmail account (once per account), and add the server to Claude.
@@ -67,7 +131,7 @@ Every Gmail account you link uses this one client.
 
 ```bash
 cd gmail-multi-connector
-npm install            # also builds dist/
+npm install && npm run build
 
 node dist/src/index.js accounts add --alias personal
 node dist/src/index.js accounts add --alias work
@@ -118,6 +182,13 @@ You can link more accounts at any time. The server picks them up without a resta
 
 ## Where things are stored
 
+**Hosted:** linked accounts and their Google refresh tokens live in the Worker's KV namespace in
+your Cloudflare account. The refresh tokens are useless without `GOOGLE_CLIENT_SECRET`, which is
+stored as an encrypted Worker secret. Claude's own tokens for the connector are stored only as
+hashes.
+
+**Local:**
+
 - `~/.config/gmail-multi-mcp/accounts.json` holds each account's email, alias and **refresh token**.
   The file is created with owner-only permissions (0600). Anyone who can read it can read and send
   your mail, so treat it like a password. Set `GMAIL_MCP_CONFIG_DIR` to use another folder.
@@ -127,27 +198,27 @@ The only scope requested is `gmail.modify`: read, compose, send, label and trash
 permanently delete mail or change account settings. Revoke access at any time with
 `accounts remove`, or at <https://myaccount.google.com/permissions>.
 
-## Using it from claude.ai (web and mobile)
-
-This version runs locally, launched by Claude Desktop or Claude Code over stdio. To use it as a
-custom connector on claude.ai, it would need to run on a server with an HTTPS URL and its own OAuth
-login in front of it. That can be added on top of the same code, but it isn't included here.
-
 ## Development
 
 ```bash
-npm test        # builds, then runs the unit tests and the end-to-end MCP tests against a fake Gmail API
-npm run build
+npm test        # builds both versions, then runs unit tests, MCP tests against a fake Gmail API,
+                # and an end-to-end run of the Worker in workerd (Cloudflare's runtime) with Google faked
+npm run build   # Node CLI → dist/
+npm run build:worker   # Worker bundle → dist-worker/ (a dry-run deploy)
 ```
 
 Code layout:
 
 | File | What it does |
 |---|---|
+| `worker/index.ts` | Cloudflare Worker entry: OAuth provider in front of a stateless MCP endpoint at `/mcp` |
+| `worker/routes.ts`, `worker/pages.ts` | Setup page, consent page, Google sign-in, and the account linking page |
+| `worker/owner.ts` | Account storage in KV, and who may sign in |
 | `src/index.ts` | CLI: `accounts …` subcommands, or runs the stdio server |
 | `src/server.ts` | MCP tool definitions and account routing (`account` → mailbox, fan-out across accounts) |
 | `src/mailbox.ts` | Gmail operations for one account: search, read, send, reply, forward, drafts, labels |
 | `src/gmailClient.ts` | Authenticated Gmail REST calls, token caching and refresh, retries |
 | `src/oauth.ts` | Google OAuth loopback flow with PKCE, token refresh and revoke |
 | `src/mime.ts`, `src/format.ts` | Building outgoing RFC 822 messages and turning Gmail API messages into tool output |
-| `src/accountStore.ts` | `accounts.json` persistence, aliases, default account |
+| `src/accounts.ts`, `src/accountStore.ts` | Account lookup (shared) and `accounts.json` persistence (local) |
+| `src/google.ts` | Google OAuth endpoints and token calls (shared by the CLI and the Worker) |

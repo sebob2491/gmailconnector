@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { AccountStore, describeAccount } from "./accountStore.js";
-import { loadOAuthClient, revokeToken, runInteractiveAuth } from "./oauth.js";
+import { TokenProvider } from "./gmailClient.js";
+import { fetchProfileEmail, loadOAuthClient, revokeToken, runInteractiveAuth } from "./oauth.js";
 import { createServer } from "./server.js";
 
 const HELP = `gmail-multi-mcp — a Gmail MCP connector that works with several Gmail accounts.
@@ -48,20 +49,16 @@ async function accountsCommand(args: string[]): Promise<void> {
       const noBrowser = bool(args, "--no-browser");
       const client = await loadOAuthClient(credentials);
       const auth = await runInteractiveAuth(client, { openBrowser: !noBrowser, log });
-      const profileRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-        headers: { Authorization: `Bearer ${auth.accessToken}` },
-      });
-      if (!profileRes.ok) throw new Error(`Could not read the Gmail profile (${profileRes.status}).`);
-      const profile = (await profileRes.json()) as { emailAddress: string };
+      const email = await fetchProfileEmail(auth.accessToken);
       await store.upsert({
-        email: profile.emailAddress,
+        email,
         alias,
         refreshToken: auth.refreshToken,
         scopes: auth.scopes,
         addedAt: new Date().toISOString(),
       });
       const all = await store.list();
-      log(`Linked ${profile.emailAddress}${alias ? ` as "${alias}"` : ""}. ${all.length} account(s) linked.`);
+      log(`Linked ${email}${alias ? ` as "${alias}"` : ""}. ${all.length} account(s) linked.`);
       if (all.length > 1) log(`Tip: run "gmail-multi-mcp accounts add" again to link another, or "accounts default" to pick a default.`);
       return;
     }
@@ -118,7 +115,7 @@ async function main(): Promise<void> {
   }
   if (cmd && cmd !== "serve") throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
 
-  const server = createServer();
+  const server = createServer({ store: new AccountStore(), tokens: new TokenProvider(() => loadOAuthClient()) });
   await server.connect(new StdioServerTransport());
   log("gmail-multi-mcp running on stdio");
 }

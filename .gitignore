@@ -2,3 +2,5 @@ node_modules/
 dist/
 credentials.json
 accounts.json
+dist-worker/
+.wrangler/

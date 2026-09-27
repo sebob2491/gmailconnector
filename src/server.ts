@@ -1,16 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import {
-  AccountError,
-  AccountStore,
-  describeAccount,
-  findAccount,
-  type LinkedAccount,
-} from "./accountStore.js";
+import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js";
+import { AccountError, describeAccount, findAccount, type AccountSource, type LinkedAccount } from "./accounts.js";
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
+import { defaultFetch, type FetchLike } from "./google.js";
 import { Mailbox } from "./mailbox.js";
-import { loadOAuthClient, type FetchLike } from "./oauth.js";
 
 export const SERVER_NAME = "gmail-multi";
 export const SERVER_VERSION = "0.1.0";
@@ -26,9 +21,10 @@ export class AccountRouter {
   private mailboxes = new Map<string, Mailbox>();
 
   constructor(
-    readonly store: AccountStore,
+    readonly store: AccountSource,
     private tokens: TokenProvider,
-    private fetchImpl: FetchLike = fetch,
+    private fetchImpl: FetchLike = defaultFetch,
+    private manageHint = LOCAL_MANAGE_HINT,
   ) {}
 
   private mailbox(account: LinkedAccount): Mailbox {
@@ -44,9 +40,7 @@ export class AccountRouter {
   private async load() {
     const data = await this.store.load();
     if (!data.accounts.length) {
-      throw new AccountError(
-        "No Gmail accounts are linked yet. In a terminal, run: gmail-multi-mcp accounts add  (once per Gmail account).",
-      );
+      throw new AccountError(`No Gmail accounts are linked yet. ${this.manageHint}`);
     }
     return data;
   }
@@ -229,19 +223,28 @@ const messageListVisibilityArg = z
 
 const SEARCH_QUERY_HELP = `Optional. Gmail search syntax, e.g. "from:alice@example.com", "subject:invoice newer_than:7d", "is:unread in:inbox", "has:attachment", "label:Receipts", "after:2026/01/01". Use OR and ( ) to broaden. Natural language must be converted to Gmail syntax first. Drafts are excluded unless the query mentions in:draft.`;
 
+export const LOCAL_MANAGE_HINT = "To link one, run in a terminal: gmail-multi-mcp accounts add  (once per Gmail account).";
+
 export interface ServerDeps {
-  store?: AccountStore;
+  /** Where linked accounts (and their refresh tokens) are read from. */
+  store: AccountSource;
+  tokens: TokenProvider;
   fetchImpl?: FetchLike;
-  tokens?: TokenProvider;
+  /** Tells the user how to link or remove accounts (differs between the CLI and the hosted connector). */
+  manageHint?: string;
+  jsonSchemaValidator?: jsonSchemaValidator;
 }
 
-export function createServer(deps: ServerDeps = {}): McpServer {
-  const fetchImpl = deps.fetchImpl ?? fetch;
-  const store = deps.store ?? new AccountStore();
-  const tokens = deps.tokens ?? new TokenProvider(() => loadOAuthClient(), fetchImpl);
-  const router = new AccountRouter(store, tokens, fetchImpl);
+export function createServer(deps: ServerDeps): McpServer {
+  const fetchImpl = deps.fetchImpl ?? defaultFetch;
+  const { store, tokens } = deps;
+  const manageHint = deps.manageHint ?? LOCAL_MANAGE_HINT;
+  const router = new AccountRouter(store, tokens, fetchImpl, manageHint);
 
-  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
+  const server = new McpServer(
+    { name: SERVER_NAME, version: SERVER_VERSION },
+    { instructions: INSTRUCTIONS, jsonSchemaValidator: deps.jsonSchemaValidator },
+  );
 
   const read = { readOnlyHint: true, openWorldHint: false } as const;
   const write = { readOnlyHint: false, destructiveHint: false, openWorldHint: false } as const;
@@ -255,7 +258,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
     {
       title: "List linked Gmail accounts",
       description:
-        "Lists the Gmail accounts linked to this connector, with their aliases and which one is the default. Use the email or alias as the `account` argument of other tools.",
+        "Lists the Gmail accounts linked to this connector, with their aliases and which one is the default. Use the email or alias as the `account` argument of other tools. The result also says how the user can link or remove accounts.",
       inputSchema: {},
       annotations: read,
     },
@@ -268,9 +271,7 @@ export function createServer(deps: ServerDeps = {}): McpServer {
             ...(a.alias ? { alias: a.alias } : {}),
             isDefault: data.defaultAccount ? a.email.toLowerCase() === data.defaultAccount.toLowerCase() : data.accounts.length === 1,
           })),
-          ...(data.accounts.length
-            ? {}
-            : { hint: "No accounts linked yet. Run `gmail-multi-mcp accounts add` in a terminal to link one." }),
+          manageAccounts: data.accounts.length ? manageHint : `No accounts linked yet. ${manageHint}`,
         };
       }),
   );

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { Buffer } from "node:buffer";
 
 export interface OutgoingAttachment {
   content: Buffer;
@@ -69,12 +69,14 @@ function addressHeader(name: string, addresses: string[]): string | undefined {
   return `${name}: ${addresses.join(`,${CRLF} `)}`;
 }
 
-function wrapBase64(buf: Buffer): string {
-  return (buf.toString("base64").match(/.{1,76}/g) ?? [""]).join(CRLF);
+function wrapBase64(bytes: Uint8Array): string {
+  const b64 = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+  return (b64.match(/.{1,76}/g) ?? [""]).join(CRLF);
 }
 
 function boundary(): string {
-  return `=_gmail_mcp_${randomBytes(12).toString("hex")}`;
+  const bytes = crypto.getRandomValues(new Uint8Array(12));
+  return `=_gmail_mcp_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function quoteParam(value: string): string {

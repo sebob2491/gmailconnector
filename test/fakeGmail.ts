@@ -106,6 +106,10 @@ export class FakeGmail {
   revoked = new Set<string>();
   expiredTokens = new Set<string>();
   tokenCalls = 0;
+  /** Authorization codes Google would hand to the redirect URI, mapped to the account that signed in. */
+  codes = new Map<string, string>();
+  codeExchanges: URLSearchParams[] = [];
+  revokeCalls: string[] = [];
 
   addMailbox(email: string, refreshToken: string): FakeMailbox {
     const mb: FakeMailbox = {
@@ -171,9 +175,29 @@ export class FakeGmail {
         headers: { "Content-Type": "application/json" },
       });
 
+    if (url.href === "https://oauth2.googleapis.com/revoke") {
+      const token = new URLSearchParams(String(init.body)).get("token")!;
+      this.revokeCalls.push(token);
+      this.revoked.add(token);
+      return json(200, {});
+    }
     if (url.href === "https://oauth2.googleapis.com/token") {
       this.tokenCalls++;
       const form = new URLSearchParams(String(init.body));
+      if (form.get("grant_type") === "authorization_code") {
+        this.codeExchanges.push(form);
+        const email = this.codes.get(form.get("code") ?? "");
+        const signedIn = this.mailboxes.find((m) => m.email === email);
+        if (!signedIn || !form.get("code_verifier")) return json(400, { error: "invalid_grant" });
+        this.codes.delete(form.get("code")!);
+        this.revoked.delete(signedIn.refreshToken);
+        return json(200, {
+          access_token: `at-${signedIn.email}-${this.tokenCalls}`,
+          refresh_token: signedIn.refreshToken,
+          expires_in: 3600,
+          scope: "https://www.googleapis.com/auth/gmail.modify",
+        });
+      }
       const mb = this.mailboxes.find((m) => m.refreshToken === form.get("refresh_token"));
       if (!mb || this.revoked.has(mb.refreshToken)) return json(400, { error: "invalid_grant" });
       return json(200, { access_token: `at-${mb.email}-${this.tokenCalls}`, expires_in: 3600 });
@@ -182,7 +206,10 @@ export class FakeGmail {
     const auth = new Headers(init.headers).get("Authorization") ?? "";
     const token = auth.replace(/^Bearer /, "");
     const mb = this.mailboxes.find((m) => token.startsWith(`at-${m.email}-`));
-    if (!mb || this.expiredTokens.has(token)) return json(401, { error: { message: "Invalid Credentials" } });
+    // Revoking a grant at Google also invalidates the access tokens issued from it.
+    if (!mb || this.expiredTokens.has(token) || this.revoked.has(mb.refreshToken)) {
+      return json(401, { error: { message: "Invalid Credentials" } });
+    }
 
     const prefix = url.pathname.startsWith("/upload/") ? "/upload/gmail/v1/users/me/" : "/gmail/v1/users/me/";
     const path = url.pathname.slice(prefix.length);

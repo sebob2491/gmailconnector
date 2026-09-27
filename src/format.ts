@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { htmlToText } from "./mime.js";
 
 /** Subset of the Gmail API Message resource we rely on. */

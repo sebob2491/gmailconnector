@@ -1,23 +1,20 @@
-import { createHash, randomBytes } from "node:crypto";
+/** Node-only parts of Google sign-in: loading the OAuth client file and the CLI loopback flow. */
 import { promises as fs } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { configDir } from "./accountStore.js";
+import {
+  AuthError,
+  buildAuthUrl,
+  exchangeCode,
+  pkceChallenge,
+  randomToken,
+  type FetchLike,
+  type LinkedTokens,
+  type OAuthClientConfig,
+} from "./google.js";
 
-export const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"];
-
-const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-export const TOKEN_URL = "https://oauth2.googleapis.com/token";
-const REVOKE_URL = "https://oauth2.googleapis.com/revoke";
-
-export type FetchLike = typeof fetch;
-
-export interface OAuthClientConfig {
-  clientId: string;
-  clientSecret: string;
-}
-
-export class AuthError extends Error {}
+export * from "./google.js";
 
 /**
  * Loads the Google OAuth client from GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET, or from a
@@ -45,56 +42,6 @@ export async function loadOAuthClient(credentialsPath?: string): Promise<OAuthCl
   return { clientId: client.client_id, clientSecret: client.client_secret };
 }
 
-export interface TokenResponse {
-  access_token: string;
-  expires_in: number;
-  refresh_token?: string;
-  scope?: string;
-}
-
-async function postForm(fetchImpl: FetchLike, url: string, form: Record<string, string>): Promise<Response> {
-  return fetchImpl(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams(form).toString(),
-  });
-}
-
-export async function refreshAccessToken(
-  client: OAuthClientConfig,
-  refreshToken: string,
-  fetchImpl: FetchLike = fetch,
-): Promise<TokenResponse> {
-  const res = await postForm(fetchImpl, TOKEN_URL, {
-    grant_type: "refresh_token",
-    refresh_token: refreshToken,
-    client_id: client.clientId,
-    client_secret: client.clientSecret,
-  });
-  const body = (await res.json().catch(() => ({}))) as Record<string, string>;
-  if (!res.ok) {
-    if (body.error === "invalid_grant") {
-      throw new AuthError("authorization expired or was revoked");
-    }
-    throw new AuthError(`token refresh failed (${res.status}): ${body.error_description ?? body.error ?? "unknown error"}`);
-  }
-  return body as unknown as TokenResponse;
-}
-
-export async function revokeToken(token: string, fetchImpl: FetchLike = fetch): Promise<void> {
-  await postForm(fetchImpl, REVOKE_URL, { token }).catch(() => undefined);
-}
-
-function base64url(buf: Buffer): string {
-  return buf.toString("base64url");
-}
-
-export interface InteractiveAuthResult {
-  refreshToken: string;
-  accessToken: string;
-  scopes: string[];
-}
-
 /**
  * Runs the OAuth "installed app" flow: starts a loopback listener, sends the user to Google's
  * consent screen, and exchanges the returned code (with PKCE) for a refresh token.
@@ -103,11 +50,9 @@ export interface InteractiveAuthResult {
 export async function runInteractiveAuth(
   client: OAuthClientConfig,
   opts: { openBrowser: boolean; loginHint?: string; log: (msg: string) => void; fetchImpl?: FetchLike },
-): Promise<InteractiveAuthResult> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
-  const verifier = base64url(randomBytes(48));
-  const challenge = base64url(createHash("sha256").update(verifier).digest());
-  const state = base64url(randomBytes(16));
+): Promise<LinkedTokens> {
+  const verifier = randomToken(48);
+  const state = randomToken(16);
 
   let resolveCode!: (value: string) => void;
   let rejectCode!: (err: Error) => void;
@@ -141,26 +86,20 @@ export async function runInteractiveAuth(
   const port = (server.address() as { port: number }).port;
   const redirectUri = `http://127.0.0.1:${port}`;
 
-  const authUrl = new URL(AUTH_URL);
-  authUrl.search = new URLSearchParams({
-    client_id: client.clientId,
-    redirect_uri: redirectUri,
-    response_type: "code",
-    scope: GMAIL_SCOPES.join(" "),
-    access_type: "offline",
-    prompt: "consent select_account",
-    code_challenge: challenge,
-    code_challenge_method: "S256",
+  const authUrl = buildAuthUrl({
+    clientId: client.clientId,
+    redirectUri,
     state,
-    ...(opts.loginHint ? { login_hint: opts.loginHint } : {}),
-  }).toString();
+    codeChallenge: await pkceChallenge(verifier),
+    loginHint: opts.loginHint,
+  });
 
   opts.log(`\nOpen this URL in a browser and sign in with the Gmail account you want to link:\n\n  ${authUrl}\n`);
   opts.log(
     `Waiting for Google to redirect back to ${redirectUri} ...\n` +
       `(If your browser is on another machine, paste the full URL it ends up on here and press Enter.)\n`,
   );
-  if (opts.openBrowser) openInBrowser(authUrl.toString());
+  if (opts.openBrowser) openInBrowser(authUrl);
 
   const onStdin = (chunk: Buffer) => {
     const text = chunk.toString().trim();
@@ -185,26 +124,7 @@ export async function runInteractiveAuth(
     process.stdin.pause();
   }
 
-  const res = await postForm(fetchImpl, TOKEN_URL, {
-    grant_type: "authorization_code",
-    code,
-    client_id: client.clientId,
-    client_secret: client.clientSecret,
-    redirect_uri: redirectUri,
-    code_verifier: verifier,
-  });
-  const body = (await res.json()) as TokenResponse & { error?: string; error_description?: string };
-  if (!res.ok) throw new AuthError(`Code exchange failed: ${body.error_description ?? body.error ?? res.status}`);
-  if (!body.refresh_token) {
-    throw new AuthError(
-      "Google did not return a refresh token. Remove the app from https://myaccount.google.com/permissions and try again.",
-    );
-  }
-  const scopes = body.scope ? body.scope.split(" ") : GMAIL_SCOPES;
-  if (!GMAIL_SCOPES.every((s) => scopes.includes(s))) {
-    throw new AuthError("Gmail access was not granted. Make sure to tick the Gmail permission on the consent screen.");
-  }
-  return { refreshToken: body.refresh_token, accessToken: body.access_token, scopes };
+  return exchangeCode(client, { code, redirectUri, codeVerifier: verifier }, opts.fetchImpl);
 }
 
 function openInBrowser(url: string): void {
