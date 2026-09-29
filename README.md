@@ -43,13 +43,11 @@ phone browser. It takes about 15 minutes, in three places: Cloudflare, Google Cl
 ### 1. Deploy to Cloudflare (about 5 minutes)
 
 1. Sign up at <https://dash.cloudflare.com/sign-up> (the free plan is enough).
-2. Go to **Workers & Pages → Create → Import a repository**. Connect GitHub and pick this repo.
+2. Go to **Workers & Pages → Create → Import a repository**. Connect GitHub and pick
+   `gmailconnector`.
 3. Fill in the form:
    - **Project name:** `gmail-multi-mcp` (it must match `name` in `wrangler.jsonc`).
-   - **Root directory** (under *Advanced settings*): `gmail-multi-connector`
    - **Deploy command:** `npx wrangler deploy` (the default). Leave the build command empty.
-   - **Branch:** the branch that contains this folder. Cloudflare uses your default branch unless
-     you change it under the Worker's *Settings → Build → Branch control*.
 4. Deploy. The first deploy creates the Worker's storage (a KV namespace) automatically.
 5. Open the Worker's URL, `https://gmail-multi-mcp.<your-subdomain>.workers.dev`. You'll see a
    **setup page** that lists the exact URLs for the next steps, each with a Copy button.
@@ -130,7 +128,8 @@ Every Gmail account you link uses this one client.
 ### 2. Install and link your accounts
 
 ```bash
-cd gmail-multi-connector
+git clone https://github.com/sebob2491/gmailconnector
+cd gmailconnector
 npm install && npm run build
 
 node dist/src/index.js accounts add --alias personal
@@ -164,7 +163,7 @@ on Windows at `%APPDATA%\Claude\`. Add:
   "mcpServers": {
     "gmail-multi": {
       "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/gmail-multi-connector/dist/src/index.js"]
+      "args": ["/ABSOLUTE/PATH/TO/gmailconnector/dist/src/index.js"]
     }
   }
 }
@@ -175,7 +174,7 @@ Then restart Claude Desktop.
 **Claude Code:**
 
 ```bash
-claude mcp add --scope user gmail-multi -- node /ABSOLUTE/PATH/TO/gmail-multi-connector/dist/src/index.js
+claude mcp add --scope user gmail-multi -- node /ABSOLUTE/PATH/TO/gmailconnector/dist/src/index.js
 ```
 
 You can link more accounts at any time. The server picks them up without a restart.

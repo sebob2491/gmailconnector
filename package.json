@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "MCP connector for Gmail that can link and use multiple Gmail accounts at once.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sebob2491/gmailconnector.git"
+  },
   "type": "module",
   "bin": {
     "gmail-multi-mcp": "dist/src/index.js"
