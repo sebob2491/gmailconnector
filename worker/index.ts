@@ -19,7 +19,8 @@ const tokenProviders = new Map<string, TokenProvider>();
 
 function tokenProviderFor(env: Env, origin: string): TokenProvider {
   const client = googleClient(env);
-  const key = `${origin}\n${client?.clientId ?? ""}`;
+  // Keyed by the client secret too, so rotating it takes effect without waiting for a new isolate.
+  const key = `${origin}\n${client?.clientId ?? ""}\n${client?.clientSecret ?? ""}`;
   let provider = tokenProviders.get(key);
   if (!provider) {
     provider = new TokenProvider(

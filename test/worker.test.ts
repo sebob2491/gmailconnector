@@ -66,6 +66,14 @@ before(async () => {
   const personal = fake.addMailbox(PERSONAL, "rt-personal");
   const work = fake.addMailbox(WORK, "rt-work");
   fake.addMailbox(STRANGER, "rt-stranger");
+  for (let i = 3; i <= 5; i++) {
+    const mb = fake.addMailbox(`extra${i}@example.com`, `rt-extra${i}`);
+    for (let t = 0; t < 20; t++) {
+      fake.deliver(mb, crlf([`From: s${t}@example.com`, `To: extra${i}@example.com`, `Subject: T${t}`, "", "x"]), {
+        threadId: `x${i}-${t}`,
+      });
+    }
+  }
   fake.deliver(
     personal,
     crlf(["From: Alice <alice@example.com>", `To: ${PERSONAL}`, "Subject: Lunch?", "Content-Type: text/plain", "", "Lunch Thursday?"]),
@@ -133,6 +141,7 @@ function authorizeUrl(clientId: string, challenge: string, redirectUri = CLAUDE_
 }
 
 let accessToken = "";
+let firstClientId = "";
 let mcpId = 0;
 async function mcp(method: string, params: Record<string, unknown> = {}, token = accessToken) {
   const res = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
@@ -162,6 +171,35 @@ async function callTool(name: string, args: Record<string, unknown> = {}) {
   return { isError: Boolean(res.result.isError), text, json };
 }
 
+/** Runs Claude's whole connect flow as the owner and returns the new access token. */
+async function connectAsOwner(clientId: string): Promise<string> {
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  const browser = new Browser(mf);
+  const consent = await browser.fetch(authorizeUrl(clientId, challenge));
+  const toGoogle = await browser.fetch("/authorize", { form: { handle: field(consent.text, "handle"), decision: "approve" } });
+  const back = await browser.googleSignIn(toGoogle.location, fake, PERSONAL);
+  assert.equal(back.status, 303, back.text);
+  const page = await browser.fetch("/accounts");
+  const done = await browser.fetch("/accounts/done", { form: { csrf: field(page.text, "csrf") } });
+  const code = new URL(done.location).searchParams.get("code")!;
+  const res = await mf.dispatchFetch(`${ORIGIN}/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: CLAUDE_CALLBACK,
+      client_id: clientId,
+      code_verifier: verifier,
+      resource: `${ORIGIN}/mcp`,
+    }).toString(),
+  });
+  const tokens = (await res.json()) as any;
+  assert.equal(res.status, 200, JSON.stringify(tokens));
+  return tokens.access_token;
+}
+
 describe("hosted connector (Cloudflare Worker)", () => {
   test("setup page shows the URLs to paste into Google and Claude", async () => {
     const res = await new Browser(mf).fetch("/");
@@ -186,6 +224,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
 
   test("connecting from Claude: consent, Google sign-in for two accounts, then tokens", async () => {
     const clientId = await registerClient();
+    firstClientId = clientId;
     const verifier = randomBytes(32).toString("base64url");
     const challenge = createHash("sha256").update(verifier).digest("base64url");
     const browser = new Browser(mf);
@@ -295,6 +334,59 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(accounts.json.accounts.length, 2);
   });
 
+  test("a linked account that isn't the owner can't sign in", async () => {
+    const browser = new Browser(mf);
+    const back = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, WORK);
+    assert.equal(back.status, 403);
+    assert.match(back.text, /Sign in with the Google account that set it up/);
+    assert.ok(!fake.revokeCalls.includes("rt-work"), "revoking would also break the linked work account");
+    assert.equal((await callTool("list_accounts")).json.accounts.length, 2, "the work account stays linked");
+    assert.equal((await callTool("search_threads", { account: WORK })).isError, false);
+  });
+
+  test("a refused sign-in while connecting can go back to Claude", async () => {
+    const browser = new Browser(mf);
+    const consent = await browser.fetch(authorizeUrl(firstClientId, "y".repeat(43)));
+    const toGoogle = await browser.fetch("/authorize", { form: { handle: field(consent.text, "handle"), decision: "approve" } });
+    const refused = await browser.googleSignIn(toGoogle.location, fake, STRANGER);
+    assert.equal(refused.status, 403);
+    assert.match(refused.text, /Back to Claude/);
+    const back = await browser.fetch("/accounts/cancel", { form: { csrf: field(refused.text, "csrf") } });
+    assert.equal(back.status, 302);
+    const url = new URL(back.location);
+    assert.equal(url.origin + url.pathname, CLAUDE_CALLBACK);
+    assert.equal(url.searchParams.get("error"), "access_denied");
+  });
+
+  test("connecting again doesn't disconnect an earlier connection", async () => {
+    const second = await connectAsOwner(firstClientId);
+    assert.notEqual(second, accessToken);
+    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 29, "first connection still works");
+    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 29);
+  });
+
+  test("searching five linked accounts stays under Cloudflare's 50-call limit", async () => {
+    const browser = new Browser(mf);
+    await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
+    for (let i = 3; i <= 5; i++) {
+      const page = await browser.fetch("/accounts");
+      const toGoogle = await browser.fetch("/accounts/link", { form: { csrf: field(page.text, "csrf") } });
+      assert.equal((await browser.googleSignIn(toGoogle.location, fake, `extra${i}@example.com`)).status, 303);
+    }
+    fake.outboundCalls = 0;
+    const res = await callTool("search_threads", {});
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.accounts.length, 5);
+    assert.ok(res.json.accounts.every((a: any) => !a.error), res.text);
+    assert.ok(fake.outboundCalls <= 50, `made ${fake.outboundCalls} outbound calls`);
+    // Unlink the extra accounts again for the tests below.
+    for (let i = 3; i <= 5; i++) {
+      const page = await browser.fetch("/accounts");
+      await browser.fetch("/accounts/remove", { form: { csrf: field(page.text, "csrf"), email: `extra${i}@example.com` } });
+    }
+    assert.equal((await callTool("list_accounts")).json.accounts.length, 2);
+  });
+
   test("a Google redirect replayed in another browser is refused", async () => {
     const victim = new Browser(mf);
     const toGoogle = await victim.fetch("/accounts");
@@ -311,6 +403,17 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(res.text, /only works with Claude/);
   });
 
+  test("request errors are never redirected to a site that isn't Claude", async () => {
+    const evilClient = await registerClient("https://evil.example/callback");
+    const url = authorizeUrl(evilClient, "x".repeat(43), "https://evil.example/callback").replace(
+      "response_type=code",
+      "response_type=token",
+    );
+    const res = await new Browser(mf).fetch(url);
+    assert.notEqual(res.status, 302);
+    assert.doesNotMatch(res.location, /evil\.example/);
+  });
+
   test("account-page forms need the session's CSRF token", async () => {
     const browser = new Browser(mf);
     const back = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
@@ -322,7 +425,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
 
   test("the owner can remove an account later from /accounts", async () => {
     const browser = new Browser(mf);
-    const back = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, WORK);
+    const back = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
     assert.equal(back.status, 303, back.text);
     const page = await browser.fetch("/accounts");
     assert.doesNotMatch(page.text, /Done — connect/);
@@ -339,5 +442,26 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(res.isError, true);
     assert.match(res.text, new RegExp(`Re-link it at ${ORIGIN}/accounts`));
     fake.revoked.delete("rt-personal");
+  });
+
+  test("signing in doesn't re-link an account that was removed", async () => {
+    const browser = new Browser(mf);
+    await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
+    let page = await browser.fetch("/accounts");
+    await browser.fetch("/accounts/remove", { form: { csrf: field(page.text, "csrf"), email: PERSONAL } });
+    assert.deepEqual((await callTool("list_accounts")).json.accounts, []);
+
+    // The owner signs in again just to manage accounts: that must not bring the account back.
+    const again = new Browser(mf);
+    const back = await again.googleSignIn((await again.fetch("/accounts")).location, fake, PERSONAL);
+    assert.equal(back.status, 303);
+    page = await again.fetch(back.location);
+    assert.match(page.text, /isn(&#39;|')t linked/);
+    assert.deepEqual((await callTool("list_accounts")).json.accounts, []);
+
+    // Linking it on purpose works.
+    const toGoogle = await again.fetch("/accounts/link", { form: { csrf: field(page.text, "csrf") } });
+    assert.equal((await again.googleSignIn(toGoogle.location, fake, PERSONAL)).status, 303);
+    assert.deepEqual((await callTool("list_accounts")).json.accounts.map((a: any) => a.email), [PERSONAL]);
   });
 });

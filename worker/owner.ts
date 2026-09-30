@@ -72,45 +72,55 @@ export function redirectHostAllowed(env: Env, redirectUri: string): boolean {
   }
 }
 
-export type SignInResult = { ok: true; rec: OwnerRecord; claimed: boolean } | { ok: false; message: string };
+export type SignInResult =
+  | { ok: true; rec: OwnerRecord; claimed: boolean; linked: boolean }
+  | { ok: false; message: string; linked: boolean };
 
 /**
- * Applies a successful Google sign-in. The first sign-in of a browser session must be the owner, an
- * already-linked account, or listed in ALLOWED_EMAILS; after that, any account can be linked.
+ * Applies a successful Google sign-in.
+ * - `purpose: "signin"` authenticates a browser session. Only the owner (the first account ever to
+ *   sign in) or an address in ALLOWED_EMAILS may do this; being a linked account is not enough, so
+ *   someone with access to one linked inbox (e.g. a work admin) can't reach the others. Signing in
+ *   refreshes that account's token if it is linked, but never re-adds an account that was removed.
+ * - `purpose: "link"` (only from an already authenticated session) adds or refreshes an account.
  */
 export async function recordSignIn(
   env: Env,
   email: string,
   tokens: LinkedTokens,
-  sessionAuthenticated: boolean,
+  purpose: "signin" | "link",
 ): Promise<SignInResult> {
   const rec = await loadOwner(env.OAUTH_KV);
   const allowed = allowedEmails(env);
   const listed = allowed.some((a) => sameEmail(a, email));
+  // Revoking any token of an account at Google ends the whole grant, including the refresh token
+  // stored for a linked account, so callers must only revoke when this is false.
+  const alreadyLinked = rec.accounts.some((a) => sameEmail(a.email, email));
   let claimed = false;
-  if (!sessionAuthenticated) {
+  if (purpose === "signin") {
     if (!rec.owner) {
       if (allowed.length && !listed) {
-        return { ok: false, message: `${email} is not in this connector's ALLOWED_EMAILS list.` };
+        return { ok: false, message: `${email} is not in this connector's ALLOWED_EMAILS list.`, linked: alreadyLinked };
       }
       rec.owner = email;
       claimed = true;
-    } else {
-      const known = sameEmail(rec.owner, email) || rec.accounts.some((a) => sameEmail(a.email, email));
-      if (!known && !listed) {
-        return {
-          ok: false,
-          message: `This connector belongs to someone else. Sign in with a Google account that is already linked to it.`,
-        };
-      }
+    } else if (!sameEmail(rec.owner, email) && !listed) {
+      return {
+        ok: false,
+        message: `This connector belongs to someone else. Sign in with the Google account that set it up.`,
+        linked: alreadyLinked,
+      };
     }
   }
-  upsertAccount(rec, {
-    email,
-    refreshToken: tokens.refreshToken,
-    scopes: tokens.scopes,
-    addedAt: new Date().toISOString(),
-  });
-  await saveOwner(env.OAUTH_KV, rec);
-  return { ok: true, rec, claimed };
+  const link = purpose === "link" || claimed || alreadyLinked;
+  if (link) {
+    upsertAccount(rec, {
+      email,
+      refreshToken: tokens.refreshToken,
+      scopes: tokens.scopes,
+      addedAt: new Date().toISOString(),
+    });
+  }
+  if (link || claimed) await saveOwner(env.OAUTH_KV, rec);
+  return { ok: true, rec, claimed, linked: link };
 }

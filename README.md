@@ -18,10 +18,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 | Situation | Behaviour |
 |---|---|
 | `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account and groups results by account. The returned `nextPageToken` continues every account at once. If one account fails, the others still return results. |
-| Any other tool with no `account` | Uses the only account if just one is linked, or the default (`accounts default …`). Otherwise the tool asks Claude to pick one. |
+| Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
 | IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
-| `account` values | The account's email address or an alias you pick (`work`, `personal`, …). |
+| `account` values | The account's email address. The local version also accepts an alias you pick (`work`, `personal`, …). |
 | Label arguments | Take label IDs **or** display names (e.g. `"Receipts"`), resolved per account. |
 
 ### Differences from the built-in Gmail connector
@@ -87,10 +87,20 @@ You can add or remove accounts later at `…workers.dev/accounts`. Claude sees t
 minute, without reconnecting.
 
 **Who can use it:** the first Google account that signs in becomes the owner. After that, only the
-owner or an already-linked account can sign in. Anyone else is turned away, and their token is
-revoked. To lock it down in advance, set a Worker variable `ALLOWED_EMAILS` (comma-separated).
-Tokens are only ever sent back to Claude (`claude.ai`, `claude.com`, or a local Claude app);
-override that with `ALLOWED_REDIRECT_HOSTS`.
+owner can sign in. Linked accounts can't, so someone with access to one of your linked inboxes
+(for example a work admin) can't use it to reach the others. Anyone else is turned away. Signing in
+only proves who you are: it never re-adds an account you removed; use **Link** for that.
+
+To lock it down in advance, or to let more of your own addresses sign in, add a variable
+`ALLOWED_EMAILS` (comma-separated) under the Worker's **Settings → Variables and Secrets**. Tokens
+are only ever sent back to Claude (`claude.ai`, `claude.com`, or a local Claude app); override that
+with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the dashboard are kept when the Worker
+redeploys.
+
+**Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
+batches Gmail calls to stay well inside that (searching five inboxes takes about 15 calls). If
+Claude ever reports errors like "exceeded CPU" or "too many subrequests", switch the Worker to the
+Workers Paid plan ($5/month), which raises both limits.
 
 **If the first deploy fails to create storage:** in Cloudflare, go to **Storage & Databases → KV →
 Create** and make a namespace. Then under your Worker's **Settings → Bindings → Add → KV
@@ -98,7 +108,7 @@ namespace**, name the binding `OAUTH_KV`, pick that namespace, and redeploy.
 
 ## Setup: local, for Claude Desktop or Claude Code
 
-You need Node.js 20 or newer. Setup has three parts: create a Google OAuth client (once), link each
+You need Node.js 22 or newer. Setup has three parts: create a Google OAuth client (once), link each
 Gmail account (once per account), and add the server to Claude.
 
 ### 1. Create a Google OAuth client (one time, about 5 minutes)
@@ -119,7 +129,8 @@ Every Gmail account you link uses this one client.
    application type **Desktop app**, then **Download JSON**.
 5. Save the downloaded file as `~/.config/gmail-multi-mcp/credentials.json`.
    Instead, you can set the `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables, or
-   pass `--credentials /path/to/file.json` to `accounts add`.
+   pass `--credentials /path/to/file.json` to `accounts add`. Either way, `accounts add` saves the
+   client to that `credentials.json` so the server Claude launches can find it.
 
 > Google Workspace (work/school) accounts: some admins block third-party apps. If linking fails
 > with "access blocked", ask your admin to allow the app's client ID. If your Cloud project is inside

@@ -17,7 +17,15 @@ export interface OAuthClientConfig {
   clientSecret: string;
 }
 
-export class AuthError extends Error {}
+export class AuthError extends Error {
+  constructor(
+    message: string,
+    /** Google's OAuth error code, e.g. "invalid_grant" when a refresh token was revoked or expired. */
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
 
 export interface TokenResponse {
   access_token: string;
@@ -48,15 +56,32 @@ export async function refreshAccessToken(
   const body = (await res.json().catch(() => ({}))) as Record<string, string>;
   if (!res.ok) {
     if (body.error === "invalid_grant") {
-      throw new AuthError("authorization expired or was revoked");
+      throw new AuthError("authorization expired or was revoked", "invalid_grant");
     }
-    throw new AuthError(`token refresh failed (${res.status}): ${body.error_description ?? body.error ?? "unknown error"}`);
+    if (body.error === "invalid_client" || body.error === "unauthorized_client") {
+      throw new AuthError(
+        `Google rejected the OAuth client (${body.error}); check GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET`,
+        body.error,
+      );
+    }
+    throw new AuthError(
+      `token refresh failed (${res.status}): ${body.error_description ?? body.error ?? "unknown error"}`,
+      body.error,
+    );
   }
   return body as unknown as TokenResponse;
 }
 
-export async function revokeToken(token: string, fetchImpl: FetchLike = defaultFetch): Promise<void> {
-  await postForm(fetchImpl, REVOKE_URL, { token }).catch(() => undefined);
+/** Revokes a Google token. Returns false if Google didn't confirm (network error or an error status). */
+export async function revokeToken(token: string, fetchImpl: FetchLike = defaultFetch): Promise<boolean> {
+  try {
+    const res = await postForm(fetchImpl, REVOKE_URL, { token });
+    await res.body?.cancel();
+    // 400 invalid_token means it was already revoked or expired, which is also the goal.
+    return res.ok || res.status === 400;
+  } catch {
+    return false;
+  }
 }
 
 export function base64url(bytes: Uint8Array): string {

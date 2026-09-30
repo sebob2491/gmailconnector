@@ -24,7 +24,7 @@ export async function loadOAuthClient(credentialsPath?: string): Promise<OAuthCl
   if (!credentialsPath && process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
     return { clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET };
   }
-  const file = credentialsPath ?? process.env.GMAIL_MCP_CREDENTIALS ?? path.join(configDir(), "credentials.json");
+  const file = credentialsPath ?? defaultCredentialsPath();
   let raw: string;
   try {
     raw = await fs.readFile(file, "utf8");
@@ -40,6 +40,29 @@ export async function loadOAuthClient(credentialsPath?: string): Promise<OAuthCl
     throw new AuthError(`${file} does not look like a Google OAuth client file (missing client_id/client_secret).`);
   }
   return { clientId: client.client_id, clientSecret: client.client_secret };
+}
+
+export function defaultCredentialsPath(): string {
+  return process.env.GMAIL_MCP_CREDENTIALS ?? path.join(configDir(), "credentials.json");
+}
+
+/**
+ * Saves the OAuth client where the MCP server looks for it, so a client given with --credentials or
+ * environment variables also works when Claude launches the server (without the user's shell env).
+ * Returns the path written, or undefined if that file already held this client.
+ */
+export async function persistOAuthClient(client: OAuthClientConfig): Promise<string | undefined> {
+  const file = defaultCredentialsPath();
+  try {
+    const current = await loadOAuthClient(file);
+    if (current.clientId === client.clientId && current.clientSecret === client.clientSecret) return undefined;
+  } catch {
+    /* missing or unreadable: write it */
+  }
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const body = { installed: { client_id: client.clientId, client_secret: client.clientSecret } };
+  await fs.writeFile(file, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+  return file;
 }
 
 /**
@@ -74,7 +97,7 @@ export async function runInteractiveAuth(
       return "State mismatch. You can close this tab and try again.";
     }
     resolveCode(code);
-    return "Account linked. You can close this tab and return to the terminal.";
+    return "Signed in. Return to the terminal to finish linking the account; you can close this tab.";
   };
 
   const server = http.createServer((req, res) => {
@@ -97,7 +120,9 @@ export async function runInteractiveAuth(
   opts.log(`\nOpen this URL in a browser and sign in with the Gmail account you want to link:\n\n  ${authUrl}\n`);
   opts.log(
     `Waiting for Google to redirect back to ${redirectUri} ...\n` +
-      `(If your browser is on another machine, paste the full URL it ends up on here and press Enter.)\n`,
+      (process.stdin.isTTY
+        ? `(If your browser is on another machine, paste the full URL it ends up on here and press Enter.)\n`
+        : ""),
   );
   if (opts.openBrowser) openInBrowser(authUrl);
 
@@ -130,11 +155,12 @@ export async function runInteractiveAuth(
 function openInBrowser(url: string): void {
   import("node:child_process")
     .then(({ spawn }) => {
+      // On Windows, `cmd /c start` would split the URL at every "&"; rundll32 takes it verbatim.
       const [cmd, args] =
         process.platform === "darwin"
           ? ["open", [url]]
           : process.platform === "win32"
-            ? ["cmd", ["/c", "start", "", url]]
+            ? ["rundll32", ["url.dll,FileProtocolHandler", url]]
             : ["xdg-open", [url]];
       const child = spawn(cmd, args as string[], { stdio: "ignore", detached: true });
       child.on("error", () => undefined);

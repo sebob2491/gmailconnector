@@ -37,7 +37,7 @@ test("loopback flow exchanges the code with PKCE and returns the refresh token",
   assert.match(redirect, /^http:\/\/127\.0\.0\.1:\d+$/);
 
   const res = await fetch(`${redirect}/?state=${params.get("state")}&code=the-code`);
-  assert.match(await res.text(), /Account linked/);
+  assert.match(await res.text(), /Signed in\. Return to the terminal/);
 
   const auth = await flow.result;
   assert.deepEqual(auth, { refreshToken: "rt", accessToken: "at", scopes: GMAIL_SCOPES });

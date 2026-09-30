@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { test } from "node:test";
-import { bareAddress, parseAddressList } from "../src/format.js";
+import { bareAddress, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
 import { buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
 
@@ -84,4 +85,49 @@ test("htmlToText keeps structure, links and entities readable", () => {
     htmlToText(html),
     "Order shipped\n\nHi Sam,\nyour order #123 is on its way.\n\n- Widget × 2\n- Gadget\n\nTrack package (https://track.example/abc) · Email us",
   );
+});
+
+test("attachment content given as a data: URL is accepted", () => {
+  assert.equal(decodeBase64("data:text/plain;base64,aGVsbG8=").toString(), "hello");
+});
+
+test("long References and Subject headers are folded; Content-IDs stay ASCII", () => {
+  const ids = Array.from({ length: 30 }, (_, i) => `<message-${i}-abcdefghijklmnop@mail.example.com>`).join(" ");
+  const raw = buildMime({
+    to: ["a@example.com"],
+    subject: "A very long subject line ".repeat(8).trim(),
+    references: ids,
+    html: '<img src="cid:caf%C3%A9%20photo.png">',
+    attachments: [{ content: Buffer.from("img"), filename: "café photo.png", mimeType: "image/png", inline: true }],
+  });
+  const headerBlock = raw.slice(0, raw.indexOf("\r\n\r\n"));
+  for (const line of headerBlock.split("\r\n")) assert.ok(line.length <= 78, `header line too long: ${line.length}`);
+  assert.equal(parseHeaders(headerBlock).find((h) => h.name === "References")!.value, ids);
+  assert.match(raw, /Content-ID: <caf%C3%A9%20photo\.png>/);
+  assert.ok(!/[^\x00-\x7f]/.test(raw), "message is 7-bit clean");
+});
+
+test("display names are quoted or encoded as needed", () => {
+  const raw = buildMime({
+    to: [{ name: "Doe, Jane", address: "jane@x.com" }, { name: "Zoë", address: "zoe@x.com" }, { name: "Bob", address: "bob@x.com" }],
+    from: { name: "Me Alias", address: "alias@x.com" },
+    text: "hi",
+  });
+  const headers = parseHeaders(raw.slice(0, raw.indexOf("\r\n\r\n")));
+  assert.equal(headers.find((h) => h.name === "To")!.value, '"Doe, Jane" <jane@x.com>, Zoë <zoe@x.com>, Bob <bob@x.com>');
+  assert.equal(headers.find((h) => h.name === "From")!.value, "Me Alias <alias@x.com>");
+});
+
+test("group syntax and comments parse into real mailboxes", () => {
+  assert.deepEqual(parseMailboxes('undisclosed-recipients:;'), []);
+  assert.deepEqual(parseMailboxes('Team: a@x.com, "B, Bee" <b@y.com>;, c@z.com (Cee)'), [
+    { address: "a@x.com" },
+    { name: "B, Bee", address: "b@y.com" },
+    { name: "Cee", address: "c@z.com" },
+  ]);
+  assert.equal(bareAddress('"Help <help@vendor.com>" <NoReply@Vendor.com>'), "noreply@vendor.com");
+  assert.deepEqual(recipientsFrom('"john doe"@example.com, not-an-address, a@x.com, A@X.com'), [
+    { address: '"john doe"@example.com' },
+    { address: "a@x.com" },
+  ]);
 });

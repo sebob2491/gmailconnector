@@ -68,10 +68,20 @@ export function htmlResponse(html: string, init: { status?: number; headers?: He
   return new Response(html, { status: init.status ?? 200, headers });
 }
 
-export function messagePage(title: string, message: string, opts: { status?: number; kind?: "ok" | "bad" | "warn"; action?: { href: string; label: string } } = {}): Response {
+export function messagePage(
+  title: string,
+  message: string,
+  opts: {
+    status?: number;
+    kind?: "ok" | "bad" | "warn";
+    action?: { href: string; label: string };
+    form?: { action: string; csrf: string; label: string };
+  } = {},
+): Response {
   const body = `<div class="card"><h1>${escapeHtml(title)}</h1>
 <div class="notice ${opts.kind ?? "bad"}">${escapeHtml(message)}</div>
-${opts.action ? `<div class="actions"><a class="button primary" href="${escapeHtml(opts.action.href)}">${escapeHtml(opts.action.label)}</a></div>` : ""}</div>`;
+${opts.action ? `<div class="actions"><a class="button primary" href="${escapeHtml(opts.action.href)}">${escapeHtml(opts.action.label)}</a></div>` : ""}
+${opts.form ? `<form method="post" action="${escapeHtml(opts.form.action)}" class="actions"><input type="hidden" name="csrf" value="${escapeHtml(opts.form.csrf)}"><button class="primary">${escapeHtml(opts.form.label)}</button></form>` : ""}</div>`;
   return htmlResponse(layout(title, body), { status: opts.status ?? 400 });
 }
 

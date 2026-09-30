@@ -98,16 +98,28 @@ const notConfigured = (origin: string) =>
     { status: 503, kind: "warn", action: { href: `${origin}/`, label: "Open setup page" } },
   );
 
-async function startGoogleSignIn(env: Env, origin: string, session: Session, headers = new Headers()): Promise<Response> {
+type SignInPurpose = "signin" | "link";
+
+interface GoogleState {
+  session: string;
+  verifier: string;
+  purpose: SignInPurpose;
+}
+
+/** Sends the browser to Google. `purpose` says whether the result signs this session in or links an account. */
+async function startGoogleSignIn(
+  env: Env,
+  origin: string,
+  session: Session,
+  purpose: SignInPurpose,
+  headers = new Headers(),
+): Promise<Response> {
   const client = googleClient(env);
   if (!client) return notConfigured(origin);
   const state = randomToken(24);
   const verifier = randomToken(48);
-  await env.OAUTH_KV.put(
-    `gmail:gstate:${state}`,
-    JSON.stringify({ session: await sha256(session.handle), verifier }),
-    { expirationTtl: GOOGLE_STATE_TTL },
-  );
+  const record: GoogleState = { session: await sha256(session.handle), verifier, purpose };
+  await env.OAUTH_KV.put(`gmail:gstate:${state}`, JSON.stringify(record), { expirationTtl: GOOGLE_STATE_TTL });
   const url = buildAuthUrl({
     clientId: client.clientId,
     redirectUri: `${origin}/google/callback`,
@@ -125,7 +137,8 @@ async function authorizeGet(request: Request, env: Env, origin: string): Promise
   try {
     authRequest = await oauth.parseAuthRequest(request);
   } catch (error) {
-    if (error instanceof AuthorizationError && error.redirectUri) {
+    // Only send errors back to Claude; anything else is shown here, so this can't be an open redirect.
+    if (error instanceof AuthorizationError && error.redirectUri && redirectHostAllowed(env, error.redirectUri)) {
       const url = new URL(error.redirectUri);
       url.searchParams.set("error", error.code);
       url.searchParams.set("error_description", error.description);
@@ -174,11 +187,12 @@ async function authorizePost(request: Request, env: Env, origin: string): Promis
       { request: approved.request, clientName: client?.clientName || "Claude", authenticated: false },
       approved.headers,
     );
-    return startGoogleSignIn(env, origin, session, approved.headers);
+    return startGoogleSignIn(env, origin, session, "signin", approved.headers);
   } catch (error) {
     if (error instanceof AuthorizationError) {
       return messagePage("This page expired", "Start connecting again from Claude.", { status: 400, kind: "warn" });
     }
+    if (error instanceof CimdFetchError) return messagePage("Can't connect", "This app could not be verified.");
     throw error;
   }
 }
@@ -186,9 +200,7 @@ async function authorizePost(request: Request, env: Env, origin: string): Promis
 async function googleCallback(request: Request, env: Env, origin: string): Promise<Response> {
   const url = new URL(request.url);
   const state = url.searchParams.get("state") ?? "";
-  const stored = state
-    ? await env.OAUTH_KV.get<{ session: string; verifier: string }>(`gmail:gstate:${state}`, "json")
-    : null;
+  const stored = state ? await env.OAUTH_KV.get<GoogleState>(`gmail:gstate:${state}`, "json") : null;
   if (stored) await env.OAUTH_KV.delete(`gmail:gstate:${state}`);
   const session = await getSession(env, request);
   if (!stored || !session || stored.session !== (await sha256(session.handle))) {
@@ -211,8 +223,9 @@ async function googleCallback(request: Request, env: Env, origin: string): Promi
 
   const client = googleClient(env);
   if (!client) return notConfigured(origin);
+  const purpose: SignInPurpose = stored.purpose === "link" && session.data.authenticated ? "link" : "signin";
   let email: string;
-  let result;
+  let linked: boolean;
   try {
     const tokens = await exchangeCode(client, {
       code: url.searchParams.get("code") ?? "",
@@ -220,11 +233,20 @@ async function googleCallback(request: Request, env: Env, origin: string): Promi
       codeVerifier: stored.verifier,
     });
     email = await fetchProfileEmail(tokens.accessToken);
-    result = await recordSignIn(env, email, tokens, session.data.authenticated);
+    const result = await recordSignIn(env, email, tokens, purpose);
     if (!result.ok) {
-      await revokeToken(tokens.refreshToken);
-      return messagePage("Not allowed", result.message, { status: 403 });
+      if (!result.linked) await revokeToken(tokens.refreshToken);
+      return messagePage("Not allowed", result.message, {
+        status: 403,
+        ...(session.data.request
+          ? { form: { action: "/accounts/cancel", csrf: session.handle, label: "Back to Claude" } }
+          : {}),
+      });
     }
+    linked = result.linked;
+    // Signing in with an account that isn't linked (e.g. one removed earlier) doesn't re-add it,
+    // and the grant Google just created isn't needed.
+    if (!linked) await revokeToken(tokens.refreshToken);
   } catch (error) {
     if (error instanceof AuthError) {
       return messagePage("Couldn't link that account", error.message, {
@@ -235,24 +257,28 @@ async function googleCallback(request: Request, env: Env, origin: string): Promi
   }
   session.data.authenticated = true;
   await saveSession(env, session);
-  return redirect(`${origin}/accounts?linked=${encodeURIComponent(email)}`, undefined, 303);
+  const param = linked ? "linked" : "signedin";
+  return redirect(`${origin}/accounts?${param}=${encodeURIComponent(email)}`, undefined, 303);
 }
 
 async function accountsGet(request: Request, env: Env, origin: string): Promise<Response> {
   const session = await getSession(env, request);
   if (!session?.data.authenticated) {
     if (!googleClient(env)) return notConfigured(origin);
-    if (session) return startGoogleSignIn(env, origin, session);
+    if (session) return startGoogleSignIn(env, origin, session, "signin");
     const headers = new Headers();
     const created = await createSession(env, { authenticated: false }, headers);
-    return startGoogleSignIn(env, origin, created, headers);
+    return startGoogleSignIn(env, origin, created, "signin", headers);
   }
   const rec = await loadOwner(env.OAUTH_KV);
   const url = new URL(request.url);
   const linked = url.searchParams.get("linked");
+  const signedIn = url.searchParams.get("signedin");
   const removed = url.searchParams.get("removed");
   const notice = linked
     ? { kind: "ok" as const, text: `Linked ${linked}.` }
+    : signedIn
+      ? { kind: "ok" as const, text: `Signed in as ${signedIn}. That account isn't linked; use "Link" below to add it.` }
     : removed
       ? { kind: "ok" as const, text: `Removed ${removed}.` }
       : url.searchParams.get("error") === "none"
@@ -275,7 +301,9 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
 async function accountsPost(request: Request, env: Env, origin: string, action: string): Promise<Response> {
   const session = await getSession(env, request);
   const form = await request.formData();
-  if (!session?.data.authenticated || form.get("csrf") !== session.handle) {
+  // Cancelling a pending connection is allowed before sign-in (e.g. after a refused sign-in).
+  const needsSignIn = action !== "cancel";
+  if (!session || (needsSignIn && !session.data.authenticated) || form.get("csrf") !== session.handle) {
     return messagePage("Session expired", "Please sign in again.", {
       kind: "warn",
       action: { href: `${origin}/accounts`, label: "Sign in" },
@@ -284,7 +312,7 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
 
   switch (action) {
     case "link":
-      return startGoogleSignIn(env, origin, session);
+      return startGoogleSignIn(env, origin, session, "link");
     case "remove": {
       const email = String(form.get("email") ?? "");
       const rec = await loadOwner(env.OAUTH_KV);
@@ -307,13 +335,23 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
       if (!session.data.request) return redirect(`${origin}/accounts`, undefined, 303);
       const rec = await loadOwner(env.OAUTH_KV);
       if (!rec.accounts.length) return redirect(`${origin}/accounts?error=none`, undefined, 303);
-      const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-        request: session.data.request,
-        userId: "owner",
-        metadata: { clientName: session.data.clientName },
-        scope: session.data.request.scope,
-        props: { owner: true },
-      });
+      let redirectTo: string;
+      try {
+        ({ redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+          request: session.data.request,
+          userId: "owner",
+          metadata: { clientName: session.data.clientName },
+          scope: session.data.request.scope,
+          props: { owner: true },
+          // Connecting again (e.g. from a second Claude account) must not disconnect the first.
+          revokeExistingGrants: false,
+        }));
+      } catch (error) {
+        if (error instanceof AuthorizationError || error instanceof CimdFetchError) {
+          return messagePage("Can't finish connecting", "Start connecting again from Claude.", { kind: "warn" });
+        }
+        throw error;
+      }
       const headers = new Headers();
       await endSession(env, session, headers);
       return redirect(redirectTo, headers);

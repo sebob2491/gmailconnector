@@ -7,5 +7,7 @@
   // Created automatically on the first deploy.
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
   "observability": { "enabled": true },
+  // Keep variables set in the Cloudflare dashboard (e.g. ALLOWED_EMAILS) when redeploying.
+  "keep_vars": true,
   "workers_dev": true
 }

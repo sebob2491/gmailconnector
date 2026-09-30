@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
@@ -77,11 +78,19 @@ function encodeMultiToken(tokens: Record<string, string>): string | undefined {
 }
 
 function decodeMultiToken(token: string): Record<string, string> {
+  let decoded: unknown;
   try {
-    return JSON.parse(Buffer.from(token.slice(MULTI_TOKEN_PREFIX.length), "base64url").toString("utf8"));
+    decoded = JSON.parse(Buffer.from(token.slice(MULTI_TOKEN_PREFIX.length), "base64url").toString("utf8"));
   } catch {
-    throw new AccountError("Invalid pageToken.");
+    decoded = undefined;
   }
+  const valid =
+    decoded !== null &&
+    typeof decoded === "object" &&
+    !Array.isArray(decoded) &&
+    Object.values(decoded as object).every((v) => typeof v === "string");
+  if (!valid) throw new AccountError("Invalid pageToken. Start the search again without a pageToken.");
+  return decoded as Record<string, string>;
 }
 
 /**
@@ -93,15 +102,26 @@ async function fanOut<T extends { nextPageToken?: string }>(
   pageToken: string | undefined,
   fn: (mb: Mailbox, pageToken: string | undefined) => Promise<T>,
 ) {
-  const multi = mailboxes.length > 1 || pageToken?.startsWith(MULTI_TOKEN_PREFIX);
-  if (!multi) {
+  const combined = pageToken?.startsWith(MULTI_TOKEN_PREFIX) ?? false;
+  if (pageToken && !combined && mailboxes.length > 1) {
+    throw new AccountError(
+      "This pageToken came from a single-account call. Pass the same `account` you used for that call.",
+    );
+  }
+  if (!combined && mailboxes.length === 1) {
     const mb = mailboxes[0];
     return { account: mb.email, ...(await fn(mb, pageToken)) };
   }
   let targets = mailboxes.map((mb) => ({ mb, token: undefined as string | undefined }));
-  if (pageToken) {
-    const tokens = decodeMultiToken(pageToken);
-    targets = mailboxes.filter((mb) => tokens[mb.email]).map((mb) => ({ mb, token: tokens[mb.email] }));
+  if (combined) {
+    const tokens = decodeMultiToken(pageToken!);
+    const lower = new Map(Object.entries(tokens).map(([email, token]) => [email.toLowerCase(), token]));
+    targets = mailboxes.filter((mb) => lower.has(mb.email.toLowerCase())).map((mb) => ({ mb, token: lower.get(mb.email.toLowerCase()) }));
+    if (!targets.length) {
+      throw new AccountError(
+        "This pageToken doesn't continue any of the requested accounts. Use the same `account` as the call that returned it (or omit it).",
+      );
+    }
   }
   const next: Record<string, string> = {};
   const accounts = await Promise.all(
@@ -223,7 +243,8 @@ const messageListVisibilityArg = z
 
 const SEARCH_QUERY_HELP = `Optional. Gmail search syntax, e.g. "from:alice@example.com", "subject:invoice newer_than:7d", "is:unread in:inbox", "has:attachment", "label:Receipts", "after:2026/01/01". Use OR and ( ) to broaden. Natural language must be converted to Gmail syntax first. Drafts are excluded unless the query mentions in:draft.`;
 
-export const LOCAL_MANAGE_HINT = "To link one, run in a terminal: gmail-multi-mcp accounts add  (once per Gmail account).";
+export const LOCAL_MANAGE_HINT =
+  "To link one, run `node dist/src/index.js accounts add` in the connector's folder (or `gmail-multi-mcp accounts add` after `npm link`), once per Gmail account.";
 
 export interface ServerDeps {
   /** Where linked accounts (and their refresh tokens) are read from. */

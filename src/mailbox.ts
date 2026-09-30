@@ -4,10 +4,12 @@ import {
   METADATA_HEADERS,
   apiFormat,
   bareAddress,
+  bodyText,
   extractContent,
   formatMessage,
   header,
-  parseAddressList,
+  parseMailboxes,
+  recipientsFrom,
   viewUrl,
   type ApiMessage,
   type FormattedMessage,
@@ -18,9 +20,11 @@ import {
   decodeBase64,
   escapeHtml,
   htmlToText,
+  isValidAddress,
   MimeError,
   type OutgoingAttachment,
   type OutgoingMessage,
+  type Recipient,
 } from "./mime.js";
 
 export interface AttachmentInput {
@@ -103,17 +107,6 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) =>
   return results;
 }
 
-function uniqueAddresses(list: string[], exclude: string[] = []): string[] {
-  const seen = new Set(exclude.map((a) => a.toLowerCase()));
-  const out: string[] = [];
-  for (const address of list.map(bareAddress)) {
-    if (!address || seen.has(address)) continue;
-    seen.add(address);
-    out.push(address);
-  }
-  return out;
-}
-
 function toAttachments(inputs: AttachmentInput[] | undefined): OutgoingAttachment[] {
   return (inputs ?? []).map((a) => ({
     content: decodeBase64(a.content),
@@ -123,8 +116,20 @@ function toAttachments(inputs: AttachmentInput[] | undefined): OutgoingAttachmen
   }));
 }
 
+/** True when the query asks for drafts (`in:draft`), but not when it excludes them (`-in:draft`). */
 function mentionsDrafts(query: string | undefined): boolean {
-  return /\b(in|is):drafts?\b/i.test(query ?? "");
+  return /(?:^|[\s({])(?:in|is):drafts?\b/i.test(query ?? "");
+}
+
+/** Joins `References` with the message's own Message-ID, per RFC 5322 threading rules. */
+function referencesFor(part: ApiMessage["payload"]): string | undefined {
+  const rfcId = header(part, "Message-ID");
+  return [header(part, "References"), rfcId].filter(Boolean).join(" ") || undefined;
+}
+
+function replySubject(subject: string | undefined): string {
+  const s = subject ?? "";
+  return /^re:/i.test(s) ? s : `Re: ${s}`.trim();
 }
 
 const THREAD_PREVIEW_MESSAGES = 5;
@@ -170,10 +175,18 @@ export class Mailbox {
       },
     });
     const format: MessageFormat = opts.view === "THREAD_VIEW_METADATA_ONLY" ? "METADATA_ONLY" : "MINIMAL";
-    const threads = await mapLimit((list.threads ?? []) as { id: string }[], 8, async (t) => {
-      const thread = await this.client.request("GET", `threads/${t.id}`, {
-        query: { format: "metadata", metadataHeaders: METADATA_HEADERS },
-      });
+    const ids = (list.threads ?? []) as { id: string }[];
+    const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
+      ids.map((t) => ({ path: `threads/${t.id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
+    );
+    const found = ids.flatMap((t, i) => {
+      const r = fetched[i];
+      if (r.ok) return [{ id: t.id, thread: r.value }];
+      if (r.error.status === 404) return []; // deleted since the search ran
+      throw r.error;
+    });
+    const threads = await mapLimit(found, 8, async ({ id, thread }) => {
+      const t = { id };
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
       const recent = messages.slice(-THREAD_PREVIEW_MESSAGES);
@@ -217,8 +230,18 @@ export class Mailbox {
   /** Downloads every attachment of a message so it can be re-attached (forwarding, draft edits). */
   private async downloadAttachments(msg: ApiMessage): Promise<OutgoingAttachment[]> {
     const content = await extractContent(msg.payload, this.loader(msg.id));
-    return mapLimit(content.attachments, 4, async (a) => {
-      const data = a.id ? await this.loader(msg.id)(a.id) : (findPart(msg, a.partId)?.body?.data ?? "");
+    const withIds = content.attachments.filter((a) => a.id);
+    const fetched = await this.client.batchGet<{ data: string }>(
+      withIds.map((a) => ({ path: `messages/${msg.id}/attachments/${a.id}` })),
+    );
+    const dataById = new Map<string, string>();
+    withIds.forEach((a, i) => {
+      const r = fetched[i];
+      if (!r.ok) throw r.error;
+      dataById.set(a.id!, r.value.data);
+    });
+    return content.attachments.map((a) => {
+      const data = a.id ? dataById.get(a.id)! : (findPart(msg, a.partId)?.body?.data ?? "");
       return {
         content: Buffer.from(data, "base64url"),
         filename: a.filename,
@@ -241,27 +264,27 @@ export class Mailbox {
     const p = original.payload;
     const self = this.email.toLowerCase();
     const from = header(p, "From") ?? "";
-    const origTo = parseAddressList(header(p, "To"));
-    const origCc = parseAddressList(header(p, "Cc"));
+    const toHeader = header(p, "To");
+    const ccHeader = header(p, "Cc");
+    // Derived recipients skip anything that isn't a real address (e.g. "undisclosed-recipients:;").
     const sentBySelf = bareAddress(from) === self;
-    const to = sentBySelf
-      ? uniqueAddresses(origTo)
-      : uniqueAddresses(parseAddressList(header(p, "Reply-To") || from));
-    const cc = replyAll ? uniqueAddresses(sentBySelf ? origCc : [...origTo, ...origCc], [self, ...to]) : [];
-    const rfcId = header(p, "Message-ID");
-    const subject = header(p, "Subject") ?? "";
+    const to = sentBySelf ? recipientsFrom(toHeader) : recipientsFrom(header(p, "Reply-To") || from);
+    const toAddresses = to.map((m) => m.address);
+    const cc = replyAll
+      ? recipientsFrom(sentBySelf ? ccHeader : [toHeader, ccHeader].filter(Boolean).join(", "), [self, ...toAddresses])
+      : [];
     const content = await extractContent(p, this.loader(original.id));
     return {
       original,
       threadId: original.threadId,
-      inReplyTo: rfcId,
-      references: [header(p, "References"), rfcId].filter(Boolean).join(" ") || undefined,
-      subject: /^re:/i.test(subject) ? subject : `Re: ${subject}`.trim(),
+      inReplyTo: header(p, "Message-ID"),
+      references: referencesFor(p),
+      subject: replySubject(header(p, "Subject")),
       to,
       cc,
       quote: {
         attribution: `On ${header(p, "Date") ?? "an earlier date"}, ${from} wrote:`,
-        text: content.text ?? (content.html !== undefined ? htmlToText(content.html) : ""),
+        text: bodyText(content),
         html: content.html,
       },
     };
@@ -307,8 +330,20 @@ export class Mailbox {
       const ctx = await this.replyContext(input.replyToMessageId);
       msg.inReplyTo = ctx.inReplyTo;
       msg.references = ctx.references;
-      msg.subject ??= ctx.subject;
+      msg.subject ||= ctx.subject;
       threadId = ctx.threadId;
+    } else if (input.replyThreadId) {
+      // Gmail only threads a message that also carries In-Reply-To/References and a matching
+      // subject, so take them from the thread's latest message.
+      const thread = await this.client.request("GET", `threads/${input.replyThreadId}`, {
+        query: { format: "metadata", metadataHeaders: METADATA_HEADERS },
+      });
+      const last = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT")).at(-1);
+      if (last) {
+        msg.inReplyTo = header(last.payload, "Message-ID");
+        msg.references = referencesFor(last.payload);
+        msg.subject ||= replySubject(header(last.payload, "Subject"));
+      }
     }
     const sent = await this.upload("POST", "messages/send", threadId ? { threadId } : {}, buildMime(msg));
     return this.sentResult(sent);
@@ -346,7 +381,7 @@ export class Mailbox {
     const original = await this.getRawMessage(input.messageId, "full");
     const p = original.payload;
     const content = await extractContent(p, this.loader(original.id));
-    const origText = content.text ?? (content.html !== undefined ? htmlToText(content.html) : "");
+    const origText = bodyText(content);
     const meta: [string, string | undefined][] = [
       ["From", header(p, "From")],
       ["Date", header(p, "Date")],
@@ -366,7 +401,6 @@ export class Mailbox {
       present.map(([k, v]) => `${k}: ${escapeHtml(v)}<br>`).join("") +
       `<br>${content.html ?? escapeHtml(origText).replace(/\n/g, "<br>")}</div>`;
     const subject = header(p, "Subject") ?? "";
-    const rfcId = header(p, "Message-ID");
     const mime = buildMime({
       to: input.to,
       cc: input.cc,
@@ -374,8 +408,8 @@ export class Mailbox {
       subject: /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`.trim(),
       text,
       html,
-      inReplyTo: rfcId,
-      references: [header(p, "References"), rfcId].filter(Boolean).join(" ") || undefined,
+      inReplyTo: header(p, "Message-ID"),
+      references: referencesFor(p),
       attachments: await this.downloadAttachments(original),
     });
     const sent = await this.upload("POST", "messages/send", { threadId: original.threadId }, mime);
@@ -416,8 +450,17 @@ export class Mailbox {
       query: { q: opts.query, maxResults: Math.min(Math.max(opts.pageSize ?? 20, 1), 50), pageToken: opts.pageToken },
     });
     const full = opts.view === "DRAFT_VIEW_FULL";
-    const drafts = await mapLimit((list.drafts ?? []) as { id: string }[], 8, async (d) => {
-      const draft = await this.client.request("GET", `drafts/${d.id}`, { query: { format: full ? "full" : "metadata" } });
+    const ids = (list.drafts ?? []) as { id: string }[];
+    const fetched = await this.client.batchGet<{ id: string; message: ApiMessage }>(
+      ids.map((d) => ({ path: `drafts/${d.id}`, query: { format: full ? "full" : "metadata" } })),
+    );
+    const found = ids.flatMap((_, i) => {
+      const r = fetched[i];
+      if (r.ok) return [r.value];
+      if (r.error.status === 404) return []; // deleted or sent since it was listed
+      throw r.error;
+    });
+    const drafts = await mapLimit(found, 8, async (draft) => {
       const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY");
       if (full) {
         const { htmlBody: _h, snippet: _s, attachments: _a, labelIds: _l, ...rest } = formatted as FormattedMessage;
@@ -468,11 +511,15 @@ export class Mailbox {
     const msg = existing.message as ApiMessage;
     const p = msg.payload;
     const content = await extractContent(p, this.loader(msg.id));
-    const pick = (value: string[] | undefined, headerName: string) =>
-      value?.length ? value : parseAddressList(header(p, headerName)).map(bareAddress);
+    // Keep the draft's recipients (with their display names) unless new ones are given.
+    const pick = (value: string[] | undefined, headerName: string): Recipient[] =>
+      value?.length ? value : recipientsFrom(header(p, headerName));
     const bodyChanged = Boolean(input.body || input.htmlBody);
     const inReplyTo = header(p, "In-Reply-To");
+    // Keep a chosen send-as address; without From, Gmail would send from the primary address.
+    const from = parseMailboxes(header(p, "From")).find((m) => isValidAddress(m.address));
     const mime = buildMime({
+      from,
       to: pick(input.to, "To"),
       cc: pick(input.cc, "Cc"),
       bcc: pick(input.bcc, "Bcc"),
@@ -483,12 +530,7 @@ export class Mailbox {
       references: header(p, "References"),
       attachments: input.attachments ? toAttachments(input.attachments) : await this.downloadAttachments(msg),
     });
-    const draft = await this.upload(
-      "PUT",
-      `drafts/${input.draftId}`,
-      { id: input.draftId, message: inReplyTo ? { threadId: msg.threadId } : {} },
-      mime,
-    );
+    const draft = await this.upload("PUT", `drafts/${input.draftId}`, { id: input.draftId, message: { threadId: msg.threadId } }, mime);
     return this.draftResult(draft);
   }
 
@@ -528,18 +570,26 @@ export class Mailbox {
   }
 
   async createLabel(input: LabelInput & { displayName: string; autoCreateParentLabels?: boolean }) {
-    const name = input.displayName.split("/").map((s) => s.trim()).filter(Boolean).join("/");
+    let name = input.displayName.split("/").map((s) => s.trim()).filter(Boolean).join("/");
     if (!name) throw new MimeError("displayName must not be empty.");
     const created: string[] = [];
     if (input.autoCreateParentLabels !== false && name.includes("/")) {
-      const existing = new Set(((await this.client.request("GET", "labels")).labels ?? []).map((l: ApiLabel) => l.name.toLowerCase()));
+      const labels = ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
+      const existing = new Map(labels.map((l) => [l.name.toLowerCase(), l.name]));
       const segments = name.split("/");
       for (let i = 1; i < segments.length; i++) {
         const parent = segments.slice(0, i).join("/");
-        if (existing.has(parent.toLowerCase())) continue;
+        const actual = existing.get(parent.toLowerCase());
+        if (actual) {
+          // Gmail nests by exact name, so reuse the existing label's capitalization.
+          segments.splice(0, i, ...actual.split("/"));
+          continue;
+        }
         await this.client.request("POST", "labels", { json: { name: parent } });
+        existing.set(parent.toLowerCase(), parent);
         created.push(parent);
       }
+      name = segments.join("/");
     }
     const label: ApiLabel = await this.client.request("POST", "labels", {
       json: { labelListVisibility: "labelShow", messageListVisibility: "show", ...this.labelBody(input), name },
@@ -559,9 +609,9 @@ export class Mailbox {
   }
 
   /** Accepts label IDs or display names (case-insensitive) and returns IDs for this account. */
-  async resolveLabelIds(refs: string[] | undefined): Promise<string[]> {
+  async resolveLabelIds(refs: string[] | undefined, known?: ApiLabel[]): Promise<string[]> {
     if (!refs?.length) return [];
-    const labels = ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
+    const labels = known ?? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[]);
     return refs.map((ref) => {
       const byId = labels.find((l) => l.id === ref);
       if (byId) return byId.id;
@@ -572,8 +622,11 @@ export class Mailbox {
   }
 
   async modify(kind: "messages" | "threads", id: string, add: string[] | undefined, remove: string[] | undefined) {
-    const addLabelIds = await this.resolveLabelIds(add);
-    const removeLabelIds = await this.resolveLabelIds(remove);
+    const labels = add?.length || remove?.length
+      ? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[])
+      : [];
+    const addLabelIds = await this.resolveLabelIds(add, labels);
+    const removeLabelIds = await this.resolveLabelIds(remove, labels);
     if (!addLabelIds.length && !removeLabelIds.length) throw new MimeError("Provide at least one label to add or remove.");
     return this.modifyIds(kind, id, addLabelIds, removeLabelIds);
   }

@@ -8,10 +8,21 @@ export interface OutgoingAttachment {
   contentId?: string;
 }
 
+/** A parsed address with an optional display name. */
+export interface Mailbox {
+  name?: string;
+  address: string;
+}
+
+/** Plain addresses typed by a user, or mailboxes carried over from existing headers. */
+export type Recipient = string | Mailbox;
+
 export interface OutgoingMessage {
-  to?: string[];
-  cc?: string[];
-  bcc?: string[];
+  /** Only set to keep a draft's existing From (e.g. a send-as alias); Gmail fills it in otherwise. */
+  from?: Mailbox;
+  to?: Recipient[];
+  cc?: Recipient[];
+  bcc?: Recipient[];
   subject?: string;
   text?: string;
   html?: string;
@@ -52,21 +63,58 @@ export function encodeHeaderValue(value: string): string {
   return words.map((w) => `=?UTF-8?B?${Buffer.from(w, "utf8").toString("base64")}?=`).join(`${CRLF} `);
 }
 
-const ADDRESS_RE = /^[^\s@<>(),;:"\[\]\\]+@[^\s@<>(),;:"\[\]\\]+$/;
+/** An addr-spec: a dot-atom or quoted local part, then a domain. */
+const ADDRESS_RE = /^(?:[^\s@<>(),;:"\[\]\\]+|"(?:[^"\\\r\n]|\\.)+")@[^\s@<>(),;:"\[\]\\]+$/;
 
-export function validateAddresses(field: string, addresses: string[] | undefined): string[] {
-  const list = (addresses ?? []).map((a) => a.trim()).filter(Boolean);
-  for (const address of list) {
-    if (!ADDRESS_RE.test(address)) {
-      throw new MimeError(`Invalid email address in "${field}": "${address}". Use plain addresses like user@example.com.`);
-    }
-  }
-  return list;
+export function isValidAddress(address: string): boolean {
+  return ADDRESS_RE.test(address);
 }
 
-function addressHeader(name: string, addresses: string[]): string | undefined {
-  if (!addresses.length) return undefined;
-  return `${name}: ${addresses.join(`,${CRLF} `)}`;
+function toMailbox(field: string, recipient: Recipient): Mailbox {
+  const mailbox = typeof recipient === "string" ? { address: recipient } : recipient;
+  const address = mailbox.address.trim();
+  if (!isValidAddress(address)) {
+    throw new MimeError(`Invalid email address in "${field}": "${address}". Use plain addresses like user@example.com.`);
+  }
+  return { name: mailbox.name?.trim() || undefined, address };
+}
+
+export function validateAddresses(field: string, recipients: Recipient[] | undefined): Mailbox[] {
+  return (recipients ?? [])
+    .filter((r) => (typeof r === "string" ? r : r.address).trim())
+    .map((r) => toMailbox(field, r));
+}
+
+/** Formats a mailbox for a header, quoting or RFC 2047-encoding the display name as needed. */
+export function formatMailbox(mailbox: Mailbox): string {
+  if (!mailbox.name) return mailbox.address;
+  const name = oneLine(mailbox.name);
+  if (!isAscii(name)) return `${encodeHeaderValue(name)} <${mailbox.address}>`;
+  if (/^[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~ .]+$/.test(name) && !/^\.|\.$|\.\./.test(name)) {
+    return `${name} <${mailbox.address}>`;
+  }
+  return `${quoteParam(name)} <${mailbox.address}>`;
+}
+
+function addressHeader(name: string, mailboxes: Mailbox[]): string | undefined {
+  if (!mailboxes.length) return undefined;
+  return `${name}: ${mailboxes.map(formatMailbox).join(`,${CRLF} `)}`;
+}
+
+/** Folds a long ASCII header at spaces so no line exceeds RFC 5322's limits. */
+function foldHeader(name: string, value: string): string {
+  const words = oneLine(value).split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let line = `${name}:`;
+  for (const word of words) {
+    if (line.length + 1 + word.length > 76 && line !== `${name}:`) {
+      lines.push(line);
+      line = "";
+    }
+    line += ` ${word}`;
+  }
+  lines.push(line);
+  return lines.join(CRLF);
 }
 
 function wrapBase64(bytes: Uint8Array): string {
@@ -76,7 +124,7 @@ function wrapBase64(bytes: Uint8Array): string {
 
 function boundary(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(12));
-  return `=_gmail_mcp_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+  return `=_mcp_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
 function quoteParam(value: string): string {
@@ -114,7 +162,10 @@ function attachmentPart(att: OutgoingAttachment, index: number): string {
   const mimeType = oneLine(att.mimeType || "application/octet-stream");
   const headers = [`Content-Type: ${mimeType}; ${filenameParams("name", filename)}`];
   if (att.inline) {
-    const cid = oneLine(att.contentId ?? filename).replace(/^<|>$/g, "");
+    // Content-ID must be ASCII without spaces; filenames that aren't are percent-encoded.
+    const cid = oneLine(att.contentId ?? filename)
+      .replace(/^<|>$/g, "")
+      .replace(/[^\x21-\x7e]|[<>"\\]/g, (ch) => encodeURIComponent(ch));
     headers.push(`Content-Disposition: inline; ${filenameParams("filename", filename)}`, `Content-ID: <${cid}>`);
   } else {
     headers.push(`Content-Disposition: attachment; ${filenameParams("filename", filename)}`);
@@ -144,21 +195,27 @@ export function buildMime(msg: OutgoingMessage): string {
     body = multipart("mixed", [body, ...regular.map((a, i) => attachmentPart({ ...a, inline: false }, i))]);
   }
 
+  const subject = oneLine(msg.subject ?? "");
   const headers = [
+    msg.from ? `From: ${formatMailbox(toMailbox("from", msg.from))}` : undefined,
     addressHeader("To", validateAddresses("to", msg.to)),
     addressHeader("Cc", validateAddresses("cc", msg.cc)),
     addressHeader("Bcc", validateAddresses("bcc", msg.bcc)),
-    `Subject: ${encodeHeaderValue(msg.subject ?? "")}`,
+    isAscii(subject) ? foldHeader("Subject", subject) : `Subject: ${encodeHeaderValue(subject)}`,
     msg.inReplyTo ? `In-Reply-To: ${oneLine(msg.inReplyTo)}` : undefined,
-    msg.references ? `References: ${oneLine(msg.references)}` : undefined,
+    msg.references ? foldHeader("References", msg.references) : undefined,
     "MIME-Version: 1.0",
   ].filter((h): h is string => Boolean(h));
   return [...headers, body].join(CRLF);
 }
 
-/** Accepts standard or URL-safe base64 (with or without padding/whitespace). */
+/** Accepts standard or URL-safe base64 (with or without padding/whitespace), or a base64 data: URL. */
 export function decodeBase64(content: string): Buffer {
-  const normalized = content.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  const normalized = content
+    .replace(/^\s*data:[^,]*;base64,/i, "")
+    .replace(/\s+/g, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) throw new MimeError("Attachment content must be base64-encoded.");
   return Buffer.from(normalized, "base64");
 }

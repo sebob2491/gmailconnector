@@ -110,6 +110,11 @@ export class FakeGmail {
   codes = new Map<string, string>();
   codeExchanges: URLSearchParams[] = [];
   revokeCalls: string[] = [];
+  /** Every HTTP call the code under test made (a batch counts once), like Cloudflare's subrequest count. */
+  outboundCalls = 0;
+  batchCalls = 0;
+  /** Paths (prefix match) that answer with this status once, to exercise retries. */
+  failOnce = new Map<string, number>();
 
   addMailbox(email: string, refreshToken: string): FakeMailbox {
     const mb: FakeMailbox = {
@@ -167,6 +172,38 @@ export class FakeGmail {
   }
 
   fetch = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
+    this.outboundCalls++;
+    return this.handle(input, init);
+  };
+
+  /** Gmail's batch endpoint: runs each embedded GET and returns the answers as multipart/mixed. */
+  private async batch(init: RequestInit): Promise<Response> {
+    this.batchCalls++;
+    const contentType = new Headers(init.headers).get("Content-Type") ?? "";
+    const boundary = /boundary=([^;]+)/.exec(contentType)![1];
+    const auth = new Headers(init.headers).get("Authorization") ?? "";
+    const parts = String(init.body)
+      .split(`--${boundary}`)
+      .filter((p) => p.trim() && !p.startsWith("--"));
+    const out: string[] = [];
+    for (const part of parts) {
+      const id = /Content-ID: <([^>]+)>/.exec(part)![1];
+      const line = part.split("\r\n\r\n")[1].split("\r\n")[0];
+      const [method, path] = line.split(" ");
+      const res = await this.handle(`https://gmail.googleapis.com${path}`, { method, headers: { Authorization: auth } });
+      const reason = res.status === 200 ? "OK" : "Error";
+      out.push(
+        `--batch_resp\r\nContent-Type: application/http\r\nContent-ID: <response-${id}>\r\n\r\n` +
+          `HTTP/1.1 ${res.status} ${reason}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${await res.text()}\r\n`,
+      );
+    }
+    return new Response(out.join("") + "--batch_resp--", {
+      status: 200,
+      headers: { "Content-Type": "multipart/mixed; boundary=batch_resp" },
+    });
+  }
+
+  private handle = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(String(input));
     const method = init.method ?? "GET";
     const json = (status: number, value: unknown) =>
@@ -211,8 +248,16 @@ export class FakeGmail {
       return json(401, { error: { message: "Invalid Credentials" } });
     }
 
+    if (url.pathname === "/batch/gmail/v1") return this.batch(init);
+
     const prefix = url.pathname.startsWith("/upload/") ? "/upload/gmail/v1/users/me/" : "/gmail/v1/users/me/";
     const path = url.pathname.slice(prefix.length);
+    for (const [failPath, status] of this.failOnce) {
+      if (path.startsWith(failPath)) {
+        this.failOnce.delete(failPath);
+        return json(status, { error: { code: status, message: "Rate Limit Exceeded", errors: [{ reason: "rateLimitExceeded" }] } });
+      }
+    }
     let body: any;
     const contentType = new Headers(init.headers).get("Content-Type") ?? "";
     if (init.body && contentType.startsWith("application/json")) body = JSON.parse(String(init.body));

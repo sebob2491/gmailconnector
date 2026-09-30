@@ -44,9 +44,21 @@ export function describeAccount(a: LinkedAccount): string {
   return a.alias ? `${a.email} (${a.alias})` : a.email;
 }
 
+/** Trims an alias and rejects values that can't work as an `account` argument. */
+export function normalizeAlias(alias: string): string {
+  const clean = alias.trim();
+  if (!clean) throw new AccountError("Aliases cannot be empty.");
+  if (clean.toLowerCase() === "all") throw new AccountError(`"all" is reserved and cannot be used as an alias.`);
+  if (clean.includes("@")) throw new AccountError(`Aliases cannot contain "@".`);
+  return clean;
+}
+
 /** Inserts or replaces an account (matched by email), keeping an existing alias unless a new one is given. */
 export function upsertAccount(data: AccountsFile, account: LinkedAccount): void {
-  if (account.alias) assertAliasFree(data, account.alias, account.email);
+  if (account.alias) {
+    account = { ...account, alias: normalizeAlias(account.alias) };
+    assertAliasFree(data, account.alias!, account.email);
+  }
   const existing = data.accounts.findIndex((a) => sameEmail(a.email, account.email));
   if (existing >= 0) {
     data.accounts[existing] = { ...account, alias: account.alias ?? data.accounts[existing].alias };
@@ -56,8 +68,7 @@ export function upsertAccount(data: AccountsFile, account: LinkedAccount): void 
 }
 
 export function assertAliasFree(data: AccountsFile, alias: string, ownerEmail: string): void {
-  if (alias.toLowerCase() === "all") throw new AccountError(`"all" is reserved and cannot be used as an alias.`);
-  if (alias.includes("@")) throw new AccountError(`Aliases cannot contain "@".`);
+  alias = normalizeAlias(alias);
   const clash = data.accounts.find(
     (a) => !sameEmail(a.email, ownerEmail) && a.alias?.toLowerCase() === alias.toLowerCase(),
   );

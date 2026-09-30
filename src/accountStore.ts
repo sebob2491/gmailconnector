@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   assertAliasFree,
   findAccount,
+  normalizeAlias,
   sameEmail,
   upsertAccount,
   type AccountSource,
@@ -79,7 +80,7 @@ export class AccountStore implements AccountSource {
     const data = await this.load();
     const account = findAccount(data, ref);
     assertAliasFree(data, alias, account.email);
-    account.alias = alias;
+    account.alias = normalizeAlias(alias);
     await this.save(data);
     return account;
   }
