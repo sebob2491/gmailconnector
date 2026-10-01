@@ -89,6 +89,12 @@ function copyRow(value: string): string {
   return `<div class="copy"><code>${escapeHtml(value)}</code><button type="button" data-copy="${escapeHtml(value)}">Copy</button></div>`;
 }
 
+/** The domain Google wants under "Authorized domains": the host minus its first label (e.g. you.workers.dev). */
+export function authorizedDomain(origin: string): string {
+  const labels = new URL(origin).hostname.split(".");
+  return labels.length > 2 ? labels.slice(1).join(".") : labels.join(".");
+}
+
 export function statusPage(opts: { origin: string; googleConfigured: boolean; claimed: boolean }): string {
   const mcpUrl = `${opts.origin}/mcp`;
   const callback = `${opts.origin}/google/callback`;
@@ -98,7 +104,11 @@ export function statusPage(opts: { origin: string; googleConfigured: boolean; cl
 <p class="muted">Finish these steps to use it in Claude. This page updates as you go.</p>
 <ol class="steps">
 <li><h2>Connect Google ${check(opts.googleConfigured)}</h2>
-<p>In Google Cloud, create an OAuth client of type <b>Web application</b> and add this <b>Authorized redirect URI</b>:</p>${copyRow(callback)}
+<p>In Google Cloud's <b>Branding</b> page, under <b>App domain</b>, use these. Google needs them before you can publish the app.</p>
+<p class="muted">Application home page</p>${copyRow(`${opts.origin}/`)}
+<p class="muted">Application privacy policy link</p>${copyRow(`${opts.origin}/privacy`)}
+<p class="muted">Authorized domain</p>${copyRow(authorizedDomain(opts.origin))}
+<p>Then create an OAuth client of type <b>Web application</b> and add this <b>Authorized redirect URI</b>:</p>${copyRow(callback)}
 <p class="muted">Then add its Client ID and Client secret to this Worker as the secrets <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code>.</p></li>
 <li><h2>Add it to Claude ${check(opts.claimed, "Signed in", "Not signed in yet")}</h2>
 <p>In Claude, open <b>Customize → Connectors → Add custom connector</b> and paste this URL:</p>${copyRow(mcpUrl)}
@@ -107,6 +117,23 @@ export function statusPage(opts: { origin: string; googleConfigured: boolean; cl
 <p>While connecting, tap <b>Link another Gmail account</b> for each extra inbox. You can also manage them any time at:</p>${copyRow(`${opts.origin}/accounts`)}</li>
 </ol></div>`;
   return layout("Gmail connector setup", body, { script: true });
+}
+
+export function privacyPage(origin: string): string {
+  const body = `<div class="card"><h1>Privacy policy</h1>
+<p class="muted">For the Gmail connector at ${escapeHtml(origin)}.</p>
+<p>This is a personal connector that lets its owner use their own Gmail accounts from Claude. It is run by that owner on their own Cloudflare account, not by a company.</p>
+<h2>What it accesses</h2>
+<p>With your permission, it uses Google's Gmail API (the <code>gmail.modify</code> scope) to search, read, draft, send, label and trash email in the Gmail accounts you link, only when you ask Claude to.</p>
+<h2>What it stores</h2>
+<p>For each linked account it stores the email address and a Google sign-in token, in the owner's Cloudflare storage. It does not keep copies of your email. Email content passes through only while answering a request.</p>
+<h2>Sharing</h2>
+<p>Data is sent only to Google (to carry out your requests) and to Claude (to show you the results). It is never sold, used for advertising, or shared with anyone else.</p>
+<h2>Removing access</h2>
+<p>Remove an account at <a href="${escapeHtml(origin)}/accounts">${escapeHtml(origin)}/accounts</a>, which also revokes its token, or revoke access at any time at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</p>
+<p class="muted">Use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.</p>
+</div>`;
+  return layout("Privacy policy", body);
 }
 
 export function consentPage(opts: { clientName: string; redirectHost: string; handle: string; local: boolean }): string {

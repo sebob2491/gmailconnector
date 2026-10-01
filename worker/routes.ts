@@ -19,7 +19,7 @@ import {
   revokeToken,
 } from "../src/google.js";
 import { googleClient, loadOwner, recordSignIn, redirectHostAllowed, saveOwner, type Env } from "./owner.js";
-import { accountsPage, consentPage, htmlResponse, messagePage, statusPage } from "./pages.js";
+import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
 const SESSION_COOKIE = "__Host-gmail-connector";
 const SESSION_TTL = 30 * 60;
@@ -373,6 +373,8 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
           claimed: Boolean((await loadOwner(env.OAUTH_KV)).owner),
         }),
       );
+    case "GET /privacy":
+      return htmlResponse(privacyPage(origin));
     case "GET /authorize":
       return authorizeGet(request, env, origin);
     case "POST /authorize":

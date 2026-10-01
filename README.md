@@ -59,7 +59,10 @@ Every Gmail account you link uses this one client. Google doesn't let anyone els
 1. Go to <https://console.cloud.google.com/> and create a project (any name).
 2. Go to **APIs & Services → Library → Gmail API** and click **Enable**.
 3. Go to **Google Auth Platform** (also called *OAuth consent screen*):
-   - **Branding:** app name (e.g. "My Gmail connector") and your email.
+   - **Branding:** app name (e.g. "My Gmail connector") and your email. Under **App domain**, fill in
+     the **home page**, **privacy policy link** and **authorized domain** shown on your connector's
+     setup page (the connector serves its own privacy policy at `/privacy`). Google requires these
+     before you can publish.
    - **Audience:** user type **External**, then **Publish app** so the status reads **In production**.
      In *Testing*, Google expires logins every 7 days.
    - **Data access:** add the scope `https://www.googleapis.com/auth/gmail.modify`.

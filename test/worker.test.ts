@@ -208,6 +208,13 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(res.text, new RegExp(`${ORIGIN}/mcp`));
     assert.match(res.text, /Not signed in yet/);
     assert.equal(res.headers.get("X-Frame-Options"), "DENY");
+    // What Google's Branding page needs before the app can be published.
+    assert.match(res.text, new RegExp(`${ORIGIN}/privacy`));
+    assert.match(res.text, /<code>tester\.workers\.dev<\/code>/);
+    const privacy = await new Browser(mf).fetch("/privacy");
+    assert.equal(privacy.status, 200);
+    assert.match(privacy.text, /Privacy policy/);
+    assert.match(privacy.text, /gmail\.modify/);
   });
 
   test("the MCP endpoint demands OAuth and advertises discovery metadata", async () => {
