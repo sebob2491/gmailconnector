@@ -6,8 +6,8 @@ import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/t
 import { AccountError, describeAccount, findAccount, type AccountSource, type LinkedAccount } from "./accounts.js";
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, type FetchLike } from "./google.js";
-import { decodeTextFile, kindOf, officeText, pdfText, sniffType } from "./attachments.js";
-import { attachmentText, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
+import { attachmentResult, FileTooLargeError, kindOf, readOffice, readPdf, readTextFile, sniffType, type ReadResult } from "./attachments.js";
+import { attachmentCharset, DEFAULT_MAX_BODY_CHARS, viewUrl } from "./format.js";
 import {
   isPrivateAddress,
   Mailbox,
@@ -863,14 +863,14 @@ export function createServer(deps: ServerDeps): McpServer {
           .int()
           .min(0)
           .optional()
-          .describe("Optional. Longest text to return (default 20000; 0 for no limit)."),
+          .describe("Optional. Longest text to return (default 20000; 0 for as much as can be read, up to 1,000,000 characters)."),
       },
       annotations: read,
     },
     async (args) =>
       runContent(async () => {
         const mb = await router.one(args.account);
-        const { info, bytes } = await mb.getAttachment(args.messageId, args);
+        const { info, bytes, message } = await mb.getAttachment(args.messageId, args);
         const mimeType = sniffType(bytes, info.mimeType, info.filename);
         const kind = kindOf(mimeType, info.filename);
         const meta = {
@@ -883,23 +883,24 @@ export function createServer(deps: ServerDeps): McpServer {
           viewUrl: viewUrl(mb.email, `all/${args.messageId}`),
         };
         const max = args.maxChars ?? DEFAULT_MAX_BODY_CHARS;
-        const asText = (text: string, extra: Record<string, unknown> = {}): CallToolResult["content"] => {
-          const limited = limitLength(attachmentText(text), max);
-          const truncated = limited.omitted
-            ? { truncated: `Shortened: ${limited.omitted.toLocaleString("en-US")} more characters not shown. Call again with maxChars: 0 for all of it.` }
-            : {};
+        const asText = (read: ReadResult, extra: Record<string, unknown> = {}): CallToolResult["content"] => {
+          const { text, truncated } = attachmentResult(read, max);
           return [
-            { type: "text", text: JSON.stringify({ ...meta, ...extra, ...truncated }) },
-            { type: "text", text: limited.text || "(The file contains no text.)" },
+            { type: "text", text: JSON.stringify({ ...meta, ...extra, ...(truncated ? { truncated } : {}) }) },
+            { type: "text", text: text || "(The file contains no text.)" },
           ];
         };
         const withNote = (note: string): CallToolResult["content"] => [{ type: "text", text: JSON.stringify({ ...meta, note }) }];
 
-        if (kind === "text") return asText(decodeTextFile(bytes, mimeType, info.filename));
+        if (kind === "text") {
+          const charset = attachmentCharset(message.payload, info.partId);
+          return asText(readTextFile(bytes, mimeType, info.filename, { maxChars: max, charset }));
+        }
         if (kind === "office") {
           try {
-            return asText(await officeText(bytes));
-          } catch {
+            return asText(await readOffice(bytes, { maxChars: max }));
+          } catch (err) {
+            if (err instanceof FileTooLargeError) return withNote(`${err.message} Open it in Gmail with viewUrl.`);
             return withNote("This Office file couldn't be read. Open it in Gmail with viewUrl.");
           }
         }
@@ -911,8 +912,8 @@ export function createServer(deps: ServerDeps): McpServer {
           ];
         }
         if (kind === "pdf") {
-          const text = await pdfText(bytes);
-          if (text) return asText(text, { extracted: "Text extracted from the PDF; layout, images and tables may be simplified." });
+          const read = await readPdf(bytes, { maxChars: max });
+          if (read) return asText(read, { extracted: "Text extracted from the PDF; layout, images and tables may be simplified." });
           // Scanned PDFs (or ones with custom font encodings) have no usable text layer: send the file itself,
           // which clients that read PDFs can show to Claude.
           if (bytes.length > MAX_PDF_BYTES) {
