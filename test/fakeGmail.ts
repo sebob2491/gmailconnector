@@ -116,6 +116,8 @@ export class FakeGmail {
   batchModifyCalls: any[] = [];
   /** Paths (prefix match) that answer with this status once, to exercise retries. */
   failOnce = new Map<string, number>();
+  /** Paths (prefix match) that keep answering with this status, like a stuck rate limit. */
+  failAlways = new Map<string, number>();
 
   addMailbox(email: string, refreshToken: string): FakeMailbox {
     const mb: FakeMailbox = {
@@ -256,6 +258,11 @@ export class FakeGmail {
     for (const [failPath, status] of this.failOnce) {
       if (path.startsWith(failPath)) {
         this.failOnce.delete(failPath);
+        return json(status, { error: { code: status, message: "Rate Limit Exceeded", errors: [{ reason: "rateLimitExceeded" }] } });
+      }
+    }
+    for (const [failPath, status] of this.failAlways) {
+      if (path.startsWith(failPath)) {
         return json(status, { error: { code: status, message: "Rate Limit Exceeded", errors: [{ reason: "rateLimitExceeded" }] } });
       }
     }

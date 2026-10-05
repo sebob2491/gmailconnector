@@ -342,7 +342,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Search email threads",
       description:
-        "Searches email threads in one or all linked Gmail accounts. Without `account`, every linked account is searched and results are grouped by account; pass that account back when opening a thread. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once).",
+        "Searches email threads in one or all linked Gmail accounts. Without `account`, every linked account is searched and results are grouped by account; pass that account back when opening a thread. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
       inputSchema: {
         account: multiAccountArg,
         query: z.string().optional().describe(SEARCH_QUERY_HELP),
@@ -423,7 +423,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "List drafts",
       description:
-        "Lists draft emails in one or all linked Gmail accounts (grouped by account when several). Returns draft IDs, recipients, dates and `viewUrl`; set view to DRAFT_VIEW_FULL to include subject and plain-text body.",
+        "Lists draft emails in one or all linked Gmail accounts (grouped by account when several). Returns draft IDs, recipients, dates and `viewUrl`; set view to DRAFT_VIEW_FULL to include subject and plain-text body. Drafts Gmail couldn't return just then are listed under `unavailable`.",
       inputSchema: {
         account: multiAccountArg,
         query: z.string().optional().describe("Optional. Gmail search syntax to filter drafts, e.g. \"subject:proposal\" or \"to:bob@example.com\"."),

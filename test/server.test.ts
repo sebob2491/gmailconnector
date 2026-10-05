@@ -1292,4 +1292,35 @@ describe("fixes from the second review", () => {
     assert.match(draft.json.id, /^r-/);
     assert.equal((await call("get_draft", { account: "work", draftId: ` ${draft.json.id} ` })).isError, false);
   });
+
+  test("threads and drafts Gmail keeps refusing are skipped and listed, not the whole account", async () => {
+    const { call, fake, work } = await setup();
+    fake.failAlways.set("threads/wt1", 429);
+    const res = await call("search_threads", { account: "work" });
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json.threads.map((t: any) => t.id), ["wt2"]);
+    assert.deepEqual(res.json.unavailable.threadIds, ["wt1"]);
+    assert.match(res.json.unavailable.error, /429/);
+
+    // Bulk changes by thread skip it too, and say so.
+    const bulk = await call("bulk_update", { account: "work", threadIds: ["wt1", "wt2"], action: "mark_read" });
+    assert.equal(bulk.isError, false, bulk.text);
+    assert.equal(bulk.json.changed, 1);
+    assert.deepEqual(bulk.json.unavailable.threadIds, ["wt1"]);
+    assert.ok(work.messages.get("w1")!.labelIds!.includes("UNREAD"));
+
+    // When nothing at all comes back, it's still an error.
+    fake.failAlways.set("threads/wt2", 429);
+    const none = await call("search_threads", { account: "work" });
+    assert.equal(none.isError, true);
+    fake.failAlways.clear();
+
+    const d1 = await call("create_draft", { account: "work", to: ["a@example.com"], subject: "One", body: "1" });
+    await call("create_draft", { account: "work", to: ["b@example.com"], subject: "Two", body: "2" });
+    fake.failAlways.set(`drafts/${d1.json.id}`, 503);
+    const drafts = await call("list_drafts", { account: "work", view: "DRAFT_VIEW_FULL" });
+    assert.equal(drafts.isError, false, drafts.text);
+    assert.deepEqual(drafts.json.drafts.map((d: any) => d.subject), ["Two"]);
+    assert.deepEqual(drafts.json.unavailable.draftIds, [d1.json.id]);
+  });
 });

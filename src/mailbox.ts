@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { GmailApiError, GmailClient } from "./gmailClient.js";
+import { GmailApiError, GmailClient, type BatchResult } from "./gmailClient.js";
 import {
   METADATA_HEADERS,
   apiFormat,
@@ -131,6 +131,31 @@ function checkId(id: string, what: string): string {
   return clean;
 }
 
+type Failed = { id: string; error: GmailApiError };
+
+/**
+ * Pairs batch results with their IDs. Items deleted since they were listed (404) are dropped, and
+ * items Gmail still didn't return after the retry round (e.g. rate limits) are reported as failed
+ * rather than failing the whole call. Only when nothing came back at all is the error thrown.
+ */
+function settle<T>(ids: string[], results: BatchResult<T>[]): { found: { id: string; value: T }[]; failed: Failed[] } {
+  const found: { id: string; value: T }[] = [];
+  const failed: Failed[] = [];
+  ids.forEach((id, i) => {
+    const r = results[i];
+    if (r.ok) found.push({ id, value: r.value });
+    else if (r.error.status !== 404) failed.push({ id, error: r.error });
+  });
+  if (failed.length && !found.length) throw failed[0].error;
+  return { found, failed };
+}
+
+/** The `unavailable` part of a result: what was skipped, and why. */
+function unavailable(key: "threadIds" | "draftIds", failed: Failed[]) {
+  if (!failed.length) return {};
+  return { unavailable: { [key]: failed.map((f) => f.id), error: failed[0].error.message } };
+}
+
 /** True when the query asks for drafts (`in:draft`), but not when it excludes them (`-in:draft`). */
 function mentionsDrafts(query: string | undefined): boolean {
   return /(?:^|[\s({])(?:in|is):drafts?\b/i.test(query ?? "");
@@ -218,13 +243,8 @@ export class Mailbox {
     const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
       ids.map((t) => ({ path: `threads/${t.id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
     );
-    const found = ids.flatMap((t, i) => {
-      const r = fetched[i];
-      if (r.ok) return [{ id: t.id, thread: r.value }];
-      if (r.error.status === 404) return []; // deleted since the search ran
-      throw r.error;
-    });
-    const threads = await mapLimit(found, 8, async ({ id, thread }) => {
+    const { found, failed } = settle(ids.map((t) => t.id), fetched);
+    const threads = await mapLimit(found, 8, async ({ id, value: thread }) => {
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
       const recent = messages.slice(-THREAD_PREVIEW_MESSAGES);
@@ -247,7 +267,11 @@ export class Mailbox {
         messages: summaries.map(({ subject: s, ...m }) => (s !== undefined && normalizeSubject(s) !== base ? { subject: s, ...m } : m)),
       };
     });
-    return { threads, ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}) };
+    return {
+      threads,
+      ...unavailable("threadIds", failed),
+      ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}),
+    };
   }
 
   async getThread(threadId: string, format: MessageFormat, opts: FormatOptions = {}) {
@@ -504,13 +528,9 @@ export class Mailbox {
     const fetched = await this.client.batchGet<{ id: string; message: ApiMessage }>(
       ids.map((d) => ({ path: `drafts/${d.id}`, query: { format: full ? "full" : "metadata" } })),
     );
-    const found = ids.flatMap((_, i) => {
-      const r = fetched[i];
-      if (r.ok) return [r.value];
-      if (r.error.status === 404) return []; // deleted or sent since it was listed
-      throw r.error;
-    });
-    const drafts = await mapLimit(found, 8, async (draft) => {
+    // Drafts deleted or sent since they were listed are dropped.
+    const { found, failed } = settle(ids.map((d) => d.id), fetched);
+    const drafts = await mapLimit(found, 8, async ({ value: draft }) => {
       // A list shows a preview of each draft; get_draft returns the whole thing.
       const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY", { maxBodyChars: LIST_BODY_CHARS });
       if (full) {
@@ -520,7 +540,11 @@ export class Mailbox {
       const { labelIds: _l, ...rest } = formatted as FormattedMessage;
       return rest;
     });
-    return { drafts, ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}) };
+    return {
+      drafts,
+      ...unavailable("draftIds", failed),
+      ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}),
+    };
   }
 
   async getDraft(draftId: string, format: MessageFormat, opts: FormatOptions = {}) {
@@ -752,15 +776,10 @@ export class Mailbox {
       const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
         sel.threadIds.map((id) => ({ path: `threads/${checkId(id, "thread")}`, query: { format: "minimal" } })),
       );
+      const { found, failed } = settle(sel.threadIds, fetched);
       const ids: string[] = [];
-      fetched.forEach((r, i) => {
-        if (!r.ok) {
-          if (r.error.status === 404) return;
-          throw new GmailApiError(r.error.status, `Thread ${sel.threadIds![i]}: ${r.error.message}`);
-        }
-        for (const m of r.value.messages ?? []) if (!m.labelIds?.includes("DRAFT")) ids.push(m.id);
-      });
-      return { ids: ids.slice(0, max), more: ids.length > max };
+      for (const { value } of found) for (const m of value.messages ?? []) if (!m.labelIds?.includes("DRAFT")) ids.push(m.id);
+      return { ids: ids.slice(0, max), more: ids.length > max, ...unavailable("threadIds", failed) };
     }
     const ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))];
     return { ids: ids.slice(0, max), more: ids.length > max };
@@ -780,7 +799,7 @@ export class Mailbox {
       : [];
     const addLabelIds = await this.resolveLabelIds(change.add, labels);
     const removeLabelIds = await this.resolveLabelIds(change.remove, labels);
-    const { ids, more } = await this.selectMessages(sel, opts.max);
+    const { ids, more, ...skipped } = await this.selectMessages(sel, opts.max);
     const moreNote = more
       ? { more: `More emails match than the limit of ${opts.max}. Run it again to continue, or raise maxEmails.` }
       : {};
@@ -800,14 +819,14 @@ export class Mailbox {
             ]
           : [],
       );
-      return { dryRun: true, wouldChange: ids.length, ...moreNote, preview };
+      return { dryRun: true, wouldChange: ids.length, ...moreNote, ...skipped, preview };
     }
     for (let i = 0; i < ids.length; i += 1000) {
       await this.client.request("POST", "messages/batchModify", {
         json: { ids: ids.slice(i, i + 1000), addLabelIds, removeLabelIds },
       });
     }
-    return { changed: ids.length, ...moreNote };
+    return { changed: ids.length, ...moreNote, ...skipped };
   }
 
   async trash(kind: "messages" | "threads", id: string, untrash = false) {
