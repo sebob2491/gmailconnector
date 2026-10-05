@@ -191,9 +191,26 @@ describe("accounts", () => {
     const { call } = await setup({ defaultAccount: "work" });
     const res = await call("list_accounts");
     assert.deepEqual(res.json.accounts, [
-      { email: PERSONAL, alias: "personal", isDefault: false },
-      { email: WORK, alias: "work", isDefault: true },
+      { email: PERSONAL, alias: "personal", isDefault: false, status: "ok" },
+      { email: WORK, alias: "work", isDefault: true, status: "ok" },
     ]);
+  });
+
+  test("list_accounts says which accounts need re-linking, without failing", async () => {
+    const { call, fake } = await setup();
+    fake.revoked.add("rt-work");
+    const res = await call("list_accounts");
+    assert.equal(res.isError, false, res.text);
+    const [personal, work] = res.json.accounts;
+    assert.equal(personal.status, "ok");
+    assert.equal(work.status, "needs re-link");
+    assert.match(work.hint, /me@work\.example: authorization expired or was revoked\. Re-link it/);
+
+    const other = await setup();
+    other.fake.tokenOutage = 503;
+    const outage = await other.call("list_accounts");
+    assert.equal(outage.isError, false);
+    assert.ok(outage.json.accounts.every((a: any) => a.status === "couldn't check" && /token refresh failed \(503\)/.test(a.error)), outage.text);
   });
 
   test("single-account tools need `account` when several are linked and no default is set", async () => {

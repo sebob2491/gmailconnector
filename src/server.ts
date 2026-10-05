@@ -5,7 +5,7 @@ import { z } from "zod";
 import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js";
 import { AccountError, describeAccount, findAccount, type AccountSource, type LinkedAccount } from "./accounts.js";
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
-import { defaultFetch, type FetchLike } from "./google.js";
+import { AuthError, defaultFetch, type FetchLike } from "./google.js";
 import { decodeTextFile, kindOf, officeText, pdfText, sniffType } from "./attachments.js";
 import { cleanBody, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
 import { Mailbox } from "./mailbox.js";
@@ -319,18 +319,32 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "List linked Gmail accounts",
       description:
-        "Lists the Gmail accounts linked to this connector, with their aliases and which one is the default. Use the email or alias as the `account` argument of other tools. The result also says how the user can link or remove accounts.",
+        "Lists the Gmail accounts linked to this connector, with their aliases, which one is the default, and each account's `status`. Use the email or alias as the `account` argument of other tools. If an account's status is \"needs re-link\", tell the user and pass on its `hint`: that account won't work until they link it again. The result also says how the user can link or remove accounts.",
       inputSchema: {},
       annotations: read,
     },
     async () =>
       run(async () => {
         const data = await store.load();
+        // Getting an access token shows whether Google still accepts the account's authorization
+        // (tokens are cached, so this is usually free).
+        const statuses = await Promise.all(
+          data.accounts.map(async (a) => {
+            try {
+              await tokens.get(a);
+              return { status: "ok" };
+            } catch (err) {
+              if (err instanceof AuthError && err.code === "invalid_grant") return { status: "needs re-link", hint: err.message };
+              return { status: "couldn't check", error: (err as Error).message };
+            }
+          }),
+        );
         return {
-          accounts: data.accounts.map((a) => ({
+          accounts: data.accounts.map((a, i) => ({
             email: a.email,
             ...(a.alias ? { alias: a.alias } : {}),
             isDefault: data.defaultAccount ? a.email.toLowerCase() === data.defaultAccount.toLowerCase() : data.accounts.length === 1,
+            ...statuses[i],
           })),
           manageAccounts: data.accounts.length ? manageHint : `No accounts linked yet. ${manageHint}`,
         };

@@ -118,6 +118,8 @@ export class FakeGmail {
   failOnce = new Map<string, number>();
   /** Paths (prefix match) that keep answering with this status, like a stuck rate limit. */
   failAlways = new Map<string, number>();
+  /** When set, token refreshes fail with this HTTP status (Google having trouble, not a revoked grant). */
+  tokenOutage?: number;
   /** Called before each API request: returning a status fails it with that status; throwing is a network error. */
   intercept?: (method: string, path: string) => number | undefined;
 
@@ -240,6 +242,7 @@ export class FakeGmail {
           scope: "https://www.googleapis.com/auth/gmail.modify",
         });
       }
+      if (this.tokenOutage) return json(this.tokenOutage, { error: "temporarily_unavailable" });
       const mb = this.mailboxes.find((m) => m.refreshToken === form.get("refresh_token"));
       if (!mb || this.revoked.has(mb.refreshToken)) return json(400, { error: "invalid_grant" });
       return json(200, { access_token: `at-${mb.email}-${this.tokenCalls}`, expires_in: 3600 });

@@ -26,7 +26,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 ### Differences from the built-in Gmail connector
 
-- New `list_accounts` tool, and an `account` argument on every tool.
+- New `list_accounts` tool, and an `account` argument on every tool. `list_accounts` also checks each
+  account and says "needs re-link" when its Google access was revoked or has expired, so Claude can tell
+  you which one to link again.
 - New `get_attachment` tool: Claude can read attachments. Text, CSV, HTML, calendar invites, Word
   (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images as images; PDFs as extracted
   text (when the PDF has a text layer with standard fonts), otherwise as the PDF file itself for clients
