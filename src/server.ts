@@ -369,7 +369,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Get email thread",
       description:
-        "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads.",
+        "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads. In PLAIN_TEXT, each reply's quoted copy of earlier messages is hidden, since those messages are in the result; get_message shows one email in full.",
       inputSchema: {
         account: accountArg,
         threadId: z.string().describe("Required. The thread ID."),
@@ -383,7 +383,11 @@ export function createServer(deps: ServerDeps): McpServer {
         const mb = await router.one(args.account);
         return {
           account: mb.email,
-          ...(await mb.getThread(args.threadId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars, shortenLinks: true })),
+          ...(await mb.getThread(args.threadId, args.messageFormat ?? "PLAIN_TEXT", {
+            maxBodyChars: args.maxBodyChars,
+            shortenLinks: true,
+            hideQuotedHistory: true,
+          })),
         };
       }),
   );

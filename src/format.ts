@@ -296,6 +296,36 @@ export function cleanBody(text: string): string {
     .trim();
 }
 
+/**
+ * Where a reply's quoted history starts: "On <date>, <name> wrote:" (possibly wrapped onto a second
+ * line, and in a few languages), Outlook's "-----Original Message-----", or its "From:/Sent:" header block.
+ */
+const QUOTE_START = new RegExp(
+  [
+    String.raw`^On\b[^\n]{0,300}(?:\n[^\n]{0,300})?\b(?:wrote|schrieb|a écrit|escribió|scrisse|schreef|skrev|napisał)\s?:[ \t]*$`,
+    String.raw`^-{2,}[ \t]*Original Message[ \t]*-{2,}[ \t]*$`,
+    String.raw`^From:[^\n]+\n(?:Sent|Date):[^\n]+\n(?:To|Subject|Cc):`,
+  ].join("|"),
+  "im",
+);
+
+export const QUOTE_HIDDEN = "[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]";
+
+/**
+ * Removes the trailing quoted history from a reply, for thread views where the quoted messages are
+ * already shown. Only cuts when everything after the marker is quote: all lines start with ">", or
+ * none do (a top-posted reply). A mix means the sender answered between quoted lines, so it's kept.
+ */
+export function hideQuotedHistory(text: string): string {
+  const match = QUOTE_START.exec(text);
+  // Real "On … wrote:" lines carry a date or time; "On Monday the team wrote:" in prose doesn't count.
+  if (!match || (/^on\b/i.test(match[0]) && !/\d/.test(match[0]))) return text;
+  const after = text.slice(match.index + match[0].length).split("\n").filter((l) => l.trim());
+  const quoted = after.filter((l) => l.trimStart().startsWith(">")).length;
+  if (quoted && quoted < after.length) return text;
+  return `${text.slice(0, match.index).trimEnd()}\n\n${QUOTE_HIDDEN}`.trimStart();
+}
+
 /** Links longer than this are nearly always tracking redirects; reading views cut them to their site. */
 const LONG_LINK = 200;
 
@@ -330,6 +360,8 @@ export interface FormatOptions {
    * may be edited and saved again (drafts), since the cut links would replace the real ones.
    */
   shortenLinks?: boolean;
+  /** In PLAIN_TEXT, hide a reply's quoted history (for thread views, where it's shown anyway). */
+  hideQuotedHistory?: boolean;
 }
 
 export interface FormattedMessage {
@@ -385,6 +417,7 @@ export async function formatMessage(
     const content = await extractContent(p, loadData);
     const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
     let body = cleanBody(bodyText(content));
+    if (opts.hideQuotedHistory && format === "PLAIN_TEXT") body = hideQuotedHistory(body);
     let shortenedLinks = 0;
     if (opts.shortenLinks && format === "PLAIN_TEXT") ({ text: body, shortened: shortenedLinks } = shortenLinks(body));
     const plain = limitLength(body, max);

@@ -1002,6 +1002,31 @@ describe("cleaner, smaller results", () => {
     assert.equal(res.json.plaintextBody, "Ends tonight.\n\nItem\t\tPrice");
   });
 
+  test("get_thread hides quoted history that repeats earlier messages; get_message keeps it", async () => {
+    const { call, fake, personal } = await setup();
+    const mail = (id: string, from: string, subject: string, body: string[]) =>
+      fake.deliver(personal, crlf([`From: ${from}`, `To: ${PERSONAL}`, `Subject: ${subject}`, "Content-Type: text/plain", "", ...body]), {
+        id,
+        threadId: "conv",
+      });
+    mail("q0", "Ann <ann@example.com>", "Interview", ["Can you do Friday?", "", "On Mon, Sep 28, 2026 at 9:00 AM Recruiter <r@example.com> wrote:", "> Earlier note"]);
+    mail("q1", "Me <me@example.com>", "Re: Interview", ["Friday works.", "", "On Tue, Sep 29, 2026 at 6:33 AM Ann Smith <", "ann@example.com> wrote:", "", "> Can you do Friday?", ">"]);
+    mail("q2", "Ann <ann@example.com>", "RE: Interview", ["Great, see you then.", "", "-----Original Message-----", "From: Me <me@example.com>", "Friday works."]);
+    mail("q3", "Me <me@example.com>", "Re: Interview", ["On Wed, Sep 30, 2026, Ann <ann@example.com> wrote:", "> Where?", "Downtown office.", "> When?", "10am."]);
+    mail("q4", "Ann <ann@example.com>", "Re: Interview", ["Thanks!", "", "On Monday the team wrote:", "We are hiring two people."]);
+
+    const thread = await call("get_thread", { account: "personal", threadId: "conv" });
+    const bodies = thread.json.messages.map((m: any) => m.plaintextBody);
+    assert.match(bodies[0], /> Earlier note$/, "the first message keeps its quote");
+    assert.equal(bodies[1], "Friday works.\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+    assert.match(bodies[2], /^Great, see you then\.\n\n\[Quoted earlier messages hidden/);
+    assert.match(bodies[3], /Downtown office\.\n> When\?\n10am\.$/, "answers written between quoted lines are kept");
+    assert.equal(bodies[4], "Thanks!\n\nOn Monday the team wrote:\nWe are hiring two people.", "prose isn't mistaken for a quote");
+
+    const one = await call("get_message", { account: "personal", messageId: "q1" });
+    assert.match(one.json.plaintextBody, /wrote:\n\n> Can you do Friday\?\n>$/);
+  });
+
   test("long tracking links are cut to their site when reading, but kept in drafts and FULL_CONTENT", async () => {
     const { call, fake, personal } = await setup();
     const tracking = `https://click.mail.shop.example/c2/abc?jwt=${"x".repeat(1500)}`;

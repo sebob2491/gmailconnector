@@ -48,6 +48,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   redirects) to their website, e.g. `https://click.shop.com/…`, with a note saying so. A typical store
   email shrinks from tens of thousands of characters to a few thousand. `messageFormat: "FULL_CONTENT"`
   returns the full links. Drafts are never shortened, so editing one can't break its links.
+- `get_thread` hides each reply's quoted copy of the earlier messages ("On … wrote:" and below), since
+  those messages are in the result anyway. A real 13-email conversation went from about 41,000 to 4,700
+  characters. Replies that answer between quoted lines are left alone, and `get_message` still shows any
+  one email in full.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
 - `forward` re-attaches the original message's attachments.

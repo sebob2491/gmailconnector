@@ -244,7 +244,8 @@ export class Mailbox {
     return {
       id: thread.id as string,
       viewUrl: viewUrl(this.email, `all/${thread.id}`),
-      messages: await Promise.all(messages.map((m) => this.format(m, format, opts))),
+      // The first message keeps any quote: what it quotes isn't in this thread.
+      messages: await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts))),
     };
   }
 
