@@ -13,6 +13,7 @@ import {
   recipientsFrom,
   viewUrl,
   type ApiMessage,
+  type ExtractedContent,
   type FormatOptions,
   type FormattedMessage,
   type MessageFormat,
@@ -23,6 +24,7 @@ import {
   escapeHtml,
   htmlToText,
   isValidAddress,
+  MAX_ATTACHMENT_BYTES,
   MimeError,
   type OutgoingAttachment,
   type OutgoingMessage,
@@ -422,9 +424,14 @@ export class Mailbox {
     return this.format(msg, format, opts);
   }
 
-  /** Downloads every attachment of a message so it can be re-attached (forwarding, draft edits). */
-  private async downloadAttachments(msg: ApiMessage): Promise<OutgoingAttachment[]> {
-    const content = await extractContent(msg.payload, this.loader(msg.id));
+  /**
+   * Downloads every attachment of a message so it can be re-attached (forwarding, draft edits).
+   * Attachments over Gmail's 25 MB limit are refused from their listed sizes, before downloading
+   * anything: they couldn't be sent, and holding them would strain the hosted connector's memory.
+   */
+  private async downloadAttachments(msg: ApiMessage, content: ExtractedContent, tooBig: (mb: string) => string): Promise<OutgoingAttachment[]> {
+    const total = content.attachments.reduce((sum, a) => sum + a.size, 0);
+    if (total > MAX_ATTACHMENT_BYTES) throw new MimeError(tooBig((total / 1048576).toFixed(1)));
     const withIds = content.attachments.filter((a) => a.id);
     const fetched = await this.client.batchGet<{ data: string }>(
       withIds.map((a) => ({ path: `messages/${msg.id}/attachments/${a.id}` })),
@@ -607,7 +614,13 @@ export class Mailbox {
       html,
       inReplyTo: header(p, "Message-ID"),
       references: referencesFor(p),
-      attachments: await this.downloadAttachments(original),
+      attachments: await this.downloadAttachments(
+        original,
+        content,
+        (mb) =>
+          `This email's attachments add up to ${mb} MB, more than the 25 MB Gmail allows in one email, so it can't be forwarded ` +
+          `with them from here. Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.`,
+      ),
     });
     const sent = await this.sendMail(() => this.upload("POST", "messages/send", { threadId: original.threadId }, mime));
     return this.sentResult(sent);
@@ -745,7 +758,13 @@ export class Mailbox {
       html: bodyChanged ? input.htmlBody : content.html,
       inReplyTo,
       references: header(p, "References"),
-      attachments: input.attachments ? toAttachments(input.attachments) : await this.downloadAttachments(msg),
+      attachments: input.attachments
+        ? toAttachments(input.attachments)
+        : await this.downloadAttachments(
+            msg,
+            content,
+            (mb) => `This draft's attachments add up to ${mb} MB, more than the 25 MB Gmail allows in one email. Pass \`attachments\` to replace them.`,
+          ),
     });
     const draft = await this.upload("PUT", `drafts/${draftId}`, { id: draftId, message: { threadId: msg.threadId } }, mime);
     return this.draftResult(draft);

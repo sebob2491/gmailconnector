@@ -1582,4 +1582,39 @@ describe("fixes from the second review", () => {
     assert.equal(refused.isError, true);
     assert.doesNotMatch(refused.text, /may have been sent/);
   });
+
+  test("forwarding or keeping attachments over 25 MB is refused before downloading them", async () => {
+    const { call, fake, work } = await setup();
+    const big = (id: string, labelIds: string[]) => {
+      work.messages.set(id, {
+        id,
+        threadId: id,
+        labelIds,
+        payload: {
+          partId: "",
+          mimeType: "multipart/mixed",
+          filename: "",
+          headers: [{ name: "Subject", value: "Video" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+          body: { size: 0 },
+          parts: [
+            { partId: "0", mimeType: "text/plain", filename: "", headers: [], body: { data: Buffer.from("see").toString("base64url"), size: 3 } },
+            { partId: "1", mimeType: "video/mp4", filename: "a.mp4", headers: [], body: { attachmentId: "ATT1", size: 20 * 1048576 } },
+            { partId: "2", mimeType: "video/mp4", filename: "b.mp4", headers: [], body: { attachmentId: "ATT2", size: 10 * 1048576 } },
+          ],
+        },
+      });
+    };
+    big("v1", ["INBOX"]);
+    fake.batchCalls = 0;
+    const fwd = await call("forward", { account: "work", messageId: "v1", to: ["x@example.com"] });
+    assert.equal(fwd.isError, true);
+    assert.match(fwd.text, /attachments add up to 30\.0 MB, more than the 25 MB Gmail allows.*Forward it in Gmail instead \(https:\/\/mail\.google\.com/);
+    big("v2", ["DRAFT"]);
+    work.drafts.set("r-big", "v2");
+    const upd = await call("update_draft", { account: "work", draftId: "r-big", subject: "Video!" });
+    assert.match(upd.text, /This draft's attachments add up to 30\.0 MB.*Pass `attachments` to replace them/);
+    assert.equal(fake.batchCalls, 0, "nothing was downloaded");
+    assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")));
+    assert.equal(fake.sentBy(WORK).length, 0);
+  });
 });
