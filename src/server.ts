@@ -7,7 +7,7 @@ import { AccountError, describeAccount, findAccount, type AccountSource, type Li
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, type FetchLike } from "./google.js";
 import { decodeTextFile, kindOf, officeText, pdfText, sniffType } from "./attachments.js";
-import { cleanBody, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
+import { attachmentText, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
 import {
   isPrivateAddress,
   Mailbox,
@@ -884,7 +884,7 @@ export function createServer(deps: ServerDeps): McpServer {
         };
         const max = args.maxChars ?? DEFAULT_MAX_BODY_CHARS;
         const asText = (text: string, extra: Record<string, unknown> = {}): CallToolResult["content"] => {
-          const limited = limitLength(cleanBody(text), max);
+          const limited = limitLength(attachmentText(text), max);
           const truncated = limited.omitted
             ? { truncated: `Shortened: ${limited.omitted.toLocaleString("en-US")} more characters not shown. Call again with maxChars: 0 for all of it.` }
             : {};

@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
+import { attachmentText } from "../src/format.js";
 import { decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, sniffType } from "../src/attachments.js";
 import { docx, docxOf, pdf, pdfOf, png, pptx, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
@@ -281,4 +282,9 @@ test("PowerPoint keeps line breaks and follows the presentation's slide order", 
     "ppt/slides/slide2.xml": slide('<a:p><a:pPr><a:tabLst><a:tab pos="914400" algn="l"/></a:tabLst></a:pPr><a:r><a:t>Agenda</a:t></a:r></a:p>'),
   });
   assert.equal(await officeText(file), "--- Slide 1 ---\nAgenda\n\n--- Slide 2 ---\nQuarterly\nResults");
+});
+
+test("attachment text keeps its spaces and tabs", () => {
+  const yaml = "﻿server:\n  port: 80\n  hosts:\n    - a\u0000\nname\t\tamount\n";
+  assert.equal(attachmentText(yaml), "server:\n  port: 80\n  hosts:\n    - a\nname\t\tamount\n");
 });

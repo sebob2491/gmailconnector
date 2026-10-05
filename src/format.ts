@@ -297,6 +297,15 @@ export function cleanBody(text: string): string {
 }
 
 /**
+ * Text from an attachment, as it is in the file: only a byte-order mark and NUL characters are removed.
+ * Unlike cleanBody, spaces and tabs are kept (they are indentation in code and YAML, and empty cells
+ * in tab-separated data).
+ */
+export function attachmentText(text: string): string {
+  return text.replace(/^\ufeff/, "").replace(/\0/g, "");
+}
+
+/**
  * Where a reply's quoted history starts: "On <date>, <name> wrote:" (possibly wrapped onto a second
  * line, and in a few languages), Outlook's "-----Original Message-----", or its "From:/Sent:" header block.
  */
