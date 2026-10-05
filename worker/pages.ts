@@ -140,7 +140,7 @@ export function privacyPage(origin: string): string {
 <h2>Sharing</h2>
 <p>Data is sent only to Google (to carry out your requests) and to Claude (to show you the results). It is never sold, used for advertising, or shared with anyone else.</p>
 <h2>Removing access</h2>
-<p>Remove an account at <a href="${escapeHtml(origin)}/accounts">${escapeHtml(origin)}/accounts</a>, which also revokes its token, or revoke access at any time at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</p>
+<p>Remove an account at <a href="${escapeHtml(origin)}/accounts">${escapeHtml(origin)}/accounts</a>, which also revokes its token, or revoke access at any time at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>. The same page can disconnect Claude, which ends Claude's access to the connector.</p>
 <p class="muted">Use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.</p>
 </div>`;
   return layout("Privacy policy", body);
@@ -205,6 +205,13 @@ ${
 <form method="post" action="/accounts/cancel">${csrf}<button class="link">Cancel</button></form>`
     : `<p class="muted">Changes apply to Claude right away (allow up to a minute).</p>`
 }
-</div>`;
+</div>
+${
+  opts.connecting
+    ? ""
+    : `<div class="card"><h2>Claude's access</h2>
+<p class="muted">Disconnecting signs Claude out of this connector everywhere it's connected (every Claude account and app). Your linked Gmail accounts stay linked; connect again from Claude's connector settings to use them.</p>
+<form method="post" action="/accounts/disconnect" class="actions">${csrf}<button>Disconnect Claude</button></form></div>`
+}`;
   return layout("Gmail accounts", body);
 }

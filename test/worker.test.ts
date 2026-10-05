@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { convertV4MiniflareOptions, Miniflare, Request as MfRequest, Response as MfResponse } from "miniflare";
 import { FakeGmail } from "./fakeGmail.js";
@@ -68,14 +69,32 @@ function answerConsent(browser: Browser, consentHtml: string, decision: "approve
   return browser.fetch(action, { form: { csrf: field(consentHtml, "csrf"), decision } });
 }
 
-/** Every KV entry, to check that a request wrote nothing. */
-async function kvSnapshot(instance: Miniflare): Promise<Map<string, string | null>> {
-  const kv = await instance.getKVNamespace("OAUTH_KV");
-  const snapshot = new Map<string, string | null>();
-  for (const key of (await kv.list()).keys) snapshot.set(key.name, (await kv.get(key.name, "text")) as string | null);
-  return snapshot;
-}
-
+/**
+ * A second Worker sharing the connector's KV, running the same OAuth library, so tests can create
+ * Claude connections the way older versions of the connector did and inspect what a token carries.
+ */
+const MINTER = `
+import { getOAuthApi } from "./oauth-provider.js";
+export default {
+  async fetch(request, env) {
+    const body = await request.json();
+    const api = getOAuthApi({
+      apiRoute: "/mcp",
+      apiHandler: { fetch: () => new Response(null) },
+      defaultHandler: { fetch: () => new Response(null) },
+      authorizeEndpoint: "/authorize",
+      tokenEndpoint: "/token",
+      clientRegistrationEndpoint: "/register",
+      scopesSupported: ["gmail"],
+      resourceMetadata: { resource: body.origin + "/mcp", authorization_servers: [body.origin], scopes_supported: ["gmail"] },
+    }, env);
+    if (body.unwrap) return Response.json(await api.unwrapToken(body.unwrap));
+    const { redirectTo } = await api.completeAuthorization({
+      request: body.request, userId: "owner", metadata: {}, scope: ["gmail"], props: body.props, revokeExistingGrants: false,
+    });
+    return Response.json({ redirectTo });
+  },
+};`;
 
 const COMPAT = { compatibilityDate: "2026-09-01", compatibilityFlags: ["nodejs_compat", "global_fetch_strictly_public"] };
 
@@ -85,24 +104,50 @@ let failRevoke = false;
 async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, string>): Promise<Miniflare> {
   const instance = new Miniflare(
     convertV4MiniflareOptions({
-      modules: true,
-      scriptPath: "dist-worker/index.js",
-      ...COMPAT,
-      kvNamespaces: ["OAUTH_KV"],
-      bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
-      outboundService: async (req: MfRequest) => {
-        if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
-        const res = await fakeGoogle.fetch(req.url, {
-          method: req.method,
-          headers: Object.fromEntries(req.headers),
-          body: req.method === "GET" ? undefined : await req.text(),
-        });
-        return new MfResponse(await res.arrayBuffer(), { status: res.status, headers: Object.fromEntries(res.headers) });
-      },
+      workers: [
+        {
+          name: "connector",
+          modules: true,
+          scriptPath: "dist-worker/index.js",
+          ...COMPAT,
+          kvNamespaces: ["OAUTH_KV"],
+          bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
+          outboundService: async (req: MfRequest) => {
+            if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
+            const res = await fakeGoogle.fetch(req.url, {
+              method: req.method,
+              headers: Object.fromEntries(req.headers),
+              body: req.method === "GET" ? undefined : await req.text(),
+            });
+            return new MfResponse(await res.arrayBuffer(), { status: res.status, headers: Object.fromEntries(res.headers) });
+          },
+        },
+        {
+          name: "minter",
+          modules: [
+            { type: "ESModule", path: "minter.mjs", contents: MINTER },
+            {
+              type: "ESModule",
+              path: "oauth-provider.js",
+              contents: readFileSync("node_modules/@cloudflare/workers-oauth-provider/dist/oauth-provider.js", "utf8"),
+            },
+          ],
+          ...COMPAT,
+          kvNamespaces: { OAUTH_KV: "OAUTH_KV" },
+        },
+      ],
     }),
   );
   await instance.ready;
   return instance;
+}
+
+/** Every KV entry, to check that a request wrote nothing. */
+async function kvSnapshot(instance: Miniflare): Promise<Map<string, string | null>> {
+  const kv = await instance.getKVNamespace("OAUTH_KV");
+  const snapshot = new Map<string, string | null>();
+  for (const key of (await kv.list()).keys) snapshot.set(key.name, (await kv.get(key.name, "text")) as string | null);
+  return snapshot;
 }
 
 let mf: Miniflare;
@@ -189,7 +234,11 @@ async function mcp(method: string, params: Record<string, unknown> = {}, token =
 }
 
 async function callTool(name: string, args: Record<string, unknown> = {}) {
-  const res = await mcp("tools/call", { name, arguments: args });
+  return callToolWith(accessToken, name, args);
+}
+
+async function callToolWith(token: string, name: string, args: Record<string, unknown> = {}) {
+  const res = await mcp("tools/call", { name, arguments: args }, token);
   const text = res.result.content[0].text as string;
   let json: any;
   try {
@@ -212,21 +261,76 @@ async function connectAsOwner(clientId: string): Promise<string> {
   const page = await browser.fetch("/accounts");
   const done = await browser.fetch("/accounts/done", { form: { csrf: field(page.text, "csrf") } });
   const code = new URL(done.location).searchParams.get("code")!;
+  return (await exchangeCode(clientId, code, verifier)).access_token;
+}
+
+async function tokenRequest(form: Record<string, string>) {
   const res = await mf.dispatchFetch(`${ORIGIN}/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: CLAUDE_CALLBACK,
-      client_id: clientId,
-      code_verifier: verifier,
-      resource: `${ORIGIN}/mcp`,
-    }).toString(),
+    body: new URLSearchParams(form).toString(),
   });
-  const tokens = (await res.json()) as any;
-  assert.equal(res.status, 200, JSON.stringify(tokens));
-  return tokens.access_token;
+  return { status: res.status, body: (await res.json()) as any };
+}
+
+async function exchangeCode(clientId: string, code: string, verifier: string) {
+  const res = await tokenRequest({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: CLAUDE_CALLBACK,
+    client_id: clientId,
+    code_verifier: verifier,
+    resource: `${ORIGIN}/mcp`,
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  return res.body as { access_token: string; refresh_token: string };
+}
+
+const refreshClaudeToken = (clientId: string, refreshToken: string) =>
+  tokenRequest({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId });
+
+/** An MCP request whose status may be an error. */
+async function mcpStatus(token: string) {
+  const res = await mf.dispatchFetch(`${ORIGIN}/mcp`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpId, method: "tools/list", params: {} }),
+  });
+  return { status: res.status, wwwAuthenticate: res.headers.get("WWW-Authenticate") ?? "", text: await res.text() };
+}
+
+async function minter(body: Record<string, unknown>) {
+  const res = await (await mf.getWorker("minter")).fetch("https://minter/", {
+    method: "POST",
+    body: JSON.stringify({ origin: ORIGIN, ...body }),
+  });
+  return (await res.json()) as any;
+}
+
+/** Creates a Claude connection straight through the OAuth library, with the given props, as older versions did. */
+async function connectWithProps(props: Record<string, unknown>, clientId = firstClientId) {
+  const verifier = randomBytes(32).toString("base64url");
+  const request = {
+    responseType: "code",
+    clientId,
+    redirectUri: CLAUDE_CALLBACK,
+    scope: ["gmail"],
+    state: "s",
+    codeChallenge: createHash("sha256").update(verifier).digest("base64url"),
+    codeChallengeMethod: "S256",
+    resource: `${ORIGIN}/mcp`,
+  };
+  const { redirectTo } = await minter({ request, props });
+  return exchangeCode(clientId, new URL(redirectTo).searchParams.get("code")!, verifier);
+}
+
+/** Signs a new browser in as the owner and returns it with the accounts page's CSRF token. */
+async function ownerBrowser() {
+  const browser = new Browser(mf);
+  const back = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
+  assert.equal(back.status, 303, back.text);
+  const page = await browser.fetch("/accounts");
+  return { browser, csrf: field(page.text, "csrf") };
 }
 
 describe("hosted connector (Cloudflare Worker)", () => {
@@ -327,6 +431,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(tokenRes.status, 200, JSON.stringify(tokens));
     assert.ok(tokens.access_token && tokens.refresh_token);
     accessToken = tokens.access_token;
+    const unwrapped = await minter({ unwrap: accessToken });
+    assert.deepEqual(unwrapped.grant.props, { email: PERSONAL }, "the connection records who approved it");
   });
 
   test("Claude can use both accounts through the MCP endpoint", async () => {
@@ -534,6 +640,30 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(wrongToken.status, 400);
   });
 
+  test("connections made before the approving address was recorded keep working", async () => {
+    // Older versions stored only { owner: true }.
+    const tokens = await connectWithProps({ owner: true });
+    assert.equal((await mcpStatus(tokens.access_token)).status, 200);
+    const refreshed = await refreshClaudeToken(firstClientId, tokens.refresh_token);
+    assert.equal(refreshed.status, 200, JSON.stringify(refreshed.body));
+    assert.equal((await mcp("tools/list", {}, refreshed.body.access_token)).result.tools.length > 0, true);
+  });
+
+  test("a connection approved by an address that may no longer sign in is ended", async () => {
+    // As if STRANGER had been in ALLOWED_EMAILS when connecting, and was taken off since.
+    const tokens = await connectWithProps({ email: STRANGER });
+    const res = await mcpStatus(tokens.access_token);
+    assert.equal(res.status, 401, res.text);
+    assert.match(res.wwwAuthenticate, /^Bearer error="invalid_token"/);
+    assert.match(res.wwwAuthenticate, /resource_metadata="https:\/\/gmail-multi-mcp\.tester\.workers\.dev\/\.well-known\/oauth-protected-resource\/mcp"/);
+    assert.match(JSON.parse(res.text).error.message, /stranger@evil\.example.*Reconnect the connector in Claude/);
+    // The connection is revoked, so Claude can't just refresh and retry: it has to reconnect.
+    assert.equal((await refreshClaudeToken(firstClientId, tokens.refresh_token)).status, 400);
+    assert.equal((await mcpStatus(tokens.access_token)).status, 401);
+    // The owner's own connection is unaffected.
+    assert.equal((await mcpStatus(accessToken)).status, 200);
+  });
+
   test("request errors are never redirected to a site that isn't Claude", async () => {
     const evilClient = await registerClient("https://evil.example/callback");
     const url = authorizeUrl(evilClient, "x".repeat(43), "https://evil.example/callback").replace(
@@ -568,9 +698,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
   });
 
   test("removing an account says so when Google doesn't confirm the revoke", async () => {
-    const browser = new Browser(mf);
-    await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
-    const csrf = field((await browser.fetch("/accounts")).text, "csrf");
+    const { browser, csrf } = await ownerBrowser();
     const toGoogle = await browser.fetch("/accounts/link", { form: { csrf } });
     assert.equal((await browser.googleSignIn(toGoogle.location, fake, "extra3@example.com")).status, 303);
     failRevoke = true;
@@ -613,6 +741,27 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const toGoogle = await again.fetch("/accounts/link", { form: { csrf: field(page.text, "csrf") } });
     assert.equal((await again.googleSignIn(toGoogle.location, fake, PERSONAL)).status, 303);
     assert.deepEqual((await callTool("list_accounts")).json.accounts.map((a: any) => a.email), [PERSONAL]);
+  });
+
+  test("Disconnect Claude ends every Claude connection", async () => {
+    const second = await connectAsOwner(await registerClient());
+    const legacy = await connectWithProps({ owner: true });
+    for (const token of [accessToken, second, legacy.access_token]) assert.equal((await mcpStatus(token)).status, 200);
+
+    const { browser, csrf } = await ownerBrowser();
+    const page = await browser.fetch("/accounts");
+    assert.match(page.text, /Disconnect Claude/);
+    const res = await browser.fetch("/accounts/disconnect", { form: { csrf } });
+    assert.equal(res.status, 303);
+    const after = await browser.fetch(res.location);
+    assert.match(after.text, /Disconnected Claude \(\d+ connections\)/);
+
+    for (const token of [accessToken, second, legacy.access_token]) assert.equal((await mcpStatus(token)).status, 401);
+    assert.equal((await refreshClaudeToken(firstClientId, legacy.refresh_token)).status, 400);
+    assert.deepEqual((await callToolWith(await connectAsOwner(firstClientId), "list_accounts")).json.accounts.map((a: any) => a.email), [PERSONAL], "connecting again works");
+    // The linked accounts stay linked, and a second click finds nothing left to disconnect except the new one.
+    const again = await browser.fetch((await browser.fetch("/accounts/disconnect", { form: { csrf } })).location);
+    assert.match(again.text, /Disconnected Claude \(1 connection\)/);
   });
 });
 

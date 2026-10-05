@@ -11,7 +11,7 @@ import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validatio
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError, defaultFetch } from "../src/google.js";
 import { createServer } from "../src/server.js";
-import { googleClient, KvAccountSource, type Env } from "./owner.js";
+import { connectionAllowed, googleClient, KvAccountSource, type Env, type GrantProps } from "./owner.js";
 import { handleBrowserRequest } from "./routes.js";
 
 // Access tokens are cached per isolate so consecutive tool calls don't each refresh with Google.
@@ -36,15 +36,43 @@ function tokenProviderFor(env: Env, origin: string): TokenProvider {
   return provider;
 }
 
+const jsonRpcError = (message: string, status: number, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message }, id: null }), {
+    status,
+    headers: { ...headers, "Content-Type": "application/json" },
+  });
+
+/**
+ * Ends a Claude connection whose approving address may no longer use the connector (taken off
+ * ALLOWED_EMAILS, or no longer the owner). Revoking the grant makes Claude's next token refresh fail
+ * too, so Claude asks the user to connect again instead of retrying the same token.
+ */
+async function endConnection(request: Request, env: Env, origin: string, email: string): Promise<Response> {
+  const [userId, grantId] = (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").split(":");
+  try {
+    if (userId && grantId) await env.OAUTH_PROVIDER.revokeGrant(grantId, userId);
+  } catch (error) {
+    // Still refuse the request; the next one tries again.
+    console.warn("Could not revoke a connection that is no longer allowed:", error);
+  }
+  const message =
+    `This connection was made by ${email}, which may no longer use this Gmail connector, so it has been ended. ` +
+    `Reconnect the connector in Claude and sign in with an allowed Google account.`;
+  // A header value must be printable ASCII, and the quoted string can't hold quotes or backslashes.
+  const quoted = message.replace(/[^\x20-\x7e]|["\\]/g, "");
+  return jsonRpcError(message, 401, {
+    "WWW-Authenticate": `Bearer error="invalid_token", error_description="${quoted}", resource_metadata="${origin}/.well-known/oauth-protected-resource/mcp"`,
+  });
+}
+
 const mcpHandler = {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    if (request.method !== "POST") {
-      return new Response(
-        JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null }),
-        { status: 405, headers: { Allow: "POST", "Content-Type": "application/json" } },
-      );
-    }
+  async fetch(request: Request, env: Env, ctx: ExecutionContext & { props?: GrantProps }): Promise<Response> {
+    if (request.method !== "POST") return jsonRpcError("Method not allowed.", 405, { Allow: "POST" });
     const origin = new URL(request.url).origin;
+    // Connections made before the approving address was recorded carry no email; they were made by
+    // the owner and keep working.
+    const email = ctx.props?.email;
+    if (!(await connectionAllowed(env, email))) return endConnection(request, env, origin, email!);
     const server = createServer({
       store: new KvAccountSource(env.OAUTH_KV),
       tokens: tokenProviderFor(env, origin),

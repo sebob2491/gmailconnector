@@ -26,13 +26,16 @@ import {
 import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal } from "./cookies.js";
 import {
   allowedEmails,
+  emailAllowed,
   googleClient,
+  GRANT_USER,
   loadOwner,
   recordSignIn,
   redirectHostAllowed,
   redirectTarget,
   saveOwner,
   type Env,
+  type GrantProps,
 } from "./owner.js";
 import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
@@ -56,6 +59,8 @@ interface SessionData {
   clientName?: string;
   /** Always true for sessions this version stores; sessions are only created by a sign-in. */
   authenticated: boolean;
+  /** The Google account this browser signed in with (absent in sessions from older versions). */
+  email?: string;
 }
 
 interface Session {
@@ -95,12 +100,15 @@ async function createSession(env: Env, data: SessionData, headers: Headers): Pro
   return { handle, data };
 }
 
-/** The browser's signed-in session, if it has one. */
+/** The browser's signed-in session, if it has one and its account may still use the connector. */
 async function getSession(env: Env, request: Request): Promise<Session | undefined> {
   const handle = readCookie(request, SESSION_COOKIE);
   if (!handle) return undefined;
   const data = await env.OAUTH_KV.get<SessionData>(await sessionKey(handle), "json");
-  return data?.authenticated ? { handle, data } : undefined;
+  if (!data?.authenticated) return undefined;
+  // Someone taken off ALLOWED_EMAILS is signed out right away, not when the session runs out.
+  if (data.email && !(await emailAllowed(env, data.email))) return undefined;
+  return { handle, data };
 }
 
 /** Saves the session and extends both its storage and its cookie by another SESSION_TTL. */
@@ -336,7 +344,7 @@ async function googleCallback(request: Request, env: Env, origin: string): Promi
   } else {
     await createSession(
       env,
-      { authenticated: true, request: pending.request, clientName: pending.clientName },
+      { authenticated: true, email, request: pending.request, clientName: pending.clientName },
       headers,
     );
   }
@@ -349,6 +357,7 @@ function accountsNotice(url: URL) {
   const linked = q.get("linked");
   const signedIn = q.get("signedin");
   const removed = q.get("removed");
+  const disconnected = q.get("disconnected");
   if (linked) return { kind: "ok" as const, text: `Linked ${linked}.` };
   if (signedIn) return { kind: "ok" as const, text: `Signed in as ${signedIn}. That account isn't linked; use "Link" below to add it.` };
   if (removed && q.get("revoked") === "0") {
@@ -359,6 +368,15 @@ function accountsNotice(url: URL) {
     };
   }
   if (removed) return { kind: "ok" as const, text: `Removed ${removed}.` };
+  if (disconnected !== null) {
+    const n = Number(disconnected) || 0;
+    return {
+      kind: "ok" as const,
+      text: n
+        ? `Disconnected Claude (${n === 1 ? "1 connection" : `${n} connections`}). To use Gmail in Claude again, connect this connector from Claude's connector settings.`
+        : "Claude wasn't connected.",
+    };
+  }
   if (q.get("error") === "none") return { kind: "bad" as const, text: "Link at least one Gmail account first." };
   return undefined;
 }
@@ -378,6 +396,21 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
         : undefined,
     }),
   );
+}
+
+/** Ends every Claude connection to this connector. Returns how many there were. */
+async function disconnectClaude(env: Env): Promise<number> {
+  let count = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await env.OAUTH_PROVIDER.listUserGrants(GRANT_USER, cursor ? { cursor } : undefined);
+    for (let i = 0; i < page.items.length; i += 5) {
+      await Promise.all(page.items.slice(i, i + 5).map((grant) => env.OAUTH_PROVIDER.revokeGrant(grant.id, GRANT_USER)));
+    }
+    count += page.items.length;
+    cursor = page.cursor;
+  } while (cursor);
+  return count;
 }
 
 /** POST handlers on the accounts page: the session cookie and the form's copy of it must match. */
@@ -407,6 +440,10 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
       }
       return redirect(`${origin}/accounts?removed=${encodeURIComponent(email)}${revoked ? "" : "&revoked=0"}`, undefined, 303);
     }
+    case "disconnect": {
+      const count = await disconnectClaude(env);
+      return redirect(`${origin}/accounts?disconnected=${count}`, undefined, 303);
+    }
     case "cancel": {
       const headers = new Headers();
       await endSession(env, session, headers);
@@ -417,14 +454,17 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
       if (!session.data.request) return redirect(`${origin}/accounts`, undefined, 303);
       const rec = await loadOwner(env.OAUTH_KV);
       if (!rec.accounts.length) return redirect(`${origin}/accounts?error=none`, undefined, 303);
+      // Recording who approved the connection lets the MCP endpoint end it if that address is
+      // later taken off ALLOWED_EMAILS.
+      const props: GrantProps = session.data.email ? { email: session.data.email } : {};
       let redirectTo: string;
       try {
         ({ redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
           request: session.data.request,
-          userId: "owner",
+          userId: GRANT_USER,
           metadata: { clientName: session.data.clientName },
           scope: session.data.request.scope,
-          props: { owner: true },
+          props,
           // Connecting again (e.g. from a second Claude account) must not disconnect the first.
           revokeExistingGrants: false,
         }));
@@ -468,6 +508,7 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
       return accountsGet(request, env, origin);
     case "POST /accounts/link":
     case "POST /accounts/remove":
+    case "POST /accounts/disconnect":
     case "POST /accounts/cancel":
     case "POST /accounts/done":
       return accountsPost(request, env, origin, url.pathname.split("/")[2]);

@@ -120,13 +120,15 @@ Reload the setup page: steps 1 and 2 should now show **✓ Done**.
    **Done — connect to Claude**.
 
 You can add or remove accounts later at `…workers.dev/accounts`. Claude sees the change within a
-minute, without reconnecting.
+minute, without reconnecting. The same page has **Disconnect Claude**, which signs Claude out of the
+connector everywhere it's connected (your linked accounts stay linked).
 
 **Who can use it:** only the addresses in `ALLOWED_EMAILS` can sign in, and the first of them to sign
 in becomes the owner (connectors set up before `ALLOWED_EMAILS` was required keep their owner, who can
 still sign in). Linked accounts can't sign in, so someone with access to one of your linked inboxes
 (for example a work admin) can't use it to reach the others. Anyone else is turned away. Signing in
-only proves who you are: it never re-adds an account you removed; use **Link** for that.
+only proves who you are: it never re-adds an account you removed; use **Link** for that. If you take
+an address off `ALLOWED_EMAILS`, Claude connections made by that address stop working.
 
 Tokens are only ever sent back to Claude (`https://claude.ai`, `https://claude.com`, or a local Claude
 app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the

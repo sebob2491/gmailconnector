@@ -3,6 +3,17 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { sameEmail, upsertAccount, type AccountSource, type AccountsFile } from "../src/accounts.js";
 import type { LinkedTokens, OAuthClientConfig } from "../src/google.js";
 
+/** What a Claude connection (an OAuth grant) records about who approved it. */
+export interface GrantProps {
+  /** The Google account that approved the connection. Absent for connections made by older versions. */
+  email?: string;
+  /** Set by older versions on every connection. */
+  owner?: boolean;
+}
+
+/** Every Claude connection is stored under this OAuth user ID; the approving address is in its props. */
+export const GRANT_USER = "owner";
+
 export interface Env {
   OAUTH_KV: KVNamespace;
   OAUTH_PROVIDER: OAuthHelpers;
@@ -92,6 +103,21 @@ export function redirectTarget(env: Env, redirectUri: string): RedirectTarget | 
 
 export function redirectHostAllowed(env: Env, redirectUri: string): boolean {
   return redirectTarget(env, redirectUri) !== undefined;
+}
+
+/** Whether `email` may still use the connector: the owner, or an address in ALLOWED_EMAILS. */
+export async function emailAllowed(env: Env, email: string): Promise<boolean> {
+  if (allowedEmails(env).some((a) => sameEmail(a, email))) return true;
+  const { owner } = await loadOwner(env.OAUTH_KV);
+  return Boolean(owner && sameEmail(owner, email));
+}
+
+/**
+ * Whether a Claude connection approved by `email` may still be used. Connections made before the
+ * approving address was recorded have none; only the owner could make those, so they stay valid.
+ */
+export async function connectionAllowed(env: Env, email: string | undefined): Promise<boolean> {
+  return email === undefined || emailAllowed(env, email);
 }
 
 export type SignInResult =
