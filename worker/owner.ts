@@ -59,17 +59,38 @@ export function allowedEmails(env: Env): string[] {
   return list(env.ALLOWED_EMAILS);
 }
 
-const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com", "localhost", "127.0.0.1", "[::1]"];
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com", ...LOOPBACK_HOSTS];
 
-/** Only Claude (and local Claude apps) may receive tokens from this connector. */
-export function redirectHostAllowed(env: Env, redirectUri: string): boolean {
+/** A redirect URI that may receive tokens, with its host and whether it is an app on this computer. */
+export interface RedirectTarget {
+  host: string;
+  local: boolean;
+}
+
+/**
+ * Only Claude (and local Claude apps) may receive tokens from this connector. The host must be on
+ * the allowed list, and the URI must use https (or http to a loopback address, RFC 8252): a URI
+ * like `someapp://claude.ai/…` has the host claude.ai but would hand the code to whichever app
+ * owns that scheme.
+ */
+export function redirectTarget(env: Env, redirectUri: string): RedirectTarget | undefined {
   const hosts = list(env.ALLOWED_REDIRECT_HOSTS);
   const allowed = hosts.length ? hosts : DEFAULT_REDIRECT_HOSTS;
+  let url: URL;
   try {
-    return allowed.includes(new URL(redirectUri).hostname.toLowerCase());
+    url = new URL(redirectUri);
   } catch {
-    return false;
+    return undefined;
   }
+  const host = url.hostname.toLowerCase();
+  const local = LOOPBACK_HOSTS.includes(host);
+  const schemeOk = url.protocol === "https:" || (url.protocol === "http:" && local);
+  return schemeOk && allowed.includes(host) ? { host, local } : undefined;
+}
+
+export function redirectHostAllowed(env: Env, redirectUri: string): boolean {
+  return redirectTarget(env, redirectUri) !== undefined;
 }
 
 export type SignInResult =

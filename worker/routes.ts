@@ -24,7 +24,7 @@ import {
   revokeToken,
 } from "../src/google.js";
 import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal } from "./cookies.js";
-import { googleClient, loadOwner, recordSignIn, redirectHostAllowed, saveOwner, type Env } from "./owner.js";
+import { googleClient, loadOwner, recordSignIn, redirectHostAllowed, redirectTarget, saveOwner, type Env } from "./owner.js";
 import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
 const SESSION_COOKIE = "__Host-gmail-connector";
@@ -190,7 +190,8 @@ function authorizeError(env: Env, error: unknown): Response {
 }
 
 function notClaude(redirectUri: string): Response {
-  const target = new URL(redirectUri).hostname;
+  const url = new URL(redirectUri);
+  const target = url.host ? `${url.protocol}//${url.host}` : url.protocol;
   return messagePage("Can't connect", `This connector only works with Claude, but this request would send access to ${target}.`, {
     status: 403,
   });
@@ -204,8 +205,8 @@ async function authorizeGet(request: Request, env: Env, origin: string): Promise
   let clientName: string;
   try {
     authRequest = await oauth.parseAuthRequest(request);
-    if (!redirectHostAllowed(env, authRequest.redirectUri)) return notClaude(authRequest.redirectUri);
-    const redirectHost = new URL(authRequest.redirectUri).hostname;
+    const target = redirectTarget(env, authRequest.redirectUri);
+    if (!target) return notClaude(authRequest.redirectUri);
     if (!googleClient(env)) return notConfigured(origin);
     clientName = (await oauth.lookupClient(authRequest.clientId))?.clientName || "Claude";
     // The form posts back to this same URL, and POST /authorize parses the request again, so
@@ -216,10 +217,10 @@ async function authorizeGet(request: Request, env: Env, origin: string): Promise
     return htmlResponse(
       consentPage({
         clientName,
-        redirectHost,
+        redirectHost: target.host,
         action: `/authorize${new URL(request.url).search}`,
         csrf,
-        local: /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/.test(redirectHost),
+        local: target.local,
       }),
       { headers },
     );

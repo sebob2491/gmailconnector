@@ -468,6 +468,26 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(res.text, /only works with Claude/);
   });
 
+  test("a claude.ai address with another scheme can't receive tokens", async () => {
+    // `evilapp://claude.ai/…` has the host claude.ai, but the code would go to whichever app owns
+    // the evilapp: scheme; plain http could be read on the way.
+    for (const redirect of ["evilapp://claude.ai/cb", "http://claude.ai/cb", "intent://claude.ai/cb"]) {
+      const client = await registerClient(redirect);
+      const res = await new Browser(mf).fetch(authorizeUrl(client, "x".repeat(43), redirect));
+      assert.equal(res.status, 403, redirect);
+      assert.match(res.text, /only works with Claude/);
+      assert.doesNotMatch(res.text, /Continue with Google/);
+      // Request errors aren't sent there either.
+      const error = await new Browser(mf).fetch(authorizeUrl(client, "x".repeat(43), redirect).replace("response_type=code", "response_type=token"));
+      assert.notEqual(error.status, 302, redirect);
+    }
+    // A Claude app on this computer may use plain http to a loopback address, with a warning.
+    const local = "http://localhost:33418/callback";
+    const res = await new Browser(mf).fetch(authorizeUrl(await registerClient(local), "x".repeat(43), local));
+    assert.equal(res.status, 200, res.text);
+    assert.match(res.text, /This sends access to an app on your computer/);
+  });
+
   test("visitors who haven't signed in write nothing to storage", async () => {
     const before = await kvSnapshot(mf);
     const visitor = new Browser(mf);

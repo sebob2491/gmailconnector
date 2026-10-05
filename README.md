@@ -125,8 +125,8 @@ only proves who you are: it never re-adds an account you removed; use **Link** f
 
 To lock it down in advance, or to let more of your own addresses sign in, add a variable
 `ALLOWED_EMAILS` (comma-separated) under the Worker's **Settings → Variables and Secrets**. Tokens
-are only ever sent back to Claude (`claude.ai`, `claude.com`, or a local Claude app); override that
-with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the dashboard are kept when the Worker
+are only ever sent back to Claude (`https://claude.ai`, `https://claude.com`, or a local Claude app at
+`localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the dashboard are kept when the Worker
 redeploys.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
