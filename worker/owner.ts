@@ -17,8 +17,9 @@ export interface Env {
 const OWNER_KEY = "gmail:owner";
 
 /**
- * This connector belongs to one person. `owner` is the first Google account that signed in; it and
- * every linked account can sign in again later. Everyone else is turned away.
+ * This connector belongs to one person. `owner` is the first Google account (from ALLOWED_EMAILS)
+ * that signed in; it and the addresses in ALLOWED_EMAILS can sign in again later. Everyone else,
+ * including linked accounts, is turned away.
  */
 export interface OwnerRecord extends AccountsFile {
   owner?: string;
@@ -97,10 +98,17 @@ export type SignInResult =
   | { ok: true; rec: OwnerRecord; claimed: boolean; linked: boolean }
   | { ok: false; message: string; linked: boolean };
 
+export const SET_ALLOWED_EMAILS =
+  "Before signing in for the first time, tell the connector who owns it: in Cloudflare, open this " +
+  "Worker's Settings → Variables and Secrets, add a variable named ALLOWED_EMAILS with your Gmail " +
+  "address as its value, deploy, then sign in again.";
+
 /**
  * Applies a successful Google sign-in.
- * - `purpose: "signin"` authenticates a browser session. Only the owner (the first account ever to
- *   sign in) or an address in ALLOWED_EMAILS may do this; being a linked account is not enough, so
+ * - `purpose: "signin"` authenticates a browser session. Only the owner or an address in
+ *   ALLOWED_EMAILS may do this. The owner is the first listed address to sign in; while there is no
+ *   owner, ALLOWED_EMAILS must be set, so a stranger who finds the URL before the owner signs in
+ *   can't claim it (KV can't make "first one wins" atomic). Being a linked account is not enough, so
  *   someone with access to one linked inbox (e.g. a work admin) can't reach the others. Signing in
  *   refreshes that account's token if it is linked, but never re-adds an account that was removed.
  * - `purpose: "link"` (only from an already authenticated session) adds or refreshes an account.
@@ -120,7 +128,8 @@ export async function recordSignIn(
   let claimed = false;
   if (purpose === "signin") {
     if (!rec.owner) {
-      if (allowed.length && !listed) {
+      if (!allowed.length) return { ok: false, message: SET_ALLOWED_EMAILS, linked: alreadyLinked };
+      if (!listed) {
         return { ok: false, message: `${email} is not in this connector's ALLOWED_EMAILS list.`, linked: alreadyLinked };
       }
       rec.owner = email;

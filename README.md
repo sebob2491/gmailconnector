@@ -101,16 +101,20 @@ Every Gmail account you link uses this one client. Google doesn't let anyone els
      (`https://gmail-multi-mcp.<your-subdomain>.workers.dev/google/callback`).
    - Create, then copy the **Client ID** and **Client secret**.
 5. Back in Cloudflare, open your Worker → **Settings → Variables and Secrets → Add**. Add two
-   variables of type **Secret**: `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Then **Deploy**.
+   variables of type **Secret**: `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+6. Add one more variable, of type **Text**: `ALLOWED_EMAILS`, with your Gmail address as its value
+   (for several of your own addresses, separate them with commas). **This step is required:** the
+   connector refuses every sign-in until it's set, so nobody who comes across your Worker's URL can
+   claim it before you do. Then **Deploy**.
 
-Reload the setup page: step 1 should now show **✓ Done**.
+Reload the setup page: steps 1 and 2 should now show **✓ Done**.
 
 ### 3. Add it to Claude and sign in (about 2 minutes)
 
 1. In claude.ai, go to **Customize → Connectors → Add custom connector**. Name it (e.g.
    "Gmail (all accounts)") and paste the connector URL from the setup page (`…workers.dev/mcp`).
 2. Press **Connect**. You'll see a consent page. Press **Continue with Google** and sign in with
-   your main Gmail account. Google will warn "Google hasn't verified this app"; that's expected for
+   the Gmail account you put in `ALLOWED_EMAILS`. Google will warn "Google hasn't verified this app"; that's expected for
    your own app. Tap **Advanced → Go to …** and allow Gmail access.
 3. On the account page, tap **＋ Link another Gmail account** for each extra inbox, then
    **Done — connect to Claude**.
@@ -118,16 +122,15 @@ Reload the setup page: step 1 should now show **✓ Done**.
 You can add or remove accounts later at `…workers.dev/accounts`. Claude sees the change within a
 minute, without reconnecting.
 
-**Who can use it:** the first Google account that signs in becomes the owner. After that, only the
-owner can sign in. Linked accounts can't, so someone with access to one of your linked inboxes
+**Who can use it:** only the addresses in `ALLOWED_EMAILS` can sign in, and the first of them to sign
+in becomes the owner (connectors set up before `ALLOWED_EMAILS` was required keep their owner, who can
+still sign in). Linked accounts can't sign in, so someone with access to one of your linked inboxes
 (for example a work admin) can't use it to reach the others. Anyone else is turned away. Signing in
 only proves who you are: it never re-adds an account you removed; use **Link** for that.
 
-To lock it down in advance, or to let more of your own addresses sign in, add a variable
-`ALLOWED_EMAILS` (comma-separated) under the Worker's **Settings → Variables and Secrets**. Tokens
-are only ever sent back to Claude (`https://claude.ai`, `https://claude.com`, or a local Claude app at
-`localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the dashboard are kept when the Worker
-redeploys.
+Tokens are only ever sent back to Claude (`https://claude.ai`, `https://claude.com`, or a local Claude
+app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the
+dashboard are kept when the Worker redeploys.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
 batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, and

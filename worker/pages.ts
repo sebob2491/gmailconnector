@@ -95,7 +95,13 @@ export function authorizedDomain(origin: string): string {
   return labels.length > 2 ? labels.slice(1).join(".") : labels.join(".");
 }
 
-export function statusPage(opts: { origin: string; googleConfigured: boolean; claimed: boolean }): string {
+export function statusPage(opts: {
+  origin: string;
+  googleConfigured: boolean;
+  /** Whether ALLOWED_EMAILS is set (its addresses aren't shown: this page is public). */
+  allowedEmailsSet: boolean;
+  claimed: boolean;
+}): string {
   const mcpUrl = `${opts.origin}/mcp`;
   const callback = `${opts.origin}/google/callback`;
   const check = (done: boolean, doneText = "Done", todoText = "To do") =>
@@ -110,9 +116,13 @@ export function statusPage(opts: { origin: string; googleConfigured: boolean; cl
 <p class="muted">Authorized domain</p>${copyRow(authorizedDomain(opts.origin))}
 <p>Then create an OAuth client of type <b>Web application</b> and add this <b>Authorized redirect URI</b>:</p>${copyRow(callback)}
 <p class="muted">Then add its Client ID and Client secret to this Worker as the secrets <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code>.</p></li>
+<li><h2>Say who owns it ${check(opts.allowedEmailsSet || opts.claimed)}</h2>
+<p>In Cloudflare, open this Worker's <b>Settings → Variables and Secrets → Add</b>. Add a variable named</p>${copyRow("ALLOWED_EMAILS")}
+<p>with your Gmail address as its value (several addresses: separate them with commas), then deploy.</p>
+<p class="muted">Only these Google accounts can sign in. The connector refuses every sign-in until this is set, so nobody else who finds this page can claim it.</p></li>
 <li><h2>Add it to Claude ${check(opts.claimed, "Signed in", "Not signed in yet")}</h2>
 <p>In Claude, open <b>Customize → Connectors → Add custom connector</b> and paste this URL:</p>${copyRow(mcpUrl)}
-<p class="muted">Then press <b>Connect</b> and sign in with Google. The first Google account that signs in becomes this connector's owner.</p></li>
+<p class="muted">Then press <b>Connect</b> and sign in with Google, using an address from <code>ALLOWED_EMAILS</code>. The first one to sign in becomes this connector's owner.</p></li>
 <li><h2>Link more Gmail accounts</h2>
 <p>While connecting, tap <b>Link another Gmail account</b> for each extra inbox. You can also manage them any time at:</p>${copyRow(`${opts.origin}/accounts`)}</li>
 </ol></div>`;

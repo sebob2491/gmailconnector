@@ -24,7 +24,16 @@ import {
   revokeToken,
 } from "../src/google.js";
 import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal } from "./cookies.js";
-import { googleClient, loadOwner, recordSignIn, redirectHostAllowed, redirectTarget, saveOwner, type Env } from "./owner.js";
+import {
+  allowedEmails,
+  googleClient,
+  loadOwner,
+  recordSignIn,
+  redirectHostAllowed,
+  redirectTarget,
+  saveOwner,
+  type Env,
+} from "./owner.js";
 import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
 const SESSION_COOKIE = "__Host-gmail-connector";
@@ -433,6 +442,7 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
         statusPage({
           origin,
           googleConfigured: Boolean(googleClient(env)),
+          allowedEmailsSet: allowedEmails(env).length > 0,
           claimed: Boolean((await loadOwner(env.OAUTH_KV)).owner),
         }),
       );

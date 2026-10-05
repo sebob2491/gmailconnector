@@ -77,6 +77,30 @@ async function kvSnapshot(instance: Miniflare): Promise<Map<string, string | nul
 }
 
 
+const COMPAT = { compatibilityDate: "2026-09-01", compatibilityFlags: ["nodejs_compat", "global_fetch_strictly_public"] };
+
+async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, string>): Promise<Miniflare> {
+  const instance = new Miniflare(
+    convertV4MiniflareOptions({
+      modules: true,
+      scriptPath: "dist-worker/index.js",
+      ...COMPAT,
+      kvNamespaces: ["OAUTH_KV"],
+      bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
+      outboundService: async (req: MfRequest) => {
+        const res = await fakeGoogle.fetch(req.url, {
+          method: req.method,
+          headers: Object.fromEntries(req.headers),
+          body: req.method === "GET" ? undefined : await req.text(),
+        });
+        return new MfResponse(await res.arrayBuffer(), { status: res.status, headers: Object.fromEntries(res.headers) });
+      },
+    }),
+  );
+  await instance.ready;
+  return instance;
+}
+
 let mf: Miniflare;
 let fake: FakeGmail;
 
@@ -104,33 +128,15 @@ before(async () => {
     { id: "w1", threadId: "wt1" },
   );
 
-  mf = new Miniflare(
-    convertV4MiniflareOptions({
-      modules: true,
-      scriptPath: "dist-worker/index.js",
-      compatibilityDate: "2026-09-01",
-      compatibilityFlags: ["nodejs_compat", "global_fetch_strictly_public"],
-      kvNamespaces: ["OAUTH_KV"],
-      bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret" },
-      outboundService: async (req: MfRequest) => {
-        const res = await fake.fetch(req.url, {
-          method: req.method,
-          headers: Object.fromEntries(req.headers),
-          body: req.method === "GET" ? undefined : await req.text(),
-        });
-        return new MfResponse(await res.arrayBuffer(), { status: res.status, headers: Object.fromEntries(res.headers) });
-      },
-    }),
-  );
-  await mf.ready;
+  mf = await startWorker(fake, { ALLOWED_EMAILS: PERSONAL });
 });
 
 after(async () => {
   await mf?.dispose();
 });
 
-async function registerClient(redirectUri = CLAUDE_CALLBACK) {
-  const res = await mf.dispatchFetch(`${ORIGIN}/register`, {
+async function registerClient(redirectUri = CLAUDE_CALLBACK, on = mf) {
+  const res = await on.dispatchFetch(`${ORIGIN}/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -226,6 +232,9 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(res.text, new RegExp(`${ORIGIN}/google/callback`));
     assert.match(res.text, new RegExp(`${ORIGIN}/mcp`));
     assert.match(res.text, /Not signed in yet/);
+    assert.match(res.text, /Say who owns it <span class="status ok">/, "ALLOWED_EMAILS is set in these tests");
+    assert.ok(res.text.indexOf("ALLOWED_EMAILS") < res.text.indexOf("Add it to Claude"), "set before signing in");
+    assert.doesNotMatch(res.text, new RegExp(PERSONAL), "the allowed addresses aren't shown on this public page");
     assert.equal(res.headers.get("X-Frame-Options"), "DENY");
     // What Google's Branding page needs before the app can be published.
     assert.match(res.text, new RegExp(`${ORIGIN}/privacy`));
@@ -581,5 +590,54 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const toGoogle = await again.fetch("/accounts/link", { form: { csrf: field(page.text, "csrf") } });
     assert.equal((await again.googleSignIn(toGoogle.location, fake, PERSONAL)).status, 303);
     assert.deepEqual((await callTool("list_accounts")).json.accounts.map((a: any) => a.email), [PERSONAL]);
+  });
+});
+
+describe("a new connector without ALLOWED_EMAILS", () => {
+  let mf2: Miniflare;
+  let fake2: FakeGmail;
+  before(async () => {
+    fake2 = new FakeGmail();
+    fake2.addMailbox(PERSONAL, "rt-personal");
+    fake2.addMailbox(STRANGER, "rt-stranger");
+    mf2 = await startWorker(fake2, {});
+  });
+  after(async () => {
+    await mf2?.dispose();
+  });
+
+  test("refuses every sign-in until ALLOWED_EMAILS is set, so nobody can claim it first", async () => {
+    const setup = await new Browser(mf2).fetch("/");
+    assert.match(setup.text, /Say who owns it <span class="status todo">/);
+
+    const browser = new Browser(mf2);
+    const refused = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake2, PERSONAL);
+    assert.equal(refused.status, 403);
+    assert.match(refused.text, /add a variable named ALLOWED_EMAILS with your Gmail address/);
+    assert.ok(fake2.revokeCalls.includes("rt-personal"), "the unneeded Google grant is revoked");
+    assert.equal(await (await mf2.getKVNamespace("OAUTH_KV")).get("gmail:owner"), null, "nobody became the owner");
+
+    // The same while connecting from Claude, with a way back to Claude.
+    const clientId = await registerClient(CLAUDE_CALLBACK, mf2);
+    const claude = new Browser(mf2);
+    const consent = await claude.fetch(authorizeUrl(clientId, "x".repeat(43)));
+    const toGoogle = await answerConsent(claude, consent.text);
+    const refusedAgain = await claude.googleSignIn(toGoogle.location, fake2, STRANGER);
+    assert.equal(refusedAgain.status, 403);
+    assert.match(refusedAgain.text, /ALLOWED_EMAILS/);
+    assert.equal(new URL(linkTo(refusedAgain.text, "Back to Claude")).searchParams.get("error"), "access_denied");
+  });
+
+  test("a connector that already has an owner works as before", async () => {
+    // Claimed by an older version, before ALLOWED_EMAILS was required.
+    await (await mf2.getKVNamespace("OAUTH_KV")).put("gmail:owner", JSON.stringify({ version: 1, owner: PERSONAL, accounts: [] }));
+    const owner = new Browser(mf2);
+    const back = await owner.googleSignIn((await owner.fetch("/accounts")).location, fake2, PERSONAL);
+    assert.equal(back.status, 303, back.text);
+    assert.equal((await owner.fetch(back.location)).status, 200);
+    const stranger = new Browser(mf2);
+    const refused = await stranger.googleSignIn((await stranger.fetch("/accounts")).location, fake2, STRANGER);
+    assert.equal(refused.status, 403);
+    assert.match(refused.text, /belongs to someone else/);
   });
 });
