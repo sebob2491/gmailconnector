@@ -1523,4 +1523,36 @@ describe("fixes from the second review", () => {
       assert.ok(ctx.fake.requests.filter((r) => r.path === "messages").every((r) => r.query.get("maxResults") === "500"));
     });
   });
+
+  test("an attachment asked for by an older attachmentId keeps its name and type", async () => {
+    const { call, client, fake, work } = await setup();
+    const csv = (name: string, body: string) => [
+      "--B",
+      `Content-Type: text/csv; name="${name}"`,
+      `Content-Disposition: attachment; filename="${name}"`,
+      "",
+      body,
+    ];
+    fake.deliver(
+      work,
+      crlf([
+        "From: a@example.com", `To: ${WORK}`, "Subject: Data", 'Content-Type: multipart/mixed; boundary="B"', "",
+        "--B", "Content-Type: text/plain", "", "See attached",
+        ...csv("short.csv", "a,b"), ...csv("longer.csv", "a,b\r\n1,2"),
+        "--B--",
+      ]),
+      { id: "csv1" },
+    );
+    // Gmail hands out a new attachmentId on every read; the one Claude saw earlier still downloads.
+    const [, data] = [...work.attachments.entries()].find(([, d]) => Buffer.from(d, "base64url").toString() === "a,b\r\n1,2")!;
+    work.attachments.set("csv1/OLDID", data);
+    const res = await call("get_attachment", { account: "work", messageId: "csv1", attachmentId: "OLDID" });
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.filename, "longer.csv");
+    assert.equal(res.json.mimeType, "text/csv");
+    const full = (await client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "csv1", attachmentId: "OLDID" } })) as {
+      content: { text: string }[];
+    };
+    assert.equal(full.content[1].text, "a,b\n1,2", "read as text, not refused as an unknown file type");
+  });
 });

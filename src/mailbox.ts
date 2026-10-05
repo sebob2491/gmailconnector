@@ -853,12 +853,16 @@ export class Mailbox {
       (byName && attachments.find((a) => a.filename.toLowerCase() === byName)) ||
       (ref.attachmentId && attachments.find((a) => a.id === ref.attachmentId)) ||
       (!ref.partId && !byName && !ref.attachmentId && attachments.length === 1 ? attachments[0] : undefined);
-    // Gmail issues new attachment IDs on every read, but old ones keep working, so a stale ID is still usable.
+    // Gmail issues new attachment IDs on every read, but old ones keep working, so a stale ID is still
+    // usable. Its name and type are recovered from the attachment of the same size (or the only one),
+    // since the file's type decides how it can be read.
     if (!attachment && ref.attachmentId) {
-      const data = (await this.loader(msg.id)(ref.attachmentId)) as string;
+      const bytes = Buffer.from((await this.loader(msg.id)(ref.attachmentId)) as string, "base64url");
+      const sameSize = attachments.filter((a) => a.size === bytes.length);
+      const match = sameSize.length === 1 ? sameSize[0] : attachments.length === 1 ? attachments[0] : undefined;
       return {
-        info: { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: 0, inline: false },
-        bytes: Buffer.from(data, "base64url"),
+        info: match ?? { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: bytes.length, inline: false },
+        bytes,
         message: msg,
       };
     }
