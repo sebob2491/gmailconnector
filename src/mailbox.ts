@@ -141,7 +141,8 @@ const LIST_BODY_CHARS = 2_000;
 
 /** "Re: Fwd: Lunch?" → "lunch?" so replies can be matched to their thread's subject. */
 function normalizeSubject(subject: string | undefined): string {
-  return (subject ?? "").replace(/^\s*((re|fwd?|aw|sv|antw)\s*(\[\d+\])?\s*:\s*)+/i, "").trim().toLowerCase();
+  // Reply/forward prefixes, plus tags mail systems add in front, e.g. "Re: [EXTERNAL]Re: Plans".
+  return (subject ?? "").replace(/^\s*(((re|fwd?|aw|sv|antw)\s*(\[\d+\])?\s*:|\[[^\]]{1,20}\])\s*)+/i, "").trim().toLowerCase();
 }
 
 /** All Gmail operations for a single linked account. */

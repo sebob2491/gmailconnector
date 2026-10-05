@@ -922,11 +922,14 @@ describe("cleaner, smaller results", () => {
     fake.deliver(work, crlf(["From: Boss <boss@work.example>", `To: ${WORK}`, "Subject: Re: Q3 report", "", "Looks good"]), {
       threadId: "wt1",
     });
+    fake.deliver(work, crlf(["From: Vendor <v@vendor.example>", `To: ${WORK}`, "Subject: RE: [EXTERNAL]Re: Q3 report", "", "Thanks"]), {
+      threadId: "wt1",
+    });
     const again = await call("search_threads", { account: "work" });
     const thread = again.json.threads.find((t: any) => t.id === "wt1");
     assert.equal(thread.subject, "Q3 report");
-    assert.equal(thread.totalMessages, 2);
-    assert.equal(thread.messages.length, 2);
+    assert.equal(thread.totalMessages, 3);
+    assert.equal(thread.messages.length, 3);
     for (const m of thread.messages) {
       assert.equal(m.subject, undefined, "replies don't repeat the thread subject");
       assert.equal(m.viewUrl, undefined);
