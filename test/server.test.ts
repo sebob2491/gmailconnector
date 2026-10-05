@@ -1323,4 +1323,27 @@ describe("fixes from the second review", () => {
     assert.deepEqual(drafts.json.drafts.map((d: any) => d.subject), ["Two"]);
     assert.deepEqual(drafts.json.unavailable.draftIds, [d1.json.id]);
   });
+
+  test("an account whose page fails is retried on the next page instead of being dropped", async () => {
+    const { call, fake, personal, work } = await setup();
+    for (const mb of [personal, work]) {
+      mb.pageSize = 1;
+      for (let t = 0; t < 2; t++) fake.deliver(mb, crlf(["From: s@x.example", `To: ${mb.email}`, `Subject: T${t}`, "", "x"]), { threadId: `${mb === work ? "w" : "p"}x${t}` });
+    }
+    const page1 = await call("search_threads", {});
+    const workPage1 = page1.json.accounts.find((a: any) => a.account === WORK).threads[0].id;
+    fake.failAlways.set("threads", 500);
+    const failed = await call("search_threads", { pageToken: page1.json.nextPageToken });
+    assert.ok(failed.json.accounts.every((a: any) => a.error && a.hasMore), failed.text);
+    assert.ok(failed.json.nextPageToken, "the token still continues both accounts");
+    fake.failAlways.clear();
+    const page2 = await call("search_threads", { pageToken: failed.json.nextPageToken });
+    assert.equal(page2.json.accounts.length, 2);
+    const workPage2 = page2.json.accounts.find((a: any) => a.account === WORK).threads[0].id;
+    assert.notEqual(workPage2, workPage1, "it continues where page 1 stopped");
+    assert.deepEqual(
+      page2.json.accounts.map((a: any) => a.threads.length),
+      [1, 1],
+    );
+  });
 });

@@ -133,7 +133,9 @@ async function fanOut<T extends { nextPageToken?: string }>(
         if (nextPageToken) next[mb.email] = nextPageToken;
         return { account: mb.email, ...rest, ...(nextPageToken ? { hasMore: true } : {}) };
       } catch (err) {
-        return { account: mb.email, error: (err as Error).message };
+        // Keep this account's place, so the next page tries the same page again instead of dropping it.
+        if (token) next[mb.email] = token;
+        return { account: mb.email, error: (err as Error).message, ...(token ? { hasMore: true } : {}) };
       }
     }),
   );
