@@ -1346,4 +1346,26 @@ describe("fixes from the second review", () => {
       [1, 1],
     );
   });
+
+  test("excluding Spam or Trash in a bulk query doesn't pull in the other", async () => {
+    const { call, fake, personal } = await setup();
+    fake.deliver(personal, crlf(["From: x@shop.example", `To: ${PERSONAL}`, "Subject: Old sale", "", "x"]), {
+      id: "trashed1",
+      labelIds: ["TRASH", "CATEGORY_PROMOTIONS"],
+    });
+    fake.deliver(personal, crlf(["From: y@shop.example", `To: ${PERSONAL}`, "Subject: Sale", "", "x"]), {
+      id: "promo1",
+      labelIds: ["CATEGORY_PROMOTIONS"],
+    });
+    const dry = await call("bulk_update", { account: "personal", query: "category:promotions -in:spam", action: "move_to_inbox", dryRun: true });
+    assert.equal(dry.json.wouldChange, 1, dry.text);
+    await call("bulk_update", { account: "personal", query: "category:promotions -in:spam", action: "move_to_inbox" });
+    assert.ok(personal.messages.get("trashed1")!.labelIds!.includes("TRASH"), "the trashed email stays in Trash");
+    assert.ok(personal.messages.get("promo1")!.labelIds!.includes("INBOX"));
+    // Asking for Trash still works.
+    await call("bulk_update", { account: "personal", query: "category:promotions in:trash", action: "move_to_inbox" });
+    assert.ok(!personal.messages.get("trashed1")!.labelIds!.includes("TRASH"));
+    const lists = fake.requests.filter((r) => r.path === "messages");
+    assert.deepEqual(lists.map((r) => r.query.get("includeSpamTrash")), [null, null, "true"]);
+  });
 });

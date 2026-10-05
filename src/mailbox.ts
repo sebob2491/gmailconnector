@@ -161,6 +161,14 @@ function mentionsDrafts(query: string | undefined): boolean {
   return /(?:^|[\s({])(?:in|is):drafts?\b/i.test(query ?? "");
 }
 
+/**
+ * True when the query asks for Spam or Trash (`in:spam`, `in:trash`, `in:anywhere`), but not when it
+ * excludes them (`-in:spam`): Gmail leaves both out unless a search asks for them.
+ */
+function mentionsSpamTrash(query: string): boolean {
+  return /(?:^|[\s({])in:(?:spam|trash|anywhere)\b/i.test(query);
+}
+
 /** Joins `References` with the message's own Message-ID, per RFC 5322 threading rules. */
 function referencesFor(part: ApiMessage["payload"]): string | undefined {
   const rfcId = header(part, "Message-ID");
@@ -757,7 +765,7 @@ export class Mailbox {
     if (sel.query !== undefined) {
       const ids: string[] = [];
       let pageToken: string | undefined;
-      const includeSpamTrash = /\bin:(spam|trash|anywhere)\b/i.test(sel.query) || undefined;
+      const includeSpamTrash = mentionsSpamTrash(sel.query) || undefined;
       do {
         const page = await this.client.request("GET", "messages", {
           query: {
