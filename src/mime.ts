@@ -1,7 +1,43 @@
 import { Buffer } from "node:buffer";
 
+/**
+ * Attachment content still in the base64url text Gmail delivered it in (as ASCII bytes). It is
+ * re-attached by re-wrapping that text as base64, without decoding the file and encoding it again.
+ */
+export class Base64UrlData {
+  /** Length of the text without "=" padding. */
+  private readonly chars: number;
+
+  constructor(readonly base64url: Uint8Array) {
+    let n = base64url.length;
+    while (n && base64url[n - 1] === 0x3d) n--;
+    this.chars = n;
+  }
+
+  /** The size of the file it encodes, in bytes. */
+  get size(): number {
+    return Math.floor((this.chars * 3) / 4);
+  }
+
+  /** Length of the same content as padded base64. */
+  get base64Length(): number {
+    return Math.ceil(this.chars / 4) * 4;
+  }
+
+  /** The file itself (only needed for attached emails, which may be sent as 7-bit text). */
+  bytes(): Buffer {
+    return Buffer.from(latin1(this.base64url.subarray(0, this.chars)), "base64url");
+  }
+
+  /** Standard base64 for characters [start, end) of the text, `end` a multiple of 4 unless it is the last block. */
+  base64Block(start: number, end: number): string {
+    return base64Of(Buffer.from(latin1(this.base64url.subarray(start, Math.min(end, this.chars))), "base64url"));
+  }
+}
+
 export interface OutgoingAttachment {
-  content: Buffer;
+  /** The file, or Gmail's base64url text of it (forwarded or kept attachments). */
+  content: Buffer | Base64UrlData;
   filename?: string;
   mimeType?: string;
   inline?: boolean;
@@ -127,9 +163,96 @@ function foldHeader(name: string, value: string): string {
   return lines.join(CRLF);
 }
 
-function wrapBase64(bytes: Uint8Array): string {
-  const b64 = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
-  return (b64.match(/.{1,76}/g) ?? [""]).join(CRLF);
+// ---------- building a message as chunks ----------
+
+/**
+ * A large piece of a message written straight into the final bytes (attachment contents), so no
+ * long string is built, concatenated or encoded on the way.
+ */
+export interface ByteChunk {
+  readonly length: number;
+  /** Writes exactly `length` bytes at `pos` and returns the position after them. */
+  write(out: Buffer, pos: number): number;
+}
+
+/** A message, or part of one: text (ASCII headers and boundaries) and byte chunks, in order. */
+export type MimeChunk = string | ByteChunk;
+
+/** Joins pieces with CRLF between them. */
+function joinLines(items: (string | MimeChunk[])[]): MimeChunk[] {
+  const out: MimeChunk[] = [];
+  items.forEach((item, i) => {
+    if (i) out.push(CRLF);
+    if (typeof item === "string") out.push(item);
+    else for (const chunk of item) out.push(chunk);
+  });
+  return out;
+}
+
+const encoder = new TextEncoder();
+
+/** Bytes of a string that is (almost always) ASCII, one byte per character. */
+function asciiBytes(text: string): Uint8Array {
+  return /^[\x00-\x7f]*$/.test(text) ? Buffer.from(text, "latin1") : encoder.encode(text);
+}
+
+/** Standard base64 of `bytes`. */
+function base64Of(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+}
+
+/** Joins chunks into one byte array, allocated once at its final size. */
+export function assembleMime(chunks: MimeChunk[]): Uint8Array<ArrayBuffer> {
+  const pieces = chunks.map((c) => (typeof c === "string" ? asciiBytes(c) : c));
+  // Every byte is written below (checked), so the buffer needn't be zeroed first.
+  const out = Buffer.allocUnsafe(pieces.reduce((sum, p) => sum + p.length, 0));
+  let pos = 0;
+  for (const piece of pieces) {
+    if (piece instanceof Uint8Array) {
+      out.set(piece, pos);
+      pos += piece.length;
+    } else {
+      const end = piece.write(out, pos);
+      if (end !== pos + piece.length) throw new Error(`MIME chunk wrote ${end - pos} bytes instead of ${piece.length}`);
+      pos = end;
+    }
+  }
+  return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+}
+
+/** Characters per block when re-wrapping base64: a multiple of 76 (one line) and of 4 (3 bytes). */
+const BASE64_BLOCK = 76 * 1024;
+
+/**
+ * Base64 of `content` in lines of 76 characters joined by CRLF, as a chunk. Blocks of the base64
+ * text are made natively (decoding Gmail's base64url text and encoding it again, which also gives
+ * canonical padding, exactly as decoding the whole file would) and copied line by line into place.
+ */
+function base64Chunk(content: Buffer | Base64UrlData): ByteChunk {
+  const encoded = content instanceof Base64UrlData ? content.base64Length : Math.ceil(content.length / 3) * 4;
+  const lines = Math.ceil(encoded / 76);
+  // A block of base64 text: from Gmail's text, or encoded from the file (57 bytes per line).
+  const block =
+    content instanceof Base64UrlData
+      ? (start: number) => content.base64Block(start, start + BASE64_BLOCK)
+      : (start: number) => base64Of(content.subarray((start / 4) * 3, ((start + BASE64_BLOCK) / 4) * 3));
+  return {
+    length: encoded + Math.max(0, lines - 1) * 2,
+    write(out, pos) {
+      const scratch = Buffer.allocUnsafe(Math.min(BASE64_BLOCK, encoded));
+      for (let start = 0; start < encoded; start += BASE64_BLOCK) {
+        const length = scratch.write(block(start), 0, "latin1");
+        for (let i = 0; i < length; i += 76) {
+          if (start + i) {
+            out[pos++] = 13;
+            out[pos++] = 10;
+          }
+          pos += scratch.copy(out, pos, i, Math.min(i + 76, length));
+        }
+      }
+      return pos;
+    },
+  };
 }
 
 function boundary(): string {
@@ -179,8 +302,8 @@ function filenameParams(param: "name" | "filename", filename: string): string {
   return `${param}=${quoteParam(encodeHeaderValue(clean))};${CRLF} ${extended}`;
 }
 
-function leafPart(headers: string[], content: Buffer): string {
-  return [...headers, "Content-Transfer-Encoding: base64", "", wrapBase64(content)].join(CRLF);
+function leafPart(headers: string[], content: Buffer | Base64UrlData): MimeChunk[] {
+  return joinLines([...headers, "Content-Transfer-Encoding: base64", "", [base64Chunk(content)]]);
 }
 
 /**
@@ -194,18 +317,18 @@ function sevenBitMessage(content: Buffer): string | undefined {
   return text.endsWith(CRLF) ? text.slice(0, -2) : text;
 }
 
-function textPart(subtype: "plain" | "html", text: string): string {
+function textPart(subtype: "plain" | "html", text: string): MimeChunk[] {
   return leafPart([`Content-Type: text/${subtype}; charset=UTF-8`], Buffer.from(text, "utf8"));
 }
 
-function multipart(subtype: string, parts: string[]): string {
+function multipart(subtype: string, parts: MimeChunk[][]): MimeChunk[] {
   const b = boundary();
-  return [
+  return joinLines([
     `Content-Type: multipart/${subtype}; boundary="${b}"`,
     "",
-    ...parts.map((p) => `--${b}${CRLF}${p}`),
+    ...parts.map((p): MimeChunk[] => [`--${b}${CRLF}`, ...p]),
     `--${b}--`,
-  ].join(CRLF);
+  ]);
 }
 
 /** A header with parameters; long or multi-line parameters start on their own folded line. */
@@ -213,7 +336,7 @@ function withParams(header: string, params: string): string {
   return params.includes(CRLF) || header.length + params.length > 76 ? `${header};${CRLF} ${params}` : `${header}; ${params}`;
 }
 
-function attachmentPart(att: OutgoingAttachment, index: number): string {
+function attachmentPart(att: OutgoingAttachment, index: number): MimeChunk[] {
   const filename = att.filename ?? `attachment-${index + 1}`;
   const mimeType = oneLine(att.mimeType || "application/octet-stream");
   const headers = [withParams(`Content-Type: ${mimeType}`, filenameParams("name", filename))];
@@ -223,8 +346,8 @@ function attachmentPart(att: OutgoingAttachment, index: number): string {
     headers.push(withParams("Content-Disposition: attachment", filenameParams("filename", filename)));
   }
   if (/^message\/rfc822$/i.test(mimeType)) {
-    const message = sevenBitMessage(att.content);
-    if (message !== undefined) return [...headers, "Content-Transfer-Encoding: 7bit", "", message].join(CRLF);
+    const message = sevenBitMessage(att.content instanceof Base64UrlData ? att.content.bytes() : att.content);
+    if (message !== undefined) return joinLines([...headers, "Content-Transfer-Encoding: 7bit", "", message]);
   }
   return leafPart(headers, att.content);
 }
@@ -270,15 +393,28 @@ function assignContentIds(html: string, inline: OutgoingAttachment[]): { html: s
   return { html: out, inline: assigned };
 }
 
-/** Builds a complete RFC 822 message. Gmail fills in From, Date and Message-ID on send. */
+/** The size of an attachment's file in bytes. */
+export function attachmentSize(content: Buffer | Base64UrlData): number {
+  return content instanceof Base64UrlData ? content.size : content.length;
+}
+
+/** Builds a complete RFC 822 message as text. Gmail fills in From, Date and Message-ID on send. */
 export function buildMime(msg: OutgoingMessage): string {
+  return latin1(assembleMime(buildMimeChunks(msg)));
+}
+
+/**
+ * Builds a complete RFC 822 message as chunks, for sending without building one long string:
+ * attachments are written straight into the bytes that are uploaded (see assembleMime).
+ */
+export function buildMimeChunks(msg: OutgoingMessage): MimeChunk[] {
   const attachments = msg.attachments ?? [];
-  const total = attachments.reduce((sum, a) => sum + a.content.length, 0);
+  const total = attachments.reduce((sum, a) => sum + attachmentSize(a.content), 0);
   if (total > MAX_ATTACHMENT_BYTES) {
     throw new MimeError(`Attachments total ${(total / 1048576).toFixed(1)} MB; Gmail allows at most 25 MB per message.`);
   }
 
-  let body: string;
+  let body: MimeChunk[];
   const requested = msg.html ? attachments.filter((a) => a.inline) : [];
   const regular = attachments.filter((a) => !requested.includes(a));
   if (msg.html) {
@@ -306,7 +442,7 @@ export function buildMime(msg: OutgoingMessage): string {
     msg.references ? foldHeader("References", msg.references) : undefined,
     "MIME-Version: 1.0",
   ].filter((h): h is string => Boolean(h));
-  return [...headers, body].join(CRLF);
+  return joinLines([...headers, body]);
 }
 
 /** Accepts standard or URL-safe base64 (with or without padding/whitespace), or a base64 data: URL. */

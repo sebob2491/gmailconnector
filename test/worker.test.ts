@@ -513,6 +513,38 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(wordResult.content[1].text, "Offer letter\nSalary: $80,000");
   });
 
+  test("forwarding re-attaches files inside the Worker runtime", async () => {
+    const personal = fake.mailboxes.find((m) => m.email === PERSONAL)!;
+    const big = randomBytes(300_001); // fetched on its own
+    const note = Buffer.from("notes\r\n"); // fetched in a batch
+    const file = (name: string, type: string, data: Buffer) => [
+      "--F",
+      `Content-Type: ${type}; name="${name}"`,
+      `Content-Disposition: attachment; filename="${name}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      data.toString("base64"),
+    ];
+    fake.deliver(
+      personal,
+      crlf([
+        "From: boss@example.com", `To: ${PERSONAL}`, "Subject: Files", 'Content-Type: multipart/mixed; boundary="F"', "",
+        "--F", "Content-Type: text/plain", "", "Two files.",
+        ...file("big.bin", "application/octet-stream", big),
+        ...file("notes.txt", "text/plain", note),
+        "--F--",
+      ]),
+      { id: "fwdfiles" },
+    );
+    const res = await callTool("forward", { account: PERSONAL, messageId: "fwdfiles", to: ["accountant@example.com"], forwardText: "FYI" });
+    assert.equal(res.isError, false, res.text);
+    const raw = fake.sentBy(PERSONAL).at(-1)!.raw;
+    const body = (name: string) => raw.split(`filename="${name}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`)[1].split("\r\n--")[0];
+    assert.ok(Buffer.from(body("big.bin").replace(/\r\n/g, ""), "base64").equals(big), "the large file arrives unchanged");
+    assert.ok(Buffer.from(body("notes.txt").replace(/\r\n/g, ""), "base64").equals(note));
+    assert.match(raw, /Subject: Fwd: Files/);
+  });
+
   test("GET on the MCP endpoint is rejected (stateless server)", async () => {
     const res = await mf.dispatchFetch(`${ORIGIN}/mcp`, { headers: { Authorization: `Bearer ${accessToken}` } });
     assert.equal(res.status, 405);

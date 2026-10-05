@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
 import { bareAddress, cleanBody, cleanSnippet, decodeBody, decodeCharset, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
-import { buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
+import { Base64UrlData, buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
+import { attachmentDataOf } from "../src/mailbox.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
 
 test("ASCII headers pass through; non-ASCII becomes short encoded-words that round-trip", () => {
@@ -294,3 +295,38 @@ test("bodies Gmail already converted to UTF-8 aren't decoded twice; real legacy 
   assert.equal(decodeCharset(Buffer.from([0x4a, 0xfc, 0x72, 0x67, 0x65, 0x6e]), "utf-8"), "Jürgen");
   assert.equal(decodeBody(Buffer.from("café", "utf8").toString("base64url"), "text/plain; charset=windows-1252"), "café");
 });
+
+test("attachments re-attached from Gmail's base64url text come out byte for byte as when decoded and encoded again", () => {
+  /** What re-attaching produced before: decode the file, then base64 in 76-character lines. */
+  const reference = (bytes: Buffer) => (bytes.toString("base64").match(/.{1,76}/g) ?? [""]).join("\r\n");
+  const anonymous = (raw: string) => raw.replace(/=_mcp_[0-9a-f]+/g, "BOUNDARY");
+  const block = 57 * 1024; // one block of re-wrapped text
+  for (const size of [0, 1, 2, 3, 4, 56, 57, 58, 1000, block - 1, block, block + 1, 3 * block + 2, 1_000_001]) {
+    const bytes = Buffer.from(Array.from({ length: size }, (_, i) => (i * 7919 + (i >> 8)) & 0xff));
+    const gmail = bytes.toString("base64url");
+    const padded = gmail + "=".repeat((4 - (gmail.length % 4)) % 4); // Gmail's text may or may not be padded
+    const message = (content: Buffer | Base64UrlData) =>
+      buildMime({ to: ["a@example.com"], subject: "Fwd", text: "see", html: "<p>see</p>", attachments: [{ content, filename: "f.bin", mimeType: "application/octet-stream" }] });
+    const decoded = message(bytes);
+    for (const text of [gmail, padded]) {
+      const data = new Base64UrlData(Buffer.from(text, "latin1"));
+      assert.equal(data.size, size);
+      assert.equal(anonymous(message(data)), anonymous(decoded), `size ${size}${text === padded ? " (padded)" : ""}`);
+    }
+    // And both match the old encoding exactly.
+    const body = decoded.split('filename="f.bin"\r\nContent-Transfer-Encoding: base64\r\n\r\n')[1].split("\r\n--")[0];
+    assert.equal(body, reference(bytes), `size ${size}`);
+  }
+});
+
+test("an attachment's base64url text is sliced out of Gmail's JSON without parsing it", () => {
+  const enc = new TextEncoder();
+  const latin = (u: Uint8Array) => Buffer.from(u).toString("latin1");
+  assert.equal(latin(attachmentDataOf(enc.encode('{\n  "size": 3,\n  "data": "QUJD"\n}\n'))), "QUJD");
+  assert.equal(latin(attachmentDataOf(enc.encode('{"data":"QUJD_-8=","size":5}'))), "QUJD_-8=");
+  assert.equal(latin(attachmentDataOf(enc.encode('{"attachmentId": "x", "size": 0, "data": ""}'))), "");
+  // Anything unexpected is parsed properly.
+  assert.equal(latin(attachmentDataOf(enc.encode('{"size": 3, "data" : "QUJD" }'))), "QUJD");
+  assert.equal(latin(attachmentDataOf(enc.encode('{"size": 0}'))), "");
+});
+

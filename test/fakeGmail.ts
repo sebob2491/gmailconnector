@@ -178,8 +178,15 @@ export class FakeGmail {
     return format === "metadata" ? this.stripBodies(msg) : msg;
   }
 
+  /** Largest request body seen (uploads arrive as bytes). */
+  largestBody = 0;
+
   fetch = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
     this.outboundCalls++;
+    if (init.body instanceof Uint8Array) {
+      this.largestBody = Math.max(this.largestBody, init.body.length);
+      init = { ...init, body: new TextDecoder().decode(init.body) };
+    }
     return this.handle(input, init);
   };
 

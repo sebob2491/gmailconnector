@@ -20,13 +20,15 @@ import {
   type MessageFormat,
 } from "./format.js";
 import {
-  buildMime,
+  Base64UrlData,
+  buildMimeChunks,
   decodeBase64,
   escapeHtml,
   htmlToText,
   isValidAddress,
   MAX_ATTACHMENT_BYTES,
   MimeError,
+  type MimeChunk,
   type OutgoingAttachment,
   type OutgoingMessage,
   type Recipient,
@@ -414,6 +416,27 @@ export function isPrivateAddress(ip: string): boolean {
   return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6) || v6.startsWith("ff") || v6.startsWith("::ffff:");
 }
 
+/** Attachments at least this large are fetched on their own, as bytes, instead of in a batch. */
+const DIRECT_FETCH_BYTES = 64 * 1024;
+/** At most this many are fetched on their own (the largest); the rest share a batch call. */
+const MAX_DIRECT_FETCHES = 8;
+
+/**
+ * The base64url text of an attachments.get answer, sliced out of the raw JSON without parsing it
+ * (base64url has no characters JSON would escape). Falls back to parsing for any other shape.
+ */
+export function attachmentDataOf(json: Uint8Array): Uint8Array {
+  const view = Buffer.from(json.buffer, json.byteOffset, json.byteLength);
+  const key = view.indexOf('"data"');
+  if (key >= 0) {
+    let start = key + 6;
+    while (start < json.length && (json[start] === 0x20 || json[start] === 0x3a || json[start] === 0x0a || json[start] === 0x0d || json[start] === 0x09)) start++;
+    const end = json[start] === 0x22 ? view.indexOf(0x22, start + 1) : -1;
+    if (end > start) return json.subarray(start + 1, end);
+  }
+  return Buffer.from((JSON.parse(new TextDecoder().decode(json)) as { data?: string }).data ?? "", "latin1");
+}
+
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
   constructor(readonly client: GmailClient) {}
@@ -545,27 +568,43 @@ export class Mailbox {
   }
 
   /**
-   * Downloads every attachment of a message so it can be re-attached (forwarding, draft edits).
-   * Attachments over Gmail's 25 MB limit are refused from their listed sizes, before downloading
-   * anything: they couldn't be sent, and holding them would strain the hosted connector's memory.
+   * Downloads every attachment of a message so it can be re-attached (forwarding, draft edits),
+   * keeping each as Gmail's base64url text so it is never decoded and encoded again. Attachments
+   * over the limit are refused from their listed sizes before downloading anything. Large ones are
+   * fetched on their own as bytes (no batch text to split, no JSON to parse); small ones share a batch.
    */
-  private async downloadAttachments(msg: ApiMessage, content: ExtractedContent, tooBig: (mb: string) => string): Promise<OutgoingAttachment[]> {
+  private async downloadAttachments(
+    msg: ApiMessage,
+    content: ExtractedContent,
+    tooBig: (size: string, limit: string, note?: string) => string,
+  ): Promise<OutgoingAttachment[]> {
     const total = content.attachments.reduce((sum, a) => sum + a.size, 0);
-    if (total > MAX_ATTACHMENT_BYTES) throw new MimeError(tooBig((total / 1048576).toFixed(1)));
+    const size = `${(total / 1048576).toFixed(1)} MB`;
+    if (total > MAX_ATTACHMENT_BYTES) throw new MimeError(tooBig(size, "25 MB Gmail allows in one email"));
     const withIds = content.attachments.filter((a) => a.id);
-    const fetched = await this.client.batchGet<{ data: string }>(
-      withIds.map((a) => ({ path: `messages/${msg.id}/attachments/${a.id}` })),
+    const direct = new Set(
+      [...withIds]
+        .filter((a) => a.size >= DIRECT_FETCH_BYTES)
+        .sort((a, b) => b.size - a.size)
+        .slice(0, MAX_DIRECT_FETCHES),
     );
-    const dataById = new Map<string, string>();
-    withIds.forEach((a, i) => {
+    const batched = withIds.filter((a) => !direct.has(a));
+    const dataById = new Map<string, Uint8Array>();
+    const [fetched] = await Promise.all([
+      this.client.batchGet<{ data: string }>(batched.map((a) => ({ path: `messages/${msg.id}/attachments/${a.id}` }))),
+      mapLimit([...direct], 4, async (a) => {
+        dataById.set(a.id!, attachmentDataOf(await this.client.getBytes(`messages/${msg.id}/attachments/${a.id}`)));
+      }),
+    ]);
+    batched.forEach((a, i) => {
       const r = fetched[i];
       if (!r.ok) throw r.error;
-      dataById.set(a.id!, r.value.data);
+      dataById.set(a.id!, Buffer.from(r.value.data, "latin1"));
     });
     return content.attachments.map((a) => {
-      const data = a.id ? dataById.get(a.id)! : (findPart(msg, a.partId)?.body?.data ?? "");
+      const data = a.id ? dataById.get(a.id)! : Buffer.from(findPart(msg, a.partId)?.body?.data ?? "", "latin1");
       return {
-        content: Buffer.from(data, "base64url"),
+        content: new Base64UrlData(data),
         filename: a.filename,
         mimeType: a.mimeType,
         inline: a.inline && Boolean(a.contentId),
@@ -576,8 +615,14 @@ export class Mailbox {
 
   // ---------- sending ----------
 
-  private async upload(method: string, path: string, metadata: unknown, mime: string) {
-    return this.client.request(method, path, { upload: GmailClient.uploadBody(metadata, mime) });
+  /**
+   * Uploads a message. The request body is assembled first, so the chunks it came from (and any
+   * attachment text they point to) can be freed while it is being sent.
+   */
+  private async upload(method: string, path: string, metadata: unknown, mime: MimeChunk[]) {
+    const upload = GmailClient.uploadBody(metadata, mime);
+    mime.length = 0;
+    return this.client.request(method, path, { upload });
   }
 
   /** Threading headers and default recipients for replying to `messageId`. */
@@ -668,8 +713,8 @@ export class Mailbox {
         msg.subject ||= replySubject(header(last.payload, "Subject"));
       }
     }
-    const mime = buildMime(msg);
-    const sent = await this.sendMail(() => this.upload("POST", "messages/send", threadId ? { threadId } : {}, mime));
+    const upload = GmailClient.uploadBody(threadId ? { threadId } : {}, buildMimeChunks(msg));
+    const sent = await this.sendMail(() => this.client.request("POST", "messages/send", { upload }));
     return this.sentResult(sent);
   }
 
@@ -677,7 +722,7 @@ export class Mailbox {
     if (!input.body && !input.htmlBody) throw new MimeError("Provide body or htmlBody for the reply.");
     const ctx = await this.replyContext(input.messageId, input.replyAll);
     const { text, html } = this.withQuote(input, ctx.quote);
-    const mime = buildMime({
+    const mime = buildMimeChunks({
       to: input.to?.length ? input.to : ctx.to,
       cc: input.cc?.length ? input.cc : ctx.cc,
       bcc: input.bcc,
@@ -687,7 +732,8 @@ export class Mailbox {
       inReplyTo: ctx.inReplyTo,
       references: ctx.references,
     });
-    const sent = await this.sendMail(() => this.upload("POST", "messages/send", { threadId: ctx.threadId }, mime));
+    const upload = GmailClient.uploadBody({ threadId: ctx.threadId }, mime);
+    const sent = await this.sendMail(() => this.client.request("POST", "messages/send", { upload }));
     return this.sentResult(sent);
   }
 
@@ -725,7 +771,7 @@ export class Mailbox {
       present.map(([k, v]) => `${k}: ${escapeHtml(v)}<br>`).join("") +
       `<br>${content.html ?? escapeHtml(origText).replace(/\n/g, "<br>")}</div>`;
     const subject = header(p, "Subject") ?? "";
-    const mime = buildMime({
+    const mime = buildMimeChunks({
       to: input.to,
       cc: input.cc,
       bcc: input.bcc,
@@ -737,12 +783,16 @@ export class Mailbox {
       attachments: await this.downloadAttachments(
         original,
         content,
-        (mb) =>
-          `This email's attachments add up to ${mb} MB, more than the 25 MB Gmail allows in one email, so it can't be forwarded ` +
-          `with them from here. Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.`,
+        (size, limit, note) =>
+          `This email's attachments add up to ${size}, more than the ${limit}, so it can't be forwarded with them from here. ` +
+          `Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.` +
+          (note ? ` ${note}` : ""),
       ),
     });
-    const sent = await this.sendMail(() => this.upload("POST", "messages/send", { threadId: original.threadId }, mime));
+    // Only the assembled bytes stay alive while sending: the attachment text they were built from can go.
+    const upload = GmailClient.uploadBody({ threadId: original.threadId }, mime);
+    mime.length = 0;
+    const sent = await this.sendMail(() => this.client.request("POST", "messages/send", { upload }));
     return this.sentResult(sent);
   }
 
@@ -847,7 +897,7 @@ export class Mailbox {
       if (!input.to?.length) msg.to = ctx.to;
       threadId = ctx.threadId;
     }
-    const draft = await this.upload("POST", "drafts", { message: threadId ? { threadId } : {} }, buildMime(msg));
+    const draft = await this.upload("POST", "drafts", { message: threadId ? { threadId } : {} }, buildMimeChunks(msg));
     return this.draftResult(draft);
   }
 
@@ -868,7 +918,7 @@ export class Mailbox {
     const inReplyTo = header(p, "In-Reply-To");
     // Keep a chosen send-as address; without From, Gmail would send from the primary address.
     const from = parseMailboxes(header(p, "From")).find((m) => isValidAddress(m.address));
-    const mime = buildMime({
+    const mime = buildMimeChunks({
       from,
       to: pick(input.to, "To"),
       cc: pick(input.cc, "Cc"),
@@ -883,7 +933,9 @@ export class Mailbox {
         : await this.downloadAttachments(
             msg,
             content,
-            (mb) => `This draft's attachments add up to ${mb} MB, more than the 25 MB Gmail allows in one email. Pass \`attachments\` to replace them.`,
+            (size, limit, note) =>
+              `This draft's attachments add up to ${size}, more than the ${limit}. Pass \`attachments\` to replace them, or edit the draft in Gmail.` +
+              (note ? ` ${note}` : ""),
           ),
     });
     const draft = await this.upload("PUT", `drafts/${draftId}`, { id: draftId, message: { threadId: msg.threadId } }, mime);
@@ -1093,8 +1145,8 @@ export class Mailbox {
 
   /** Sends the unsubscribe email a sender's List-Unsubscribe header asks for (mailto:). */
   async sendUnsubscribeEmail(mail: { to: string; subject: string; body: string }) {
-    const mime = buildMime({ to: [mail.to], subject: mail.subject, text: mail.body });
-    return this.sentResult(await this.sendMail(() => this.upload("POST", "messages/send", {}, mime)));
+    const upload = GmailClient.uploadBody({}, buildMimeChunks({ to: [mail.to], subject: mail.subject, text: mail.body }));
+    return this.sentResult(await this.sendMail(() => this.client.request("POST", "messages/send", { upload })));
   }
 
   // ---------- bulk changes ----------

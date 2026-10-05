@@ -1,5 +1,6 @@
 import type { LinkedAccount } from "./accounts.js";
 import { AuthError, defaultFetch, refreshAccessToken, type FetchLike, type OAuthClientConfig } from "./google.js";
+import { assembleMime, type MimeChunk } from "./mime.js";
 
 const API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me/";
 const UPLOAD_BASE = "https://gmail.googleapis.com/upload/gmail/v1/users/me/";
@@ -60,7 +61,7 @@ export interface RequestOptions {
   query?: Record<string, QueryValue>;
   json?: unknown;
   /** Sends a pre-built body to the upload endpoint (used for RFC 822 messages). */
-  upload?: { body: string; contentType: string };
+  upload?: { body: string | Uint8Array<ArrayBuffer>; contentType: string };
 }
 
 export interface BatchItem {
@@ -159,10 +160,11 @@ export class GmailClient {
   private async send(
     method: string,
     url: URL | string,
-    body: string | undefined,
+    body: string | Uint8Array<ArrayBuffer> | undefined,
     contentType: string | undefined,
     idempotent: boolean,
-  ): Promise<{ res: Response; text: string }> {
+    asBytes = false,
+  ): Promise<{ res: Response; text: string; bytes?: Uint8Array }> {
     let refreshed = false;
     for (let attempt = 0; ; ) {
       const token = await this.tokens.get(this.account, false);
@@ -171,6 +173,8 @@ export class GmailClient {
         headers: { Authorization: `Bearer ${token}`, ...(contentType ? { "Content-Type": contentType } : {}) },
         body,
       });
+      // A large successful answer can be kept as bytes, skipping text decoding.
+      if (asBytes && res.ok) return { res, text: "", bytes: new Uint8Array(await res.arrayBuffer()) };
       const text = await res.text();
       if (res.status === 401 && !refreshed) {
         refreshed = true;
@@ -191,7 +195,7 @@ export class GmailClient {
     const url = withQuery(new URL(path, opts.upload ? UPLOAD_BASE : API_BASE), opts.query);
     if (opts.upload) url.searchParams.set("uploadType", "multipart");
 
-    let body: string | undefined;
+    let body: string | Uint8Array<ArrayBuffer> | undefined;
     let contentType: string | undefined;
     if (opts.upload) {
       body = opts.upload.body;
@@ -205,6 +209,13 @@ export class GmailClient {
     const { res, text } = await this.send(method, url, body, contentType, idempotent);
     if (!res.ok) throw apiError(method, path, res.status, text);
     return (text ? JSON.parse(text) : undefined) as T;
+  }
+
+  /** A GET whose successful answer is returned as raw bytes (e.g. an attachment's JSON, for slicing). */
+  async getBytes(path: string, query?: Record<string, QueryValue>): Promise<Uint8Array> {
+    const { res, text, bytes } = await this.send("GET", withQuery(new URL(path, API_BASE), query), undefined, undefined, true, true);
+    if (!bytes) throw apiError("GET", path, res.status, text);
+    return bytes;
   }
 
   /**
@@ -255,12 +266,18 @@ export class GmailClient {
     return parseBatchResponse(text, res.headers.get("Content-Type") ?? "", items.length);
   }
 
-  /** Builds a multipart/related upload body: JSON metadata followed by the RFC 822 message. */
-  static uploadBody(metadata: unknown, rfc822: string): { body: string; contentType: string } {
+  /**
+   * Builds a multipart/related upload body: JSON metadata followed by the RFC 822 message, as one
+   * byte array allocated once (attachments are written straight into it, never into a string).
+   */
+  static uploadBody(metadata: unknown, rfc822: string | MimeChunk[]): { body: Uint8Array<ArrayBuffer>; contentType: string } {
     const boundary = `gmail_mcp_upload_${Math.random().toString(36).slice(2)}`;
-    const body =
+    const body = assembleMime([
       `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
-      `--${boundary}\r\nContent-Type: message/rfc822\r\n\r\n${rfc822}\r\n--${boundary}--`;
+        `--${boundary}\r\nContent-Type: message/rfc822\r\n\r\n`,
+      ...(typeof rfc822 === "string" ? [rfc822] : rfc822),
+      `\r\n--${boundary}--`,
+    ]);
     return { body, contentType: `multipart/related; boundary=${boundary}` };
   }
 }

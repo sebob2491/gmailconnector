@@ -1900,3 +1900,47 @@ describe("unsubscribe", () => {
   });
 });
 
+describe("cheaper forwarding", () => {
+  test("large attachments are fetched on their own and re-attached unchanged", async () => {
+    const { call, fake, work } = await setup();
+    const big = Buffer.from(Array.from({ length: 300_001 }, (_, i) => (i * 131 + (i >> 9)) & 0xff));
+    const small = Buffer.from("small file\r\n");
+    const file = (name: string, type: string, data: Buffer) => [
+      "--B",
+      `Content-Type: ${type}; name="${name}"`,
+      `Content-Disposition: attachment; filename="${name}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      data.toString("base64"),
+    ];
+    fake.deliver(
+      work,
+      crlf([
+        "From: a@example.com", `To: ${WORK}`, "Subject: Files", 'Content-Type: multipart/mixed; boundary="B"', "",
+        "--B", "Content-Type: text/plain", "", "Two files",
+        ...file("big.bin", "application/octet-stream", big),
+        ...file("small.txt", "text/plain", small),
+        "--B--",
+      ]),
+      { id: "files1" },
+    );
+    fake.batchCalls = 0;
+    fake.requests.length = 0;
+    const res = await call("forward", { account: "work", messageId: "files1", to: ["x@example.com"] });
+    assert.equal(res.isError, false, res.text);
+    const [sent] = fake.sentBy(WORK);
+    const parts = inspectMime(sent.raw).parts.filter((p) => p.filename);
+    assert.deepEqual(parts.map((p) => p.filename), ["big.bin", "small.txt"]);
+    // inspectMime decodes as UTF-8 text, so compare the raw base64 instead.
+    const body = (name: string) => sent.raw.split(`filename="${name}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`)[1].split("\r\n--")[0];
+    assert.equal(Buffer.from(body("big.bin").replace(/\r\n/g, ""), "base64").equals(big), true);
+    assert.ok(body("big.bin").split("\r\n").every((line) => line.length <= 76));
+    assert.equal(Buffer.from(body("small.txt").replace(/\r\n/g, ""), "base64").toString(), small.toString());
+    const direct = fake.requests.filter((r) => r.path.includes("/attachments/"));
+    assert.equal(direct.length, 2, "both downloaded");
+    assert.equal(fake.batchCalls, 1, "the small one in a batch, the large one on its own");
+    assert.ok(fake.largestBody > 400_000, "the upload went out as bytes");
+  });
+
+});
+
