@@ -5,14 +5,14 @@ import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { attachmentCharset, attachmentText } from "../src/format.js";
 import { attachmentResult, decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
-import { docx, docxOf, pdf, pdfOf, png, pptx, xlsx, xlsxOf, zip, zipOf } from "./files.js";
+import { docx, docxOf, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
   const file = pdf([
     "BT /F1 12 Tf 72 720 Td (Pay statement for Sebastian) Tj 0 -14 Td (Net pay: $1,234.56) Tj T* [(Hello)-250(World)] TJ ET",
     "BT /F1 12 Tf 72 720 Td (Caf\\351 \\(page two\\)) Tj ET",
   ]);
-  assert.equal(await pdfText(file), "Pay statement for Sebastian\nNet pay: $1,234.56\nHello World\n\nCafé (page two)");
+  assert.equal(await pdfText(file), "--- Page 1 ---\nPay statement for Sebastian\nNet pay: $1,234.56\nHello World\n\n--- Page 2 ---\nCafé (page two)");
 });
 
 test("PDF images and other binary streams are skipped", async () => {
@@ -87,9 +87,11 @@ test("decompression bombs fail fast with a clear error instead of exhausting mem
   const lying = await timed(() => readOffice(zipOf([{ name: "word/document.xml", data: bomb, declaredSize: 2000 }])));
   assert.ok(lying.error instanceof FileTooLargeError, String(lying.error));
   // A PDF stream that unpacks to 64 MB is skipped; the rest of the PDF is still read.
-  const pdfBomb = pdf(["BT 72 700 Td (Readable statement text for the account holder.) Tj ET"], [
-    { dict: "/Filter /FlateDecode", data: deflateSync(Buffer.alloc(64 * 1024 * 1024, " ")) },
-  ]);
+  const b = new PdfBuilder();
+  const text = b.content("BT 72 700 Td (Readable statement text for the account holder.) Tj ET");
+  const huge = b.add("/Filter /FlateDecode", deflateSync(Buffer.alloc(64 * 1024 * 1024, " ")));
+  const page = b.add(`<< /Type /Page /Contents [${refs(text, huge)}] >>`);
+  const pdfBomb = b.build(b.add(`<< /Type /Catalog /Pages ${refs(b.add(`<< /Type /Pages /Kids [${refs(page)}] /Count 1 >>`))} >>`));
   const read = await timed(() => readPdf(pdfBomb));
   assert.equal(read.value?.text, "Readable statement text for the account holder.");
   assert.match(read.value?.incomplete ?? "", /too large/);
@@ -360,4 +362,202 @@ test("get_attachment's note says whether a larger maxChars would show more", () 
   assert.match(cut.truncated!, /too large.*viewUrl/);
   // Nothing missing, nothing said; text keeps its tabs and indentation.
   assert.deepEqual(attachmentResult({ text: "a\t\tb\n    c" }, 20_000), { text: "a\t\tb\n    c" });
+});
+
+// ---------- PDF reading order ----------
+
+/** A catalog and page tree over pages made by `page(builder)`, written in the builder's object order. */
+function pageTree(b: PdfBuilder, pages: number[], extra = ""): number {
+  const tree = b.add(`<< /Type /Pages /Kids [${refs(pages)}] /Count ${pages.length}${extra} >>`);
+  return b.add(`<< /Type /Catalog /Pages ${refs(tree)} >>`);
+}
+
+const textPage = (b: PdfBuilder, text: string, resources = "") =>
+  b.add(`<< /Type /Page /Contents ${refs(b.content(`BT /F1 12 Tf 72 700 Td (${text}) Tj ET`))}${resources} >>`);
+
+test("PDF pages come out in page-tree order, with page markers", async () => {
+  const b = new PdfBuilder();
+  // Written to the file as Page C, Page A, Page B; the tree (in a nested Pages node) says A, B, C.
+  const c = textPage(b, "Third page: closing remarks and signature.");
+  const a = textPage(b, "First page: summary of the agreement terms.");
+  const bp = textPage(b, "Second page: payment schedule and amounts.");
+  const inner = b.add(`<< /Type /Pages /Kids [${refs(bp, c)}] /Count 2 >>`);
+  const tree = b.add(`<< /Type /Pages /Kids [${refs(a, inner)}] /Count 3 >>`);
+  const file = b.build(b.add(`<< /Type /Catalog /Pages ${refs(tree)} >>`));
+  assert.equal(
+    (await readPdf(file))!.text,
+    "--- Page 1 ---\nFirst page: summary of the agreement terms.\n\n--- Page 2 ---\nSecond page: payment schedule and amounts.\n\n--- Page 3 ---\nThird page: closing remarks and signature.",
+  );
+  // Page markers count toward maxChars.
+  const first = await readPdf(file, { maxChars: 50 });
+  assert.equal(first!.more, true);
+  assert.doesNotMatch(first!.text, /Second page/);
+});
+
+test("pages without text are listed together, so page numbers stay right", async () => {
+  const b = new PdfBuilder();
+  const pages = [textPage(b, "First page, with the cover letter text.")];
+  for (let i = 0; i < 4; i++) pages.push(b.add("<< /Type /Page >>"));
+  pages.push(textPage(b, "Page six has text again, after four scanned ones."), b.add("<< /Type /Page >>"));
+  assert.equal(
+    (await readPdf(b.build(pageTree(b, pages))))!.text,
+    "--- Page 1 ---\nFirst page, with the cover letter text.\n\n--- Pages 2–5: no text ---\n\n--- Page 6 ---\nPage six has text again, after four scanned ones.\n\n--- Page 7: no text ---",
+  );
+});
+
+test("PDF objects packed in object streams are found", async () => {
+  const b = new PdfBuilder();
+  const one = textPage(b, "Packed page one: the invoice number is 4471.");
+  const two = textPage(b, "Packed page two: payment due within 30 days.");
+  const root = pageTree(b, [one, two]);
+  const tree = root - 1;
+  // Catalog, page tree and page dictionaries live in an object stream; the trailer is a cross-reference stream.
+  const file = b.build(root, { packed: [one, two, tree, root], xrefStream: true });
+  assert.equal(
+    (await readPdf(file))!.text,
+    "--- Page 1 ---\nPacked page one: the invoice number is 4471.\n\n--- Page 2 ---\nPacked page two: payment due within 30 days.",
+  );
+});
+
+test("after an incremental update only the latest version of a page is read", async () => {
+  const b = new PdfBuilder();
+  const one = textPage(b, "Offer letter: the position is Senior Analyst.");
+  const two = textPage(b, "Salary: 90000 dollars per year (draft).");
+  const root = pageTree(b, [one, two]);
+  const original = b.build(root);
+  // The update replaces page two's content stream (object two - 1) with a new version.
+  const updated = pdfUpdate(original, root, [
+    { num: two - 1, body: "/Filter /FlateDecode", data: deflateSync(Buffer.from("BT /F1 12 Tf 72 700 Td (Salary: 95000 dollars per year (final).) Tj ET")) },
+  ]);
+  const text = (await readPdf(updated))!.text;
+  assert.match(text, /95000 dollars per year \(final\)/);
+  assert.doesNotMatch(text, /90000|draft/);
+});
+
+test("form XObjects are read where they are drawn, once, and never recursively", async () => {
+  const b = new PdfBuilder();
+  const form = b.reserve();
+  const self = `/Resources << /XObject << /Fm1 ${refs(form)} >> >>`;
+  // The form draws itself again (a cycle), which must not loop.
+  b.set(form, `/Type /XObject /Subtype /Form /BBox [0 0 612 792] ${self} /Filter /FlateDecode`, deflateSync(Buffer.from("BT /F1 12 Tf 72 680 Td (Text from the form: account 12-3456.) Tj ET /Fm1 Do")));
+  const content = b.content("BT /F1 12 Tf 72 700 Td (Before the form, on top of the page.) Tj ET /Fm1 Do /Fm1 Do BT /F1 12 Tf 72 660 Td (After the form, further down.) Tj ET");
+  const page = b.add(`<< /Type /Page /Contents ${refs(content)} >>`);
+  // The page inherits its resources from the page tree node.
+  const tree = b.add(`<< /Type /Pages /Kids [${refs(page)}] /Count 1 /Resources << /XObject << /Fm1 ${refs(form)} >> >> >>`);
+  const file = b.build(b.add(`<< /Type /Catalog /Pages ${refs(tree)} >>`));
+  assert.equal((await readPdf(file))!.text, "Before the form, on top of the page.\nText from the form: account 12-3456.\nAfter the form, further down.");
+});
+
+test("PDF lines are rebuilt from text positions (Word writes one text object per run)", async () => {
+  const b = new PdfBuilder();
+  // A font whose letters are 600/1000 em wide and spaces 300, so runs can be placed end to end.
+  const widths = Array.from({ length: 95 }, (_, i) => (i === 0 ? 300 : 600)).join(" ");
+  const font = b.add(`<< /Type /Font /Subtype /TrueType /BaseFont /Calibri /FirstChar 32 /LastChar 126 /Widths [${widths}] >>`);
+  const width = (s: string) => [...s].reduce((w, ch) => w + (ch === " " ? 0.3 : 0.6), 0) * 11;
+  const runs = ["Please pay the ", "full amount", " by Friday."];
+  let x = 72;
+  const line1 = runs.map((run, i) => {
+    const op = `BT /F${(i % 2) + 1} 11 Tf 1 0 0 1 ${x.toFixed(2)} 700 Tm [(${run})] TJ ET`;
+    x += width(run);
+    return op;
+  });
+  const content = [
+    ...line1,
+    "BT /F1 11 Tf 1 0 0 1 72 686.6 Tm [(Thank you.)] TJ ET", // next line
+    "BT /F1 11 Tf 1 0 0 1 72 650 Tm [(Total)] TJ ET BT /F1 11 Tf 1 0 0 1 400 650 Tm [($120.00)] TJ ET", // a paragraph gap, then two columns
+    "BT /F1 11 Tf 1 0 0 1 72 636.6 Tm [(Ref)] TJ ET BT /F1 11 Tf 1 0 0 1 98 636.6 Tm [(no. 55)] TJ ET", // a small gap: a space
+    "BT /F1 11 Tf 1 0 0 1 72 623.2 Tm [(H)] TJ ET BT /F1 8 Tf 1 0 0 1 78.6 627 Tm [(2)] TJ ET BT /F1 11 Tf 1 0 0 1 83.4 623.2 Tm [(O)] TJ ET", // a raised digit stays on its line
+  ].join("\n");
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content(content))} /Resources << /Font << /F1 ${refs(font)} /F2 ${refs(font)} >> >> >>`);
+  const file = b.build(pageTree(b, [page]));
+  assert.equal((await readPdf(file))!.text, "Please pay the full amount by Friday.\nThank you.\n\nTotal\t$120.00\nRef no. 55\nH2O");
+  // Standard fonts have no widths in the file: a word placed on its own further right is a new word.
+  assert.equal((await readPdf(pdf(["BT /F1 12 Tf 72 700 Td (Hello) Tj 28.3 0 Td (World,) Tj 36 0 Td (again and again.) Tj ET"])))!.text, "Hello World, again and again.");
+});
+
+test("filled-in form fields (annotation appearances) are read after the page", async () => {
+  const b = new PdfBuilder();
+  const appearance = b.add("/Type /XObject /Subtype /Form /BBox [0 0 200 20] /Filter /FlateDecode", deflateSync(Buffer.from("/Tx BMC BT /Helv 10 Tf 2 5 Td (Jane Q. Applicant) Tj ET EMC")));
+  const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
+  const field = b.add(`<< /Type /Annot /Subtype /Widget /Rect [150 690 350 710] /AP << /N ${refs(appearance)} >> >>`);
+  const box = b.add(`<< /Type /Annot /Subtype /Widget /Rect [150 670 160 680] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`);
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (Applicant name:) Tj ET"))} /Annots [${refs(field, box)}] >>`);
+  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Applicant name:\nJane Q. Applicant");
+});
+
+test("PDFs whose page tree can't be used are read in file order", async () => {
+  // A page whose content stream is missing: the tree is damaged.
+  const b = new PdfBuilder();
+  const missing = textPage(b, "Text of the first page in the file, about the lease.");
+  const page = b.add(`<< /Type /Page /Contents ${refs(999)} >>`);
+  const damaged = b.build(pageTree(b, [page, missing]));
+  assert.equal((await readPdf(damaged))!.text, "Text of the first page in the file, about the lease.");
+  // An encrypted PDF's objects can't be read: file order (here the streams happen to be plain).
+  const e = new PdfBuilder();
+  const p1 = textPage(e, "Encrypted file, second in the tree but first in the file.");
+  const p2 = textPage(e, "Encrypted file, first in the tree but second in the file.");
+  const root = pageTree(e, [p2, p1]);
+  const encrypted = pdfUpdate(e.build(root), root, [], " /Encrypt << /Filter /Standard >>");
+  assert.equal(
+    (await readPdf(encrypted))!.text,
+    "Encrypted file, second in the tree but first in the file.\n\nEncrypted file, first in the tree but second in the file.",
+  );
+});
+
+test("forms with underscore lines count as readable", async () => {
+  const text = (await readPdf(pdf(["BT /F1 12 Tf 72 700 Td (Name: ______________________________) Tj 0 -20 Td (Signature: __________________________) Tj 0 -20 Td (Date: ____________ Amount due: $120.00) Tj ET"])))!.text;
+  assert.match(text, /^Name: _+\nSignature: _+\nDate: _+ Amount due: \$120\.00$/);
+});
+
+test("crafted page trees and object streams stay fast", async () => {
+  const cases: Record<string, Buffer> = {};
+  // A page tree nested 5,000 levels deep.
+  {
+    const b = new PdfBuilder();
+    let node = textPage(b, "Deep inside a very deep page tree, still readable.");
+    for (let i = 0; i < 5000; i++) node = b.add(`<< /Type /Pages /Kids [${refs(node)}] /Count 1 >>`);
+    cases["deep tree"] = b.build(b.add(`<< /Type /Catalog /Pages ${refs(node)} >>`));
+  }
+  // A tree whose nodes list themselves and each other as kids.
+  {
+    const b = new PdfBuilder();
+    const page = textPage(b, "The only real page in a cyclic page tree.");
+    const a = b.reserve();
+    const c = b.reserve();
+    b.set(a, `<< /Type /Pages /Kids [${refs(a, c, page, a)}] /Count 1 >>`);
+    b.set(c, `<< /Type /Pages /Kids [${refs(a, c)}] /Count 1 >>`);
+    cases["cyclic tree"] = b.build(b.add(`<< /Type /Catalog /Pages ${refs(a)} >>`));
+  }
+  // Kids arrays with 200,000 entries: the same page over and over, and pages that don't exist.
+  {
+    const b = new PdfBuilder();
+    const page = textPage(b, "One page listed two hundred thousand times.");
+    cases["huge Kids, one page"] = b.build(pageTree(b, Array(200_000).fill(page)));
+    const m = new PdfBuilder();
+    const real = textPage(m, "A real page before many missing ones, in the file.");
+    cases["huge Kids, missing pages"] = m.build(pageTree(m, [real].concat(Array.from({ length: 200_000 }, (_, i) => 10_000 + i))));
+  }
+  // 20,000 pages, all but the first without text (they are listed as one line).
+  {
+    const b = new PdfBuilder();
+    const pages = [textPage(b, "First of twenty thousand mostly empty pages.")];
+    for (let i = 1; i < 20_000; i++) pages.push(b.add("<< /Type /Page >>"));
+    cases["20,000 pages"] = b.build(pageTree(b, pages));
+  }
+  // 3,000 object streams (more than are indexed: read in file order) and 1,500 (indexed).
+  for (const count of [3000, 1500]) {
+    const b = new PdfBuilder();
+    const page = textPage(b, "A page whose file has very many object streams.");
+    const parts = [b.build(pageTree(b, [page]))];
+    for (let i = 0; i < count; i++) {
+      const data = deflateSync(Buffer.from(`${50_000 + i} 0 << /Junk ${i} >>`));
+      parts.push(Buffer.from(`${20_000 + i} 0 obj\n<< /Type /ObjStm /N 1 /First 8 /Filter /FlateDecode /Length ${data.length} >>\nstream\n`, "latin1"), data, Buffer.from("\nendstream\nendobj\n"));
+    }
+    cases[`${count} object streams`] = Buffer.concat(parts);
+  }
+  for (const [name, file] of Object.entries(cases)) {
+    const r = await timed(() => readPdf(file));
+    assert.ok(r.ms < 200, `${name}: ${r.ms.toFixed(0)} ms`);
+    assert.ok(r.value?.text, `${name}: no text`);
+  }
 });

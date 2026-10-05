@@ -919,20 +919,20 @@ export async function officeText(bytes: Uint8Array, opts: ReadOptions = {}): Pro
 
 // ---------- PDF ----------
 
-/** Literal and hex PDF strings, decoded as Windows-1252 (PDF's common single-byte text encoding). */
 const win1252Decoder = new TextDecoder("windows-1252");
-const win1252 = {
-  /** Plain ASCII needs no decoding, which skips a costly round trip for most strings. */
-  decode: (bytes: Uint8Array) => {
-    const text = latin1(bytes);
-    return /[^\x00-\x7f]/.test(text) ? win1252Decoder.decode(bytes) : text;
-  },
-};
+
+/**
+ * Decodes PDF string bytes (held one per character) as Windows-1252, PDF's common single-byte text
+ * encoding. Plain ASCII needs no decoding, which skips a costly round trip for most strings.
+ */
+function win1252(raw: string): string {
+  return /[^\x00-\x7f]/.test(raw) ? win1252Decoder.decode(Buffer.from(raw, "latin1")) : raw;
+}
 
 const LITERAL_SPECIAL = /[\\()]/g;
 const ESCAPES: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", "(": "(", ")": ")", "\\": "\\" };
 
-/** Reads a (literal) string starting at `start` (the "("), returning its text and the index after ")". */
+/** Reads a literal string starting at `start` (the "("): its bytes (one per character) and the index after ")". */
 function readLiteral(s: string, start: number): { value: string; end: number } {
   let depth = 1;
   let out = "";
@@ -961,79 +961,707 @@ function readLiteral(s: string, start: number): { value: string; end: number } {
       depth++;
       out += ch;
     } else if (--depth === 0) {
-      return { value: win1252.decode(Buffer.from(out, "latin1")), end: next };
+      return { value: out, end: next };
     } else out += ch;
     pos = next;
     LITERAL_SPECIAL.lastIndex = next;
   }
-  return { value: win1252.decode(Buffer.from(out + s.slice(pos), "latin1")), end: s.length };
+  return { value: out + s.slice(pos), end: s.length };
+}
+
+/** A hex string's bytes, one per character. */
+function hexBytes(hex: string): string {
+  const digits = hex.replace(/[^0-9A-Fa-f]/g, "");
+  return latin1(Buffer.from(digits.length % 2 ? `${digits}0` : digits, "hex"));
+}
+
+// ---------- PDF objects ----------
+
+class PdfName {
+  constructor(readonly name: string) {}
+}
+
+class PdfRef {
+  constructor(readonly num: number) {}
+}
+
+class PdfString {
+  constructor(readonly bytes: string) {}
+}
+
+type PdfDict = Map<string, PdfValue>;
+type PdfValue = number | boolean | null | PdfName | PdfRef | PdfString | PdfDict | PdfValue[];
+
+/** A stream object: its dictionary and where its (still encoded) data lies in the file. */
+interface PdfStream {
+  dict: PdfDict;
+  start: number;
+  end: number;
+}
+
+const PDF_NUMBER = /[+-]?(?:\d+\.?\d*|\.\d+)/y;
+const PDF_NAME = /\/([^\s/[\]()<>{}%]*)/y;
+const PDF_REF_TAIL = /\s+(\d+)\s+R(?![^\s/[\]()<>{}%])/y;
+const PDF_KEYWORD = /[A-Za-z]+/y;
+/** Arrays and dictionaries nested deeper than this are treated as damage. */
+const MAX_NESTING = 32;
+
+function skipPdfSpace(s: string, p: { pos: number }) {
+  for (;;) {
+    const c = s.charCodeAt(p.pos);
+    if (c === 32 || c === 10 || c === 13 || c === 9 || c === 12 || c === 0) p.pos++;
+    else if (c === 37 /* % */) {
+      const eol = s.slice(p.pos).search(/[\r\n]/);
+      p.pos = eol < 0 ? s.length : p.pos + eol;
+    } else return;
+  }
+}
+
+const pdfName = (raw: string) => (raw.includes("#") ? raw.replace(/#([0-9A-Fa-f]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16))) : raw);
+
+/** Parses one PDF object (dictionary, array, string, name, number, reference, …) at `p.pos`; undefined if damaged. */
+function parsePdfValue(s: string, p: { pos: number }, depth = 0): PdfValue | undefined {
+  skipPdfSpace(s, p);
+  if (p.pos >= s.length || depth > MAX_NESTING) return undefined;
+  const c = s.charCodeAt(p.pos);
+  if (c === 60 /* < */) {
+    if (s.charCodeAt(p.pos + 1) !== 60) {
+      const end = s.indexOf(">", p.pos);
+      if (end < 0) return undefined;
+      const value = new PdfString(hexBytes(s.slice(p.pos + 1, end)));
+      p.pos = end + 1;
+      return value;
+    }
+    p.pos += 2;
+    const dict: PdfDict = new Map();
+    for (;;) {
+      skipPdfSpace(s, p);
+      if (s.startsWith(">>", p.pos)) {
+        p.pos += 2;
+        return dict;
+      }
+      PDF_NAME.lastIndex = p.pos;
+      const key = PDF_NAME.exec(s);
+      if (!key) return undefined;
+      p.pos = PDF_NAME.lastIndex;
+      const value = parsePdfValue(s, p, depth + 1);
+      if (value === undefined) return undefined;
+      dict.set(pdfName(key[1]), value);
+    }
+  }
+  if (c === 91 /* [ */) {
+    p.pos++;
+    const array: PdfValue[] = [];
+    for (;;) {
+      skipPdfSpace(s, p);
+      if (s.charCodeAt(p.pos) === 93 /* ] */) {
+        p.pos++;
+        return array;
+      }
+      const value = parsePdfValue(s, p, depth + 1);
+      if (value === undefined) return undefined;
+      array.push(value);
+    }
+  }
+  if (c === 40 /* ( */) {
+    const literal = readLiteral(s, p.pos);
+    p.pos = literal.end;
+    return new PdfString(literal.value);
+  }
+  if (c === 47 /* / */) {
+    PDF_NAME.lastIndex = p.pos;
+    const m = PDF_NAME.exec(s)!;
+    p.pos = PDF_NAME.lastIndex;
+    return new PdfName(pdfName(m[1]));
+  }
+  PDF_NUMBER.lastIndex = p.pos;
+  const number = PDF_NUMBER.exec(s);
+  if (number) {
+    p.pos = PDF_NUMBER.lastIndex;
+    if (/^\d+$/.test(number[0])) {
+      PDF_REF_TAIL.lastIndex = p.pos;
+      if (PDF_REF_TAIL.exec(s)) {
+        p.pos = PDF_REF_TAIL.lastIndex;
+        return new PdfRef(Number(number[0]));
+      }
+    }
+    return Number(number[0]);
+  }
+  PDF_KEYWORD.lastIndex = p.pos;
+  const keyword = PDF_KEYWORD.exec(s)?.[0];
+  if (keyword === "true" || keyword === "false" || keyword === "null") {
+    p.pos = PDF_KEYWORD.lastIndex;
+    return keyword === "true" ? true : keyword === "false" ? false : null;
+  }
+  return undefined;
+}
+
+const nameOf = (v: PdfValue | PdfStream | undefined) => (v instanceof PdfName ? v.name : undefined);
+const isDict = (v: unknown): v is PdfDict => v instanceof Map;
+const isStream = (v: unknown): v is PdfStream => typeof v === "object" && v !== null && "start" in v && "dict" in v;
+
+/** Most objects a PDF may have for its page tree to be used (larger ones are read in file order). */
+const MAX_PDF_OBJECTS = 200_000;
+/** Most object streams a PDF may have for its page tree to be used. */
+const MAX_OBJECT_STREAMS = 2_000;
+/** Longest object (other than stream data) that is parsed. */
+const MAX_OBJECT_BYTES = 4 * 1024 * 1024;
+
+/** The file's bytes, typed as Node's Buffer (the Worker's own Buffer type has no indexOf for strings). */
+type PdfBytes = ReturnType<typeof bufferOf>;
+const bufferOf = (bytes: Uint8Array) => Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+/** True for bytes that can be part of a PDF keyword or number (not white space or a delimiter). */
+function isRegularByte(b: number | undefined): boolean {
+  return b !== undefined && !(b <= 32 || b === 40 || b === 41 || b === 60 || b === 62 || b === 91 || b === 93 || b === 123 || b === 125 || b === 47 || b === 37);
+}
+
+/** The object number of an "N G obj" header whose "obj" starts at `at`, read backwards. */
+function headerNumber(buf: Uint8Array, at: number): number | undefined {
+  let i = at - 1;
+  const digits = () => {
+    const end = i;
+    while (i >= 0 && buf[i] >= 48 && buf[i] <= 57) i--;
+    return end - i;
+  };
+  const spaces = () => {
+    const end = i;
+    while (i >= 0 && (buf[i] === 32 || buf[i] === 10 || buf[i] === 13 || buf[i] === 9 || buf[i] === 12 || buf[i] === 0)) i--;
+    return end - i;
+  };
+  if (!spaces() || !digits() || !spaces()) return undefined;
+  const end = i;
+  if (!digits() || end - i > 10 || isRegularByte(buf[i])) return undefined;
+  return Number(latin1(buf.subarray(i + 1, end + 1)));
+}
+
+/**
+ * A PDF's objects, found by scanning the file for "N G obj" (so a damaged cross-reference table
+ * doesn't matter) and by reading object streams. When an object is defined more than once (each
+ * incremental update appends new versions), the definition furthest into the file wins.
+ */
+class PdfFile {
+  /** Object number → offset just after its "obj" keyword. */
+  private readonly top = new Map<number, number>();
+  /** Objects packed in object streams: number → the stream's object number and its index there. */
+  private readonly packed = new Map<number, { stream: number; index: number }>();
+  private readonly objectStreams = new Map<number, { text: string; first: number; offsets: number[] }>();
+  private readonly cache = new Map<number, PdfValue | PdfStream | null>();
+  private readonly decoded = new Map<number, string | null>();
+  private resolving = 0;
+  root?: PdfDict;
+
+  private constructor(
+    readonly buf: PdfBytes,
+    readonly budget: Budget,
+  ) {}
+
+  /** Indexes a PDF's objects; undefined when its page tree can't be used (no trailer, encrypted, too big). */
+  static open(bytes: Uint8Array, budget: Budget): PdfFile | undefined {
+    const buf = bufferOf(bytes);
+    const file = new PdfFile(buf, budget);
+    const objectStreams: { num: number; at: number }[] = [];
+    let trailer: { at: number; dict: PdfDict } | undefined;
+    let pos = 0;
+    for (;;) {
+      const at = buf.indexOf("obj", pos);
+      if (at < 0) break;
+      pos = at + 3;
+      if (at >= 3 && buf[at - 1] === 0x64 && buf[at - 2] === 0x6e && buf[at - 3] === 0x65) continue; // endobj
+      if (isRegularByte(buf[at + 3])) continue;
+      const num = headerNumber(buf, at);
+      if (num === undefined) continue;
+      if (file.top.size >= MAX_PDF_OBJECTS && !file.top.has(num)) return undefined;
+      file.top.set(num, pos);
+      // A stream's data can hold anything (even "1 0 obj"), so continue after it.
+      const body = file.bodyOf(pos);
+      if (body.streamAt >= 0) {
+        const dict = parsePdfValue(latin1(buf.subarray(pos, body.streamAt)), { pos: 0 });
+        if (isDict(dict)) {
+          const type = nameOf(dict.get("Type"));
+          if (type === "ObjStm") objectStreams.push({ num, at });
+          if (type === "XRef" && (!trailer || at > trailer.at)) trailer = { at, dict };
+        }
+        const end = buf.indexOf("endstream", body.streamAt + 6);
+        pos = end < 0 ? buf.length : end + 9;
+      }
+    }
+    const classic = buf.lastIndexOf("trailer", buf.length);
+    if (classic >= 0 && (!trailer || classic > trailer.at)) {
+      const dict = parsePdfValue(latin1(buf.subarray(classic + 7, Math.min(buf.length, classic + 7 + 65536))), { pos: 0 });
+      if (isDict(dict)) trailer = { at: classic, dict };
+    }
+    if (!trailer || trailer.dict.has("Encrypt")) return undefined;
+    if (objectStreams.length > MAX_OBJECT_STREAMS) return undefined;
+    for (const { num, at } of objectStreams) if (!file.indexObjectStream(num, at)) return undefined;
+    const root = file.dict(trailer.dict.get("Root"));
+    if (!root) return undefined;
+    file.root = root;
+    return file;
+  }
+
+  /** Where an object's body ends ("endobj"), and where its "stream" keyword is (-1 if it has none). */
+  private bodyOf(pos: number): { end: number; streamAt: number } {
+    const endobj = this.buf.indexOf("endobj", pos);
+    const end = endobj < 0 ? Math.min(this.buf.length, pos + MAX_OBJECT_BYTES) : endobj;
+    const stream = this.buf.subarray(pos, Math.min(end, pos + MAX_OBJECT_BYTES)).indexOf("stream", 0);
+    return { end, streamAt: stream < 0 ? -1 : pos + stream };
+  }
+
+  /** Reads an object stream's index, so its objects can be found (a later definition by file position wins). */
+  private indexObjectStream(num: number, at: number): boolean {
+    const stream = this.stream(new PdfRef(num));
+    const n = stream?.dict.get("N");
+    const first = stream?.dict.get("First");
+    if (!stream || typeof n !== "number" || typeof first !== "number") return false;
+    const text = this.decode(stream, num);
+    if (text === undefined) return false;
+    const header = text.slice(0, first).trim().split(/\s+/).map(Number);
+    const offsets: number[] = [];
+    for (let i = 0; i < Math.min(n, header.length / 2); i++) {
+      const member = header[2 * i];
+      offsets.push(header[2 * i + 1]);
+      if (!Number.isInteger(member)) return false;
+      if ((this.top.get(member) ?? -1) < at) this.packed.set(member, { stream: num, index: i });
+    }
+    this.objectStreams.set(num, { text, first, offsets });
+    return true;
+  }
+
+  /** The object a value refers to (or the value itself); undefined when missing or damaged. */
+  get(value: PdfValue | undefined): PdfValue | PdfStream | undefined {
+    if (!(value instanceof PdfRef)) return value;
+    const num = value.num;
+    const cached = this.cache.get(num);
+    if (cached !== undefined) return cached ?? undefined;
+    if (this.resolving > 8) return undefined; // references to references (e.g. /Length) only go so deep
+    this.resolving++;
+    let result: PdfValue | PdfStream | undefined;
+    try {
+      const member = this.packed.get(num);
+      const at = this.top.get(num);
+      if (member) {
+        const holder = this.objectStreams.get(member.stream)!;
+        const start = holder.first + holder.offsets[member.index];
+        const end = member.index + 1 < holder.offsets.length ? holder.first + holder.offsets[member.index + 1] : holder.text.length;
+        result = parsePdfValue(holder.text.slice(start, end), { pos: 0 });
+      } else if (at !== undefined) {
+        const body = this.bodyOf(at);
+        const value = parsePdfValue(latin1(this.buf.subarray(at, body.streamAt >= 0 ? body.streamAt : Math.min(body.end, at + MAX_OBJECT_BYTES))), { pos: 0 });
+        result = body.streamAt >= 0 && isDict(value) ? this.streamAt(value, body.streamAt) : value;
+      }
+    } finally {
+      this.resolving--;
+    }
+    this.cache.set(num, result ?? null);
+    return result;
+  }
+
+  private streamAt(dict: PdfDict, keyword: number): PdfStream {
+    let start = keyword + 6;
+    if (this.buf[start] === 13) start++;
+    if (this.buf[start] === 10) start++;
+    const length = this.get(dict.get("Length"));
+    let end = typeof length === "number" && length >= 0 ? start + length : -1;
+    // Trust /Length only when "endstream" follows it.
+    if (end < 0 || end > this.buf.length || !latin1(this.buf.subarray(end, end + 32)).includes("endstream")) {
+      const found = this.buf.indexOf("endstream", start);
+      end = found < 0 ? this.buf.length : found;
+      while (end > start && (this.buf[end - 1] === 10 || this.buf[end - 1] === 13)) end--;
+    }
+    return { dict, start, end };
+  }
+
+  dict(value: PdfValue | undefined): PdfDict | undefined {
+    const v = this.get(value);
+    return isDict(v) ? v : isStream(v) ? v.dict : undefined;
+  }
+
+  array(value: PdfValue | undefined): PdfValue[] | undefined {
+    const v = this.get(value);
+    return Array.isArray(v) ? v : undefined;
+  }
+
+  stream(value: PdfValue | undefined): PdfStream | undefined {
+    const v = this.get(value);
+    return isStream(v) ? v : undefined;
+  }
+
+  /**
+   * A stream's decoded content (one character per byte), within the file's unpacking budget;
+   * undefined for filters other than Flate, damaged data or a stream too large to unpack.
+   */
+  decode(stream: PdfStream, num?: number): string | undefined {
+    if (num !== undefined && this.decoded.has(num)) return this.decoded.get(num) ?? undefined;
+    const filters = [this.get(stream.dict.get("Filter"))].flat().map((f) => nameOf(f as PdfValue));
+    let data: Uint8Array = this.buf.subarray(stream.start, stream.end);
+    let result: string | undefined;
+    if (filters.every((f) => f === undefined || f === "FlateDecode" || f === "Fl") && filters.length <= 2) {
+      try {
+        for (const filter of filters) {
+          if (!filter) continue;
+          if (this.budget.partBytes <= 0) throw new RangeError("budget");
+          data = inflate(data, "deflate", this.budget.partBytes);
+          this.budget.spend(data.length);
+        }
+        result = latin1(data);
+      } catch (err) {
+        if (isOverLimit(err)) this.budget.cut(this.budget.partBytes <= 0 ? FILE_TOO_LARGE : PDF_PART_TOO_LARGE);
+      }
+    }
+    if (num !== undefined) this.decoded.set(num, result ?? null);
+    return result;
+  }
+}
+
+// ---------- PDF text layout ----------
+
+type Matrix = [number, number, number, number, number, number];
+const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0];
+
+/** m × n: first m, then n (PDF's row-vector convention). */
+function multiply(m: Matrix, n: Matrix): Matrix {
+  return [
+    m[0] * n[0] + m[1] * n[2],
+    m[0] * n[1] + m[1] * n[3],
+    m[2] * n[0] + m[3] * n[2],
+    m[2] * n[1] + m[3] * n[3],
+    m[4] * n[0] + m[5] * n[2] + n[4],
+    m[4] * n[1] + m[5] * n[3] + n[5],
+  ];
+}
+
+function toMatrix(value: PdfValue | PdfStream | undefined): Matrix | undefined {
+  return Array.isArray(value) && value.length === 6 && value.every((v) => typeof v === "number") ? (value as Matrix) : undefined;
+}
+
+/** What text placement needs from a font: glyph widths (in 1/1000 em) and whether codes are two bytes. */
+interface FontMetrics {
+  first: number;
+  widths: number[];
+  missing: number;
+  twoByte: boolean;
+  /** False when widths are guessed (fonts without /Widths, e.g. the standard 14), so run ends are estimates. */
+  exact: boolean;
+}
+
+const DEFAULT_FONT: FontMetrics = { first: 0, widths: [], missing: 500, twoByte: false, exact: false };
+
+/**
+ * Collects a page's text runs as lines. A run starts a new line only when the baseline moves by
+ * more than a fraction of the font size, and a blank line when it moves more than 1.5 line spacings
+ * (a paragraph gap). Runs on the same line are joined directly when adjacent (Word writes each
+ * formatting run separately), with a space after a gap, or with a tab after a wide gap (columns).
+ * Where glyph widths are only guessed, a run placed further right on the line counts as a new word.
+ */
+class PdfTextWriter {
+  private readonly parts: string[] = [];
+  length = 0;
+  private lastChar = "";
+  private last?: { across: number; along: number; alongEnd: number; dx: number; dy: number; size: number };
+  private spacing?: number;
+  /** A line break the content asked for explicitly (T* with no leading set). */
+  breakLine = false;
+
+  constructor(readonly limit: number) {}
+
+  get full() {
+    return this.length >= this.limit;
+  }
+
+  private add(s: string) {
+    this.parts.push(s);
+    this.length += s.length;
+    this.lastChar = s[s.length - 1];
+  }
+
+  /**
+   * Places `text`, drawn from (x0, y0) to (x1, y1) along the direction (dx, dy) at font size `size`.
+   * `exact` says the end point comes from real glyph widths; `moved` that the run was positioned
+   * by itself (Td, Tm, …) rather than following the previous one.
+   */
+  place(text: string, x0: number, y0: number, x1: number, y1: number, dx: number, dy: number, size: number, exact: boolean, moved: boolean) {
+    if (!text) return;
+    const along = x0 * dx + y0 * dy;
+    const across = y0 * dx - x0 * dy;
+    const last = this.last;
+    if (last) {
+      const h = Math.max(size, last.size, 1);
+      const sameDirection = last.dx * dx + last.dy * dy > 0.99;
+      const down = last.across - across;
+      if (!sameDirection || Math.abs(down) > 0.4 * h || this.breakLine) {
+        const spacing = this.spacing ?? 1.2 * h;
+        const blank = sameDirection && Math.abs(down) > 1.5 * spacing;
+        if (sameDirection && !blank && down >= 0.8 * h) this.spacing = Math.min(this.spacing ?? down, down);
+        if (this.lastChar !== "\n") this.add(blank ? "\n\n" : "\n");
+        else if (blank && !this.parts.at(-1)?.endsWith("\n\n")) this.add("\n");
+      } else if (this.lastChar !== "\n" && !/^\s/.test(text) && !/\s/.test(this.lastChar)) {
+        const gap = along - last.alongEnd;
+        if (gap > 2 * h) this.add("\t");
+        else if (gap > 0.2 * h || gap < -3 * h || (!exact && moved && along > last.along + 0.5 * h)) this.add(" ");
+      }
+    }
+    this.breakLine = false;
+    this.add(text);
+    this.last = { across, along, alongEnd: x1 * dx + y1 * dy, dx, dy, size };
+  }
+
+  /** Starts a new line (between separately read content, e.g. annotations after the page). */
+  newline() {
+    if (this.length && this.lastChar !== "\n") this.add("\n");
+    this.last = undefined;
+  }
+
+  text(): string {
+    return tidyLines(this.parts.join(""));
+  }
 }
 
 /** One token of a content stream: whitespace, comment, string start, array bracket, number, name or operator. */
 const TOKEN = /\s+|%[^\r\n]*|\(|<<|>>|<[0-9A-Fa-f\s]*>|\[|\]|[+-]?(?:\d+\.?\d*|\.\d+)|\/[^\s\/\[\]()<>{}%]*|[A-Za-z'"*]+|[^]/y;
+/** The end of an inline image's data. */
+const INLINE_IMAGE_END = /\sEI(?=\s|$)/g;
+/** Deepest q (save state) nesting and Form XObject nesting followed. */
+const MAX_STATE_DEPTH = 64;
+const MAX_FORM_DEPTH = 8;
 
-/** Pulls the text drawn by a page content stream (Tj, TJ, ', " operators, with line breaks), up to about `limit` characters. */
-function contentText(s: string, limit = Infinity): string {
-  let out = "";
-  const operands: (string | number | (string | number)[])[] = [];
+interface TextState {
+  ctm: Matrix;
+  font: FontMetrics;
+  size: number;
+  charSpacing: number;
+  wordSpacing: number;
+  scale: number;
+  leading: number;
+  rise: number;
+}
+
+/** What content streams need while being read: the file (for fonts and forms), output and guards. */
+interface ContentContext {
+  file?: PdfFile;
+  writer: PdfTextWriter;
+  budget: Budget;
+  /** Forms already drawn on this page (each is read once per page), and forms being drawn (recursion). */
+  formsOnPage: Set<number>;
+  formsActive: Set<number>;
+  fonts: Map<PdfDict, FontMetrics>;
+}
+
+function fontMetrics(ctx: ContentContext, resources: PdfDict | undefined, name: string): FontMetrics {
+  const file = ctx.file;
+  const font = file?.dict(file.dict(resources?.get("Font"))?.get(name));
+  if (!file || !font) return DEFAULT_FONT;
+  let metrics = ctx.fonts.get(font);
+  if (!metrics) {
+    const widths = file.array(font.get("Widths"))?.map((w) => (typeof w === "number" ? w : 0)) ?? [];
+    const first = font.get("FirstChar");
+    const missing = file.dict(font.get("FontDescriptor"))?.get("MissingWidth");
+    metrics = {
+      first: typeof first === "number" ? first : 0,
+      widths,
+      missing: typeof missing === "number" && missing > 0 ? missing : widths.length ? 0 : 500,
+      twoByte: nameOf(font.get("Subtype")) === "Type0",
+      exact: widths.length > 0,
+    };
+    ctx.fonts.set(font, metrics);
+  }
+  return metrics;
+}
+
+/** How far a string advances the text position, in text space units (glyph widths plus character and word spacing). */
+function advanceOf(state: TextState, raw: string): number {
+  const { font } = state;
+  const size = state.size || 12;
+  let width = 0;
+  let spaces = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    if (code === 32) spaces++;
+    if (font.twoByte) continue;
+    const w = font.widths[code - font.first];
+    width += w === undefined || w <= 0 ? (code === 32 ? 250 : font.missing || 500) : w;
+  }
+  if (font.twoByte) width = (raw.length / 2) * 1000;
+  return ((width / 1000) * size + raw.length * state.charSpacing + spaces * state.wordSpacing) * state.scale;
+}
+
+/**
+ * Reads the text a content stream draws (Tj, TJ, ', ") with its position, following the text and
+ * transformation matrices, and the Form XObjects it draws with Do (at the point of use).
+ */
+function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefined, initial: TextState, formDepth = 0): void {
+  const { writer, budget } = ctx;
+  if (budget.partBytes <= 0) {
+    budget.cut(FILE_TOO_LARGE);
+    return;
+  }
+  budget.spend(s.length);
+  let state: TextState = { ...initial };
+  const saved: TextState[] = [];
+  let tm: Matrix = IDENTITY;
+  let tlm: Matrix = IDENTITY;
+  let moved = true;
+  const operands: (string | number | PdfName | (string | number)[])[] = [];
   let array: (string | number)[] | undefined;
   const push = (v: string | number) => (array ? array.push(v) : operands.push(v));
-  const newline = () => {
-    if (out && !out.endsWith("\n")) out += "\n";
+  const num = (i: number) => {
+    const v = operands[operands.length - i];
+    return typeof v === "number" ? v : 0;
+  };
+  const moveLine = (tx: number, ty: number) => {
+    tlm = multiply([1, 0, 0, 1, tx, ty], tlm);
+    tm = tlm;
+    moved = true;
+  };
+  const nextLine = () => {
+    if (state.leading) moveLine(0, -state.leading);
+    else writer.breakLine = true;
+  };
+  const show = (raw: string) => {
+    const size = state.size || 12;
+    const m = multiply(tm, state.ctm);
+    tm = multiply([1, 0, 0, 1, advanceOf(state, raw), 0], tm);
+    const end = multiply(tm, state.ctm);
+    const length = Math.hypot(m[0], m[1]) || 1;
+    writer.place(win1252(raw), m[4], m[5], end[4], end[5], m[0] / length, m[1] / length, size * (Math.hypot(m[2], m[3]) || 1), state.font.exact, moved);
+    moved = false;
   };
   TOKEN.lastIndex = 0;
-  while (TOKEN.lastIndex < s.length && out.length < limit) {
+  while (TOKEN.lastIndex < s.length && !writer.full) {
     const at = TOKEN.lastIndex;
     const m = TOKEN.exec(s);
     if (!m) break;
     const tok = m[0];
     const c = tok.charCodeAt(0);
     if (tok === "(") {
-      const lit = readLiteral(s, at);
-      push(lit.value);
-      TOKEN.lastIndex = lit.end;
-    } else if (c === 60 /* < */ && tok !== "<<") {
-      const hex = tok.slice(1, -1).replace(/\s+/g, "");
-      push(win1252.decode(Buffer.from(hex.length % 2 ? hex + "0" : hex, "hex")));
-    } else if (tok === "[") array = [];
+      const literal = readLiteral(s, at);
+      push(literal.value);
+      TOKEN.lastIndex = literal.end;
+    } else if (c === 60 /* < */ && tok !== "<<") push(hexBytes(tok.slice(1, -1)));
+    else if (tok === "[") array = [];
     else if (tok === "]") {
       if (array) operands.push(array);
       array = undefined;
     } else if ((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) push(Number(tok));
+    else if (c === 47 /* / */) operands.push(new PdfName(tok.slice(1)));
     else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 39 || c === 34 || c === 42) {
-      const op = tok;
       const last = operands[operands.length - 1];
-      if (op === "Tj") {
-        if (typeof last === "string") out += last;
-      } else if (op === "TJ") {
-        if (Array.isArray(last)) {
-          for (const part of last) {
-            if (typeof part === "string") out += part;
-            else if (part < -180 && !out.endsWith(" ")) out += " ";
-          }
+      switch (tok) {
+        case "q":
+          if (saved.length < MAX_STATE_DEPTH) saved.push({ ...state });
+          break;
+        case "Q":
+          state = saved.pop() ?? state;
+          break;
+        case "cm":
+          state.ctm = multiply([num(6), num(5), num(4), num(3), num(2), num(1)], state.ctm);
+          break;
+        case "BT":
+          tm = tlm = IDENTITY;
+          moved = true;
+          break;
+        case "Tf": {
+          const font = operands[operands.length - 2];
+          state.size = num(1);
+          state.font = font instanceof PdfName ? fontMetrics(ctx, resources, font.name) : DEFAULT_FONT;
+          break;
         }
-      } else if (op === "'" || op === '"') {
-        newline();
-        if (typeof last === "string") out += last;
-      } else if (op === "T*" || op === "ET" || op === "Tm") newline();
-      else if (op === "Td" || op === "TD") {
-        const ty = operands[operands.length - 1];
-        const tx = operands[operands.length - 2];
-        if (typeof ty === "number" && Math.abs(ty) > 0.01) newline();
-        else if (typeof tx === "number" && tx > 0 && !out.endsWith(" ") && !out.endsWith("\n")) out += " ";
+        case "Tc":
+          state.charSpacing = num(1);
+          break;
+        case "Tw":
+          state.wordSpacing = num(1);
+          break;
+        case "Tz":
+          state.scale = num(1) / 100;
+          break;
+        case "TL":
+          state.leading = num(1);
+          break;
+        case "Ts":
+          state.rise = num(1);
+          break;
+        case "Td":
+          moveLine(num(2), num(1));
+          break;
+        case "TD":
+          state.leading = -num(1);
+          moveLine(num(2), num(1));
+          break;
+        case "Tm":
+          tm = tlm = [num(6), num(5), num(4), num(3), num(2), num(1)];
+          moved = true;
+          break;
+        case "T*":
+          nextLine();
+          break;
+        case "Tj":
+          if (typeof last === "string") show(last);
+          break;
+        case "'":
+          nextLine();
+          if (typeof last === "string") show(last);
+          break;
+        case '"':
+          state.wordSpacing = num(3);
+          state.charSpacing = num(2);
+          nextLine();
+          if (typeof last === "string") show(last);
+          break;
+        case "TJ":
+          if (Array.isArray(last)) {
+            for (const part of last) {
+              if (typeof part === "string") show(part);
+              else tm = multiply([1, 0, 0, 1, (-part / 1000) * (state.size || 12) * state.scale, 0], tm);
+            }
+          }
+          break;
+        case "ID": {
+          // Inline image data can contain anything; skip to its "EI".
+          INLINE_IMAGE_END.lastIndex = TOKEN.lastIndex;
+          const end = INLINE_IMAGE_END.exec(s);
+          TOKEN.lastIndex = end ? end.index + end[0].length : s.length;
+          break;
+        }
+        case "Do":
+          if (last instanceof PdfName) drawForm(last.name, ctx, resources, state, formDepth);
+          break;
       }
       operands.length = 0;
     }
   }
-  return out;
 }
+
+/** Reads a Form XObject drawn with Do, where it is drawn; each form once per page, never recursively. */
+function drawForm(name: string, ctx: ContentContext, resources: PdfDict | undefined, state: TextState, depth: number) {
+  const file = ctx.file;
+  const ref = file?.dict(resources?.get("XObject"))?.get(name);
+  if (!file || !(ref instanceof PdfRef) || depth >= MAX_FORM_DEPTH) return;
+  if (ctx.formsOnPage.has(ref.num) || ctx.formsActive.has(ref.num)) return;
+  const form = file.stream(ref);
+  if (!form || nameOf(form.dict.get("Subtype")) !== "Form") return;
+  ctx.formsOnPage.add(ref.num);
+  const content = file.decode(form, ref.num);
+  if (content === undefined) return;
+  ctx.formsActive.add(ref.num);
+  const matrix = toMatrix(file.get(form.dict.get("Matrix"))) ?? IDENTITY;
+  runContent(content, ctx, file.dict(form.dict.get("Resources")) ?? resources, { ...state, ctm: multiply(matrix, state.ctm) }, depth + 1);
+  ctx.formsActive.delete(ref.num);
+}
+
+const initialState = (): TextState => ({ ctm: IDENTITY, font: DEFAULT_FONT, size: 0, charSpacing: 0, wordSpacing: 0, scale: 1, leading: 0, rise: 0 });
+
+// ---------- PDF reading ----------
+
+/** Characters of real text (letters, digits, punctuation, underscores of form lines, common symbols). */
+const READABLE = /[\p{L}\p{N}.,;:'"!?()\-–—\/$%&@#*+=€£¥°§•…’“”_|<>[\]{}~^©®™±×÷]+/gu;
 
 /** True when extracted text is mostly words, not the gibberish produced by fonts with custom encodings. */
 function looksReadable(text: string): boolean {
   const compact = text.replace(/\s+/g, "");
   if (compact.length < 20) return false;
-  const good = compact.match(/[\p{L}\p{N}.,;:'"!?()\-–—\/$%&@#*+=€£¥°§•…’“”_|<>[\]{}~^©®™±×÷]/gu)?.length ?? 0;
-  return good / compact.length > 0.9;
+  const other = compact.replace(READABLE, "").length;
+  return (compact.length - other) / compact.length > 0.9;
 }
 
 /** Streams that never hold page text: images, fonts, cross-reference and object streams, metadata, embedded files, color data. */
@@ -1053,13 +1681,166 @@ function tidyLines(text: string): string {
     .trim();
 }
 
+/** Most page-tree nodes visited, and the deepest nesting followed. */
+const MAX_PAGE_NODES = 20_000;
+const MAX_TREE_DEPTH = 64;
+/** Most annotations per page whose appearance (e.g. a filled-in form field) is read. */
+const MAX_ANNOTATIONS = 500;
+
+interface PdfPage {
+  dict: PdfDict;
+  resources?: PdfDict;
+}
+
 /**
- * Best-effort text extraction for PDFs whose fonts use standard encodings (most generated
- * statements, receipts and letters), stopping once `maxChars` are collected. Returns undefined when
- * nothing readable comes out, e.g. for scanned pages or fonts with custom glyph encodings.
+ * The pages in reading order: Catalog → /Pages → /Kids, depth first, with /Resources inherited
+ * from parent nodes. Finishes with "damaged" when the tree has missing or broken parts, and with
+ * "too many" past MAX_PAGE_NODES nodes; repeated and cyclic nodes are skipped.
  */
-export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promise<ReadResult | undefined> {
-  const budget = new Budget(opts.maxChars);
+function* pageTree(file: PdfFile): Generator<PdfPage, "complete" | "damaged" | "too many"> {
+  const stack: { kids: PdfValue[]; next: number; resources?: PdfDict }[] = [{ kids: [file.root!.get("Pages") ?? null], next: 0 }];
+  const visited = new Set<number>();
+  let nodes = 0;
+  while (stack.length) {
+    const level = stack.at(-1)!;
+    if (level.next >= level.kids.length) {
+      stack.pop();
+      continue;
+    }
+    const kid = level.kids[level.next++];
+    if (!(kid instanceof PdfRef)) return "damaged";
+    if (visited.has(kid.num)) continue;
+    visited.add(kid.num);
+    if (++nodes > MAX_PAGE_NODES) return "too many";
+    const node = file.dict(kid);
+    if (!node) return "damaged";
+    const resources = file.dict(node.get("Resources")) ?? level.resources;
+    const type = nameOf(node.get("Type"));
+    if (type === "Pages" || (type !== "Page" && node.has("Kids"))) {
+      const kids = file.array(node.get("Kids"));
+      if (!kids || stack.length >= MAX_TREE_DEPTH) return "damaged";
+      stack.push({ kids, next: 0, resources });
+    } else if (type === "Page" || node.has("Contents")) yield { dict: node, resources };
+    else return "damaged";
+  }
+  return "complete";
+}
+
+/** A page's content streams, decoded and joined; undefined when one is missing (a damaged file). */
+function pageContent(file: PdfFile, page: PdfPage): string | undefined {
+  const contents = page.dict.get("Contents");
+  if (contents === undefined || contents === null) return "";
+  const resolved = file.get(contents);
+  const refs = isStream(resolved) ? [contents] : Array.isArray(resolved) ? resolved : undefined;
+  if (!refs) return undefined;
+  const parts: string[] = [];
+  for (const ref of refs) {
+    const stream = file.stream(ref);
+    if (!stream) return undefined;
+    // A stream that can't be decoded (another filter, or too large) is left out, not treated as damage.
+    parts.push(file.decode(stream) ?? "");
+  }
+  return parts.join("\n");
+}
+
+/** Text drawn by a page's annotations, such as filled-in form fields (their appearance streams). */
+function readAnnotations(file: PdfFile, page: PdfPage, ctx: ContentContext) {
+  const annotations = file.array(page.dict.get("Annots"))?.slice(0, MAX_ANNOTATIONS) ?? [];
+  for (const ref of annotations) {
+    const annotation = file.dict(ref);
+    const flags = annotation?.get("F");
+    if (!annotation || (typeof flags === "number" && flags & (2 | 32))) continue; // Hidden or NoView
+    // Only a single appearance; per-state ones (check boxes, radio buttons) show no text.
+    const appearanceRef = file.dict(annotation.get("AP"))?.get("N");
+    const appearance = file.stream(appearanceRef);
+    const rect = file.array(annotation.get("Rect"));
+    if (!appearance || !rect || rect.length !== 4 || !rect.every((v) => typeof v === "number")) continue;
+    const num = appearanceRef instanceof PdfRef ? appearanceRef.num : undefined;
+    if (num !== undefined && ctx.formsOnPage.has(num)) continue;
+    if (num !== undefined) ctx.formsOnPage.add(num);
+    const content = file.decode(appearance, num);
+    if (!content) continue;
+    const bbox = file.array(appearance.dict.get("BBox"));
+    const [bx, by] = bbox?.length === 4 && typeof bbox[0] === "number" && typeof bbox[1] === "number" ? [bbox[0], bbox[1]] : [0, 0];
+    const matrix = toMatrix(file.get(appearance.dict.get("Matrix"))) ?? IDENTITY;
+    const [x, y] = [Math.min(rect[0] as number, rect[2] as number), Math.min(rect[1] as number, rect[3] as number)];
+    ctx.writer.newline();
+    runContent(content, ctx, file.dict(appearance.dict.get("Resources")) ?? page.resources, {
+      ...initialState(),
+      ctm: multiply(matrix, [1, 0, 0, 1, x - bx, y - by]),
+    });
+  }
+}
+
+const pageMarker = (n: number) => `--- Page ${n} ---\n`;
+
+/** Pages with their markers; runs of pages without text become one line ("--- Pages 4–9: no text ---"). */
+function withPageMarkers(pages: string[]): string {
+  const out: string[] = [];
+  for (let i = 0; i < pages.length; ) {
+    if (pages[i]) {
+      out.push(`${pageMarker(i + 1)}${pages[i]}`);
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < pages.length && !pages[j]) j++;
+    out.push(j - i === 1 ? `--- Page ${i + 1}: no text ---` : `--- Pages ${i + 1}–${j}: no text ---`);
+    i = j;
+  }
+  return out.join("\n\n");
+}
+
+/**
+ * Reads pages in the order of the page tree, separated by "--- Page N ---" when there are several
+ * (the markers count toward the budget). Returns undefined when the tree can't be used, so the
+ * caller reads the file in order instead.
+ */
+function readPageTree(file: PdfFile, budget: Budget): ReadResult | undefined {
+  const tree = pageTree(file);
+  const count = file.get(file.dict(file.root!.get("Pages"))?.get("Count"));
+  const pages: string[] = [];
+  const fonts = new Map<PdfDict, FontMetrics>();
+  let multi = typeof count === "number" && count > 1;
+  let total = 0;
+  let stopped = false;
+  let step = tree.next();
+  while (!step.done) {
+    if (total >= budget.chars) {
+      stopped = true;
+      break;
+    }
+    const content = pageContent(file, step.value);
+    if (content === undefined) return undefined;
+    if (pages.length === 1 && !multi) {
+      multi = true;
+      total += pageMarker(1).length;
+    }
+    const marker = multi ? pageMarker(pages.length + 1).length : 0;
+    const writer = new PdfTextWriter(Math.max(1, budget.chars - total - marker));
+    const ctx: ContentContext = { file, writer, budget, formsOnPage: new Set(), formsActive: new Set(), fonts };
+    runContent(content, ctx, step.value.resources, initialState());
+    if (!writer.full) readAnnotations(file, step.value, ctx);
+    const text = writer.text();
+    pages.push(text);
+    if (text) total += marker + text.length + 2;
+    if (writer.full) {
+      stopped = true;
+      break;
+    }
+    step = tree.next();
+  }
+  if (step.done && step.value === "damaged") return undefined;
+  if (step.done && step.value === "too many") budget.cut("This PDF has too many pages to read here, so only the first ones are shown.");
+  const plain = pages.filter(Boolean).join("\n\n");
+  // No text at all on any page: read the file in order instead, in case it is drawn some other way.
+  if (!plain) return undefined;
+  if (!looksReadable(plain)) return { text: "" };
+  return budget.result(multi || pages.length > 1 ? withPageMarkers(pages) : plain, stopped);
+}
+
+/** Reads every stream that looks like page content in file order: for PDFs whose page tree can't be used. */
+function readInFileOrder(bytes: Uint8Array, budget: Budget): ReadResult | undefined {
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const parts: string[] = [];
   let total = 0;
@@ -1067,18 +1848,18 @@ export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promis
   let pos = 0;
   let previousEnd = 0;
   for (;;) {
-    const at = buf.indexOf("stream", pos, "latin1");
+    const at = buf.indexOf("stream", pos);
     if (at < 0) break;
     pos = at + 6;
-    if (at >= 3 && buf.toString("latin1", at - 3, at) === "end") continue;
+    if (at >= 3 && latin1(buf.subarray(at - 3, at)) === "end") continue;
     let start = at + 6;
     if (buf[start] === 13) start++;
     if (buf[start] !== 10) continue;
     start++;
-    const end = buf.indexOf("endstream", start, "latin1");
+    const end = buf.indexOf("endstream", start);
     if (end < 0) break;
     // The stream's dictionary: from its "N 0 obj" (looking back a bounded distance) to "stream".
-    const head = buf.toString("latin1", Math.max(previousEnd, at - DICT_WINDOW), at);
+    const head = latin1(buf.subarray(Math.max(previousEnd, at - DICT_WINDOW), at));
     const dict = head.slice(Math.max(0, head.lastIndexOf("obj")));
     pos = previousEnd = end + 9;
     if (NOT_TEXT_STREAM.test(dict)) continue;
@@ -1086,7 +1867,7 @@ export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promis
       stopped = true;
       break;
     }
-    let data: Buffer = buf.subarray(start, end);
+    let data: Uint8Array = buf.subarray(start, end);
     if (data.at(-1) === 10) data = data.subarray(0, -1);
     if (data.at(-1) === 13) data = data.subarray(0, -1);
     if (/\/FlateDecode/.test(dict)) {
@@ -1105,7 +1886,9 @@ export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promis
     } else if (/\/Filter/.test(dict)) continue;
     const content = latin1(data);
     if (!/\bBT\b/.test(content) || !/T[jJ]|'|"/.test(content)) continue;
-    const text = contentText(content, budget.chars - total + 1).trim();
+    const writer = new PdfTextWriter(budget.chars - total + 1);
+    runContent(content, { writer, budget, formsOnPage: new Set(), formsActive: new Set(), fonts: new Map() }, undefined, initialState());
+    const text = writer.text();
     if (text) {
       parts.push(text);
       total += text.length + 2;
@@ -1113,6 +1896,21 @@ export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promis
   }
   const text = tidyLines(parts.join("\n\n"));
   return looksReadable(text) ? budget.result(text, stopped || total > budget.chars) : undefined;
+}
+
+/**
+ * Best-effort text extraction for PDFs whose fonts use standard encodings (most generated
+ * statements, receipts and letters), in reading order: pages as the page tree orders them, lines
+ * from text positions, form XObjects where they are drawn. Stops once `maxChars` are collected.
+ * Returns undefined when nothing readable comes out, e.g. for scanned pages or fonts with custom
+ * glyph encodings. PDFs whose page tree can't be used (encrypted, damaged) are read in file order.
+ */
+export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promise<ReadResult | undefined> {
+  const budget = new Budget(opts.maxChars);
+  const file = PdfFile.open(bytes, budget);
+  const fromTree = file && readPageTree(file, budget);
+  if (fromTree) return fromTree.text ? fromTree : undefined;
+  return readInFileOrder(bytes, new Budget(opts.maxChars));
 }
 
 /** The text of a PDF as one string (with a note when it is incomplete), or undefined if none is readable. */

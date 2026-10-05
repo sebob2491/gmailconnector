@@ -59,7 +59,7 @@ export function zip(files: Record<string, string>): Buffer {
   return zipOf(Object.entries(files).map(([name, content]) => ({ name, data: Buffer.from(content, "utf8") })));
 }
 
-/** A PDF made of the given stream objects, in order. */
+/** A PDF made of the given stream objects, in order, without a usable page tree (its catalog points at a stream). */
 export function pdfOf(streams: { dict: string; data: Buffer }[]): Buffer {
   const parts: Buffer[] = [Buffer.from("%PDF-1.4\n%\xe2\xe3\xcf\xd3\n", "latin1")];
   let n = 1;
@@ -71,9 +71,103 @@ export function pdfOf(streams: { dict: string; data: Buffer }[]): Buffer {
   return Buffer.concat(parts);
 }
 
-/** A PDF whose pages draw the given content streams (compressed with FlateDecode). */
+interface PdfObject {
+  body: string;
+  data?: Buffer;
+}
+
+const pdfObject = (num: number, { body, data }: PdfObject) =>
+  data
+    ? Buffer.concat([
+        Buffer.from(`${num} 0 obj\n<< ${body} /Length ${data.length} >>\nstream\n`, "latin1"),
+        data,
+        Buffer.from("\nendstream\nendobj\n", "latin1"),
+      ])
+    : Buffer.from(`${num} 0 obj\n${body}\nendobj\n`, "latin1");
+
+/** "3 0 R" for each object number (given one by one, or as arrays). */
+export const refs = (...nums: (number | number[])[]) =>
+  nums
+    .flat()
+    .map((n) => `${n} 0 R`)
+    .join(" ");
+
+/**
+ * Builds a PDF object by object, for page trees, object streams and incremental updates. An
+ * object is PDF text (e.g. "<< /Type /Page … >>"), or a stream when it has data; a stream's body
+ * lists its dictionary entries without "<<" and ">>" (/Length is added).
+ */
+export class PdfBuilder {
+  private readonly objects = new Map<number, PdfObject>();
+  private next = 1;
+
+  add(body: string, data?: Buffer): number {
+    const num = this.next++;
+    this.objects.set(num, { body, data });
+    return num;
+  }
+
+  /** An object number to fill in later with set(). */
+  reserve(): number {
+    return this.add("null");
+  }
+
+  set(num: number, body: string, data?: Buffer) {
+    this.objects.set(num, { body, data });
+  }
+
+  /** A page content stream, compressed with FlateDecode. */
+  content(text: string): number {
+    return this.add("/Filter /FlateDecode", deflateSync(Buffer.from(text, "latin1")));
+  }
+
+  /**
+   * The file. Objects are written in `order` (the others follow by number); objects listed in
+   * `packed` go into one compressed object stream; `xrefStream` writes the trailer as a
+   * cross-reference stream (as PDFs with object streams do) instead of a "trailer" dictionary.
+   */
+  build(root: number, opts: { order?: number[]; packed?: number[]; xrefStream?: boolean } = {}): Buffer {
+    const packed = new Set(opts.packed ?? []);
+    const nums = [...new Set([...(opts.order ?? []), ...[...this.objects.keys()].sort((a, b) => a - b)])].filter((n) => !packed.has(n));
+    const parts = [Buffer.from("%PDF-1.5\n%\xe2\xe3\xcf\xd3\n", "latin1"), ...nums.map((n) => pdfObject(n, this.objects.get(n)!))];
+    let size = this.next;
+    if (packed.size) {
+      let header = "";
+      let bodies = "";
+      for (const n of packed) {
+        header += `${n} ${bodies.length} `;
+        bodies += `${this.objects.get(n)!.body}\n`;
+      }
+      const data = deflateSync(Buffer.from(header + bodies, "latin1"));
+      parts.push(pdfObject(size++, { body: `/Type /ObjStm /N ${packed.size} /First ${header.length} /Filter /FlateDecode`, data }));
+    }
+    if (opts.xrefStream) {
+      parts.push(pdfObject(size, { body: `/Type /XRef /Size ${size + 1} /Root ${root} 0 R /W [1 2 1]`, data: Buffer.alloc(0) }));
+      parts.push(Buffer.from("startxref\n0\n%%EOF\n", "latin1"));
+    } else parts.push(Buffer.from(`trailer\n<< /Size ${size} /Root ${root} 0 R >>\nstartxref\n0\n%%EOF\n`, "latin1"));
+    return Buffer.concat(parts);
+  }
+}
+
+/** Appends an incremental update to a PDF: new versions of objects, then a new trailer. */
+export function pdfUpdate(file: Buffer, root: number, objects: ({ num: number } & PdfObject)[], extraTrailer = ""): Buffer {
+  return Buffer.concat([
+    file,
+    ...objects.map((o) => pdfObject(o.num, o)),
+    Buffer.from(`trailer\n<< /Root ${root} 0 R${extraTrailer} >>\nstartxref\n0\n%%EOF\n`, "latin1"),
+  ]);
+}
+
+/** A PDF whose pages (in a real page tree) draw the given content streams; `extraStreams` are other, unreferenced objects. */
 export function pdf(pages: string[], extraStreams: { dict: string; data: Buffer }[] = []): Buffer {
-  return pdfOf([...extraStreams, ...pages.map((content) => ({ dict: "/Filter /FlateDecode", data: deflateSync(Buffer.from(content, "latin1")) }))]);
+  const b = new PdfBuilder();
+  const catalog = b.reserve();
+  const tree = b.reserve();
+  for (const extra of extraStreams) b.add(extra.dict, extra.data);
+  const kids = pages.map((content) => b.add(`<< /Type /Page /Parent ${tree} 0 R /MediaBox [0 0 612 792] /Contents ${refs(b.content(content))} >>`));
+  b.set(catalog, `<< /Type /Catalog /Pages ${refs(tree)} >>`);
+  b.set(tree, `<< /Type /Pages /Kids [${refs(kids)}] /Count ${kids.length} >>`);
+  return b.build(catalog);
 }
 
 /** A Word document whose body is the given WordprocessingML. */

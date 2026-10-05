@@ -32,9 +32,11 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 - New `get_attachment` tool: Claude can read attachments. Text, CSV, HTML, calendar invites, Word
   (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images as images; PDFs as extracted
   text (when the PDF has a text layer with standard fonts), otherwise as the PDF file itself for clients
-  that read PDFs. Spreadsheets keep empty cells in place and show dates as dates; Word tables come out
-  row by row. Text files are decoded in their own character set. Very large files (and booby-trapped
-  ones) are read only as far as needed, with a note saying what was left out.
+  that read PDFs. PDF text comes in page order with "--- Page N ---" markers, with lines rebuilt from
+  where the text sits on the page (so Word-made PDFs don't break mid-sentence) and filled-in form
+  fields included. Spreadsheets keep empty cells in place and show dates as dates; Word tables come
+  out row by row. Text files are decoded in their own character set. Very large files (and
+  booby-trapped ones) are read only as far as needed, with a note saying what was left out.
 - New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
   promotions older than a week"). They support a dry run that previews what would change, and Claude
