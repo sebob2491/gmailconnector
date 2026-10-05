@@ -118,7 +118,7 @@ export class FakeGmail {
   failOnce = new Map<string, number>();
   /** Paths (prefix match) that keep answering with this status, like a stuck rate limit. */
   failAlways = new Map<string, number>();
-  /** Called before each API request; returning a status makes that request fail with it. */
+  /** Called before each API request: returning a status fails it with that status; throwing is a network error. */
   intercept?: (method: string, path: string) => number | undefined;
 
   addMailbox(email: string, refreshToken: string): FakeMailbox {

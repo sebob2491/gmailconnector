@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { GmailApiError, GmailClient, type BatchResult } from "./gmailClient.js";
+import { AuthError } from "./google.js";
 import {
   METADATA_HEADERS,
   apiFormat,
@@ -503,7 +504,8 @@ export class Mailbox {
 
   async sendMessage(input: ComposeInput & { draftId?: string; replyThreadId?: string; replyToMessageId?: string }) {
     if (input.draftId) {
-      const sent = await this.client.request("POST", "drafts/send", { json: { id: checkId(input.draftId, "draft") } });
+      const id = checkId(input.draftId, "draft");
+      const sent = await this.sendMail(() => this.client.request("POST", "drafts/send", { json: { id } }));
       return this.sentResult(sent);
     }
     const to = input.to ?? [];
@@ -539,7 +541,8 @@ export class Mailbox {
         msg.subject ||= replySubject(header(last.payload, "Subject"));
       }
     }
-    const sent = await this.upload("POST", "messages/send", threadId ? { threadId } : {}, buildMime(msg));
+    const mime = buildMime(msg);
+    const sent = await this.sendMail(() => this.upload("POST", "messages/send", threadId ? { threadId } : {}, mime));
     return this.sentResult(sent);
   }
 
@@ -557,7 +560,7 @@ export class Mailbox {
       inReplyTo: ctx.inReplyTo,
       references: ctx.references,
     });
-    const sent = await this.upload("POST", "messages/send", { threadId: ctx.threadId }, mime);
+    const sent = await this.sendMail(() => this.upload("POST", "messages/send", { threadId: ctx.threadId }, mime));
     return this.sentResult(sent);
   }
 
@@ -606,8 +609,26 @@ export class Mailbox {
       references: referencesFor(p),
       attachments: await this.downloadAttachments(original),
     });
-    const sent = await this.upload("POST", "messages/send", { threadId: original.threadId }, mime);
+    const sent = await this.sendMail(() => this.upload("POST", "messages/send", { threadId: original.threadId }, mime));
     return this.sentResult(sent);
+  }
+
+  /**
+   * Runs a send (messages/send or drafts/send). Those aren't retried after a server or network error,
+   * because the email may have gone out anyway; the error then says so, so it isn't sent twice.
+   */
+  private async sendMail<T>(send: () => Promise<T>): Promise<T> {
+    try {
+      return await send();
+    } catch (err) {
+      // Rate limits (429), bad requests and sign-in problems are refused before anything is sent.
+      const unsure = err instanceof GmailApiError ? err.status >= 500 : !(err instanceof AuthError || err instanceof MimeError);
+      if (!unsure) throw err;
+      const message =
+        `${(err as Error).message.replace(/\.?$/, ".")} The email may have been sent anyway: check the Sent folder ` +
+        `(search_threads with "in:sent newer_than:1d") before trying again, so it isn't sent twice.`;
+      throw err instanceof GmailApiError ? new GmailApiError(err.status, message) : new Error(message);
+    }
   }
 
   private sentResult(sent: { id: string; threadId: string; labelIds?: string[] }) {

@@ -1555,4 +1555,31 @@ describe("fixes from the second review", () => {
     };
     assert.equal(full.content[1].text, "a,b\n1,2", "read as text, not refused as an unknown file type");
   });
+
+  test("a send that fails with a server or network error says it may have gone out", async () => {
+    const { call, fake } = await setup();
+    fake.failOnce.set("messages/send", 503);
+    const sent = await call("send_message", { account: "work", to: ["x@example.com"], body: "hi" });
+    assert.equal(sent.isError, true);
+    assert.match(sent.text, /\(503\).*may have been sent anyway: check the Sent folder/);
+
+    fake.intercept = (method, path) => {
+      if (path === "messages/send") throw new TypeError("fetch failed");
+      return undefined;
+    };
+    const reply = await call("reply", { account: "personal", messageId: "p1", body: "Sure" });
+    assert.match(reply.text, /^fetch failed\. The email may have been sent anyway/);
+    fake.intercept = undefined;
+
+    const draft = await call("create_draft", { account: "work", to: ["a@example.com"], body: "d" });
+    fake.failOnce.set("drafts/send", 500);
+    const fromDraft = await call("send_message", { account: "work", draftId: draft.json.id });
+    assert.match(fromDraft.text, /may have been sent anyway/);
+
+    // Errors Gmail returns before sending anything don't suggest that.
+    fake.failAlways.set("messages/send", 400);
+    const refused = await call("forward", { account: "work", messageId: "w1", to: ["x@example.com"] });
+    assert.equal(refused.isError, true);
+    assert.doesNotMatch(refused.text, /may have been sent/);
+  });
 });
