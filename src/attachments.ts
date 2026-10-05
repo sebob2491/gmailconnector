@@ -153,6 +153,7 @@ const MAX_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_RATIO = 500;
 
 const PART_TOO_LARGE = "Part of this file is too large to read here, so only its beginning is shown.";
+const PDF_PART_TOO_LARGE = "Part of this PDF is too large to read here and was skipped.";
 const FILE_TOO_LARGE = "This file is too large to read here in full, so only its beginning is shown.";
 const TEXT_TOO_LONG = `The text is longer than ${MAX_TEXT_CHARS.toLocaleString("en-US")} characters, so only the beginning is shown.`;
 
@@ -1109,7 +1110,7 @@ export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promis
         budget.spend(data.length);
       } catch (err) {
         // A stream that unpacks to more than MAX_PART_BYTES is skipped (and noted); damaged ones just skipped.
-        if (isOverLimit(err)) budget.cut(PART_TOO_LARGE);
+        if (isOverLimit(err)) budget.cut(PDF_PART_TOO_LARGE);
         continue;
       }
     } else if (/\/Filter/.test(dict)) continue;
