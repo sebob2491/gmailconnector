@@ -1622,3 +1622,32 @@ describe("fixes from the second review", () => {
     assert.equal(fake.sentBy(WORK).length, 0);
   });
 });
+
+describe("smaller thread views", () => {
+  test("with bodies, get_thread gives the subject once and drops each message's snippet and threadId", async () => {
+    const { call, fake, personal } = await setup();
+    for (const [id, subject] of [["p2", "Re: Lunch?"], ["p3", "Change of plans"]]) {
+      fake.deliver(personal, crlf([`From: alice@example.com`, `To: ${PERSONAL}`, `Subject: ${subject}`, "", `Body of ${id}`]), { id, threadId: "pt1" });
+    }
+    const res = await call("get_thread", { account: "personal", threadId: "pt1" });
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.subject, "Lunch?");
+    assert.deepEqual(res.json.messages.map((m: any) => m.subject), [undefined, undefined, "Change of plans"]);
+    for (const m of res.json.messages) {
+      assert.equal(m.snippet, undefined);
+      assert.equal(m.threadId, undefined);
+      assert.match(m.viewUrl, /#all\/p\d$/);
+      assert.ok(m.plaintextBody);
+    }
+    const full = await call("get_thread", { account: "personal", threadId: "pt1", messageFormat: "FULL_CONTENT" });
+    assert.equal(full.json.subject, "Lunch?");
+    assert.equal(full.json.messages[0].snippet, undefined);
+
+    // Without bodies the snippet is the content, so nothing changes there.
+    const minimal = await call("get_thread", { account: "personal", threadId: "pt1", messageFormat: "MINIMAL" });
+    assert.equal(minimal.json.subject, undefined);
+    assert.deepEqual(minimal.json.messages.map((m: any) => m.subject), ["Lunch?", "Re: Lunch?", "Change of plans"]);
+    assert.ok(minimal.json.messages.every((m: any) => m.snippet && m.threadId === "pt1"));
+  });
+});
+

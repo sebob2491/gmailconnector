@@ -406,11 +406,24 @@ export class Mailbox {
       query: { format: apiFormat(format), metadataHeaders: format === "MINIMAL" || format === "METADATA_ONLY" ? METADATA_HEADERS : undefined },
     });
     const messages = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT"));
-    return {
+    // The first message keeps any quote: what it quotes isn't in this thread.
+    const formatted = await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts)));
+    const base = {
       id: thread.id as string,
       viewUrl: viewUrl(this.email, `all/${thread.id}`),
-      // The first message keeps any quote: what it quotes isn't in this thread.
-      messages: await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts))),
+    };
+    if (format !== "PLAIN_TEXT" && format !== "FULL_CONTENT") return { ...base, messages: formatted };
+    // With bodies, each message's snippet only repeats its body, and its threadId is the thread's id.
+    // The subject is given once for the thread, and on a message only when it changes.
+    const subject = formatted[0]?.subject;
+    const topic = normalizeSubject(subject);
+    return {
+      id: base.id,
+      ...(subject !== undefined ? { subject } : {}),
+      viewUrl: base.viewUrl,
+      messages: formatted.map(({ snippet: _s, threadId: _t, subject: s, ...m }) =>
+        s !== undefined && normalizeSubject(s) !== topic ? { subject: s, ...m } : m,
+      ),
     };
   }
 

@@ -371,7 +371,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Get email thread",
       description:
-        "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads. In PLAIN_TEXT, each reply's quoted copy of earlier messages is hidden, since those messages are in the result; get_message shows one email in full.",
+        "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads. In PLAIN_TEXT, each reply's quoted copy of earlier messages is hidden, since those messages are in the result; get_message shows one email in full. With bodies, the thread's `subject` is given once; a message has its own `subject` only when it differs.",
       inputSchema: {
         account: accountArg,
         threadId: z.string().describe("Required. The thread ID."),
