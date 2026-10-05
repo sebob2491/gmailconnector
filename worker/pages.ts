@@ -1,4 +1,5 @@
 /** Server-rendered HTML for the connector's setup, consent and account pages. */
+import type { AccountHealth } from "./health.js";
 
 export const escapeHtml = (value: string): string =>
   value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
@@ -25,6 +26,15 @@ ul.accounts{list-style:none;margin:8px 0 0;padding:0}
 ul.accounts li{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
 ul.accounts li:first-child{border-top:none}
 .email{overflow-wrap:anywhere;font-weight:500}
+.account{min-width:0}
+.health{font-size:.85rem;font-weight:600;margin-top:2px}
+.health.ok{color:var(--ok)}
+.health.bad{color:var(--bad)}
+.health.warn{color:var(--warn)}
+.health .reason{font-weight:400;color:var(--muted)}
+.row-actions{display:flex;align-items:center;gap:4px;flex:none}
+.row-actions form{margin:0}
+button.small{min-height:36px;padding:6px 12px;font-size:.9rem}
 .tag{display:inline-block;white-space:nowrap;font-size:.75rem;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 8px;margin-left:6px;font-weight:500;vertical-align:middle}
 .notice{border-radius:10px;padding:10px 12px;margin:12px 0;font-size:.95rem}
 .notice.ok{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
@@ -166,21 +176,38 @@ ${opts.local ? `<div class="notice warn">This sends access to an app on your com
   return layout("Connect Gmail", body);
 }
 
+/** How the accounts page describes an account's Google access. */
+function healthLine(health: AccountHealth | undefined): string {
+  if (!health) return "";
+  if (health.state === "working") return `<div class="health ok">Working</div>`;
+  if (health.state === "relink") {
+    return `<div class="health bad">Needs re-link <span class="reason">Google no longer accepts its sign-in (password changed, access removed, or it expired).</span></div>`;
+  }
+  return `<div class="health warn">Couldn't check <span class="reason">${escapeHtml(health.reason)}</span></div>`;
+}
+
 export function accountsPage(opts: {
-  accounts: string[];
+  accounts: { email: string; health?: AccountHealth }[];
   owner?: string;
   csrf: string;
   connecting?: { clientName: string; redirectHost: string };
   notice?: { kind: "ok" | "bad" | "warn"; text: string; link?: { href: string; label: string } };
 }): string {
-  const rows = opts.accounts
-    .map(
-      (email) => `<li><span class="email">${escapeHtml(email)}${opts.owner && email.toLowerCase() === opts.owner.toLowerCase() ? `<span class="tag">owner</span>` : ""}</span>
-<form method="post" action="/accounts/remove"><input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"><input type="hidden" name="email" value="${escapeHtml(email)}">
-<button class="link" aria-label="Remove ${escapeHtml(email)}">Remove</button></form></li>`,
-    )
-    .join("");
   const csrf = `<input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">`;
+  const rows = opts.accounts
+    .map(({ email, health }) => {
+      const owner = opts.owner && email.toLowerCase() === opts.owner.toLowerCase() ? `<span class="tag">owner</span>` : "";
+      const emailField = `<input type="hidden" name="email" value="${escapeHtml(email)}">`;
+      // Re-linking is the usual link flow, with this address preselected at Google.
+      const relink =
+        health?.state === "relink"
+          ? `<form method="post" action="/accounts/link">${csrf}${emailField}<button class="primary small" aria-label="Re-link ${escapeHtml(email)}">Re-link</button></form>`
+          : "";
+      return `<li><div class="account"><span class="email">${escapeHtml(email)}${owner}</span>${healthLine(health)}</div>
+<div class="row-actions">${relink}<form method="post" action="/accounts/remove">${csrf}${emailField}
+<button class="link" aria-label="Remove ${escapeHtml(email)}">Remove</button></form></div></li>`;
+    })
+    .join("");
   const title = opts.connecting ? `Choose the Gmail accounts for ${opts.connecting.clientName}` : "Linked Gmail accounts";
   const body = `<div class="card"><h1>${escapeHtml(title)}</h1>
 ${

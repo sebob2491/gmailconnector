@@ -123,6 +123,15 @@ You can add or remove accounts later at `…workers.dev/accounts`. Claude sees t
 minute, without reconnecting. The same page has **Disconnect Claude**, which signs Claude out of the
 connector everywhere it's connected (your linked accounts stay linked).
 
+That page also checks each account's Google access every time you open it:
+
+- **Working**: Claude can use it.
+- **Needs re-link**: Google no longer accepts the account's sign-in, usually because its password
+  changed, its access was removed at myaccount.google.com/permissions, or (in *Testing* mode) its
+  7 days ran out. Tap **Re-link** and sign in to that account again; Google preselects it.
+- **Couldn't check**: Google couldn't be reached or answered with an error. The account may be fine;
+  reload the page later.
+
 **Who can use it:** only the addresses in `ALLOWED_EMAILS` can sign in, and the first of them to sign
 in becomes the owner (connectors set up before `ALLOWED_EMAILS` was required keep their owner, who can
 still sign in). Linked accounts can't sign in, so someone with access to one of your linked inboxes

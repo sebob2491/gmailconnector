@@ -58,6 +58,8 @@ class Browser {
   }
 }
 
+/** The accounts page's row for one account. */
+const accountRow = (html: string, email: string) => html.split("<li>").find((row) => row.includes(`<span class="email">${email}`)) ?? "";
 const field = (html: string, name: string) => new RegExp(`name="${name}" value="([^"]+)"`).exec(html)?.[1] ?? "";
 const unescape = (html: string) => html.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
 /** The href of the link labelled `label` (e.g. a "Back to Claude" button). */
@@ -100,6 +102,11 @@ const COMPAT = { compatibilityDate: "2026-09-01", compatibilityFlags: ["nodejs_c
 
 /** Google's revoke endpoint fails while this is set (tests a revoke Google doesn't confirm). */
 let failRevoke = false;
+/**
+ * While set, refreshing a Google token fails: "unreachable" makes the call itself fail (Miniflare
+ * reports that to the Worker as an HTTP 500), 503 is Google answering with a server error.
+ */
+let refreshFailure: "unreachable" | 503 | undefined;
 
 async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, string>): Promise<Miniflare> {
   const instance = new Miniflare(
@@ -114,10 +121,15 @@ async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, strin
           bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
           outboundService: async (req: MfRequest) => {
             if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
+            const body = req.method === "GET" ? undefined : await req.text();
+            if (refreshFailure && req.url === "https://oauth2.googleapis.com/token" && body?.includes("grant_type=refresh_token")) {
+              if (refreshFailure === "unreachable") throw new Error("connection reset");
+              return new MfResponse("upstream error", { status: 503 });
+            }
             const res = await fakeGoogle.fetch(req.url, {
               method: req.method,
               headers: Object.fromEntries(req.headers),
-              body: req.method === "GET" ? undefined : await req.text(),
+              body,
             });
             return new MfResponse(await res.arrayBuffer(), { status: res.status, headers: Object.fromEntries(res.headers) });
           },
@@ -673,6 +685,61 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const res = await new Browser(mf).fetch(url);
     assert.notEqual(res.status, 302);
     assert.doesNotMatch(res.location, /evil\.example/);
+  });
+
+  test("the accounts page shows which accounts work, and Re-link fixes one that doesn't", async () => {
+    const kv = await mf.getKVNamespace("OAUTH_KV");
+    // The work account's stored token has stopped working (e.g. its password was changed).
+    const rec = JSON.parse((await kv.get("gmail:owner", "text")) as string);
+    rec.accounts.find((a: any) => a.email === WORK).refreshToken = "rt-work-dead";
+    await kv.put("gmail:owner", JSON.stringify(rec));
+
+    const { browser, csrf } = await ownerBrowser();
+    const before = await kvSnapshot(mf);
+    fake.outboundCalls = 0;
+    const page = await browser.fetch("/accounts");
+    assert.equal(page.status, 200);
+    assert.equal(fake.outboundCalls, 2, "one token refresh per account");
+    assert.deepEqual(await kvSnapshot(mf), before, "checking writes nothing");
+    assert.match(accountRow(page.text, PERSONAL), /class="health ok">Working</);
+    assert.doesNotMatch(accountRow(page.text, PERSONAL), /Re-link/);
+    const work = accountRow(page.text, WORK);
+    assert.match(work, /class="health bad">Needs re-link/);
+    assert.match(work, /<form method="post" action="\/accounts\/link"><input type="hidden" name="csrf" value="[^"]+"><input type="hidden" name="email" value="me@work\.example"><button[^>]*>Re-link</);
+
+    // Re-link needs the session's CSRF token, like every form on the page.
+    assert.match((await browser.fetch("/accounts/link", { form: { csrf: "wrong", email: WORK } })).text, /Session expired/);
+    const toGoogle = await browser.fetch("/accounts/link", { form: { csrf, email: WORK } });
+    assert.equal(toGoogle.status, 302);
+    assert.equal(new URL(toGoogle.location).searchParams.get("login_hint"), WORK, "Google preselects the account");
+    const back = await browser.googleSignIn(toGoogle.location, fake, WORK);
+    assert.equal(back.location, `${ORIGIN}/accounts?linked=${encodeURIComponent(WORK)}`);
+    const relinked = JSON.parse((await kv.get("gmail:owner", "text")) as string);
+    assert.equal(relinked.accounts.find((a: any) => a.email === WORK).refreshToken, "rt-work", "the new token replaces the dead one");
+    const after = await browser.fetch(back.location);
+    assert.match(accountRow(after.text, WORK), /class="health ok">Working</);
+
+    // "Link another" still sends no hint.
+    const another = await browser.fetch("/accounts/link", { form: { csrf } });
+    assert.equal(new URL(another.location).searchParams.get("login_hint"), null);
+  });
+
+  test("the accounts page still shows when Google can't be reached", async () => {
+    const { browser } = await ownerBrowser();
+    for (const failure of ["unreachable", 503] as const) {
+      refreshFailure = failure;
+      try {
+        const page = await browser.fetch("/accounts");
+        assert.equal(page.status, 200, page.text);
+        for (const email of [PERSONAL, WORK]) {
+          assert.match(accountRow(page.text, email), /class="health warn">Couldn't check <span class="reason">[^<]+</, email);
+          assert.doesNotMatch(accountRow(page.text, email), /Re-link/);
+        }
+        if (failure === 503) assert.match(page.text, /Google answered with an error \(HTTP 503\)/);
+      } finally {
+        refreshFailure = undefined;
+      }
+    }
   });
 
   test("account-page forms need the session's CSRF token", async () => {

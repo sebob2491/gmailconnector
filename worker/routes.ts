@@ -24,6 +24,7 @@ import {
   revokeToken,
 } from "../src/google.js";
 import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal } from "./cookies.js";
+import { checkAccounts } from "./health.js";
 import {
   allowedEmails,
   emailAllowed,
@@ -80,7 +81,12 @@ interface PendingSignIn {
   /** For "signin" while connecting Claude: the request to finish after signing in. */
   request?: AuthRequest;
   clientName?: string;
+  /** For re-linking an account: its address, so Google preselects it. */
+  loginHint?: string;
 }
+
+/** Loose, but enough to keep anything else out of the login_hint sent to Google. */
+const EMAIL_PATTERN = /^[^\s@]{1,64}@[^\s@]{1,190}$/;
 
 async function sha256(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
@@ -175,6 +181,7 @@ async function beginGoogleSignIn(
     redirectUri: `${origin}/google/callback`,
     state,
     codeChallenge: await pkceChallenge(verifier),
+    loginHint: pending.loginHint,
   });
 }
 
@@ -385,9 +392,11 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
   const session = await getSession(env, request);
   if (!session) return startGoogleSignIn(env, origin, request, { purpose: "signin" });
   const rec = await loadOwner(env.OAUTH_KV);
+  // One token refresh per account, in parallel, so the page shows which ones need re-linking.
+  const health = await checkAccounts(googleClient(env), rec.accounts);
   return htmlResponse(
     accountsPage({
-      accounts: rec.accounts.map((a) => a.email),
+      accounts: rec.accounts.map((a, i) => ({ email: a.email, health: health[i] })),
       owner: rec.owner,
       csrf: session.handle,
       notice: accountsNotice(new URL(request.url)),
@@ -425,8 +434,15 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
   }
 
   switch (action) {
-    case "link":
-      return startGoogleSignIn(env, origin, request, { purpose: "link", session: await sha256(session.handle) });
+    case "link": {
+      // "Re-link" on an account that needs it sends its address, so Google preselects it.
+      const hint = String(form.get("email") ?? "").trim();
+      return startGoogleSignIn(env, origin, request, {
+        purpose: "link",
+        session: await sha256(session.handle),
+        ...(EMAIL_PATTERN.test(hint) ? { loginHint: hint } : {}),
+      });
+    }
     case "remove": {
       const email = String(form.get("email") ?? "");
       const rec = await loadOwner(env.OAUTH_KV);
