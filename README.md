@@ -41,6 +41,13 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   "category:promotions" only touches promotions still in the inbox), so running the same change again
   continues with the rest. With thread or message IDs, the IDs left over are returned to pass next time.
   If a run fails partway, the result says how many emails were changed and how to finish.
+- New `unsubscribe` tool: "unsubscribe me from everything Levi's sends, in both accounts". It looks at the
+  newest matching emails, groups them by account and sender, and uses the unsubscribe option senders
+  put in their emails' headers: the standard one-click request (sent by the connector, only to public
+  https addresses), an unsubscribe email from that account (it shows in Sent), or, when the sender only
+  offers a web page, the link for you to open (the connector never opens links). Claude is told to show
+  you the plan first (`dryRun`) and to ask before doing it. Up to 10 senders per run (`maxSenders` up to
+  20); the emails you already have stay until you archive or trash them with the bulk tools.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
   Results are compact: one-email threads are shown flat, previews are cleaned of the invisible padding
@@ -147,8 +154,9 @@ app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables
 dashboard are kept when the Worker redeploys.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
-batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, and
-archiving 2,000 emails in each of five inboxes about 35. If Claude ever reports errors like "exceeded
+batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, archiving
+2,000 emails in each of five inboxes about 35, and unsubscribing from 20 senders across five inboxes
+about 35. If Claude ever reports errors like "exceeded
 CPU" or "too many subrequests", switch the Worker to the Workers Paid plan ($5/month), which raises
 both limits.
 

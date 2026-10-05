@@ -481,3 +481,35 @@ export class FakeGmail {
     return this.mailboxes.find((m) => m.email === email)!.sent;
   }
 }
+
+/** Stand-in for senders' websites (one-click unsubscribe) and for DNS. */
+export class FakeWeb {
+  requests: { url: string; method: string; contentType: string | null; body: string; redirect?: string; hasSignal: boolean }[] = [];
+  /** How a URL (prefix match) answers: an HTTP status (default 200), "network" or "timeout". */
+  answers = new Map<string, number | "network" | "timeout">();
+  /** Host name → addresses; unknown hosts resolve to a public test address. */
+  dns = new Map<string, string[]>();
+  lookups: string[] = [];
+
+  fetch = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
+    const url = String(input);
+    this.requests.push({
+      url,
+      method: init.method ?? "GET",
+      contentType: new Headers(init.headers).get("Content-Type"),
+      body: String(init.body ?? ""),
+      redirect: init.redirect,
+      hasSignal: Boolean(init.signal),
+    });
+    const answer = [...this.answers].find(([prefix]) => url.startsWith(prefix))?.[1] ?? 200;
+    if (answer === "network") throw new TypeError("fetch failed");
+    if (answer === "timeout") throw new DOMException("The operation timed out.", "TimeoutError");
+    return new Response(answer === 204 || (answer >= 300 && answer < 400) ? null : "ok", { status: answer });
+  };
+
+  resolve = async (host: string): Promise<string[]> => {
+    this.lookups.push(host);
+    return this.dns.get(host) ?? ["203.0.113.10"];
+  };
+}
+

@@ -8,7 +8,15 @@ import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, type FetchLike } from "./google.js";
 import { decodeTextFile, kindOf, officeText, pdfText, sniffType } from "./attachments.js";
 import { cleanBody, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
-import { Mailbox } from "./mailbox.js";
+import {
+  isPrivateAddress,
+  Mailbox,
+  mapLimit,
+  unsafeUnsubscribeHost,
+  unsubscribeOptions,
+  type SenderGroup,
+  type UnsubscribeOptions,
+} from "./mailbox.js";
 
 export const SERVER_NAME = "gmail-multi";
 export const SERVER_VERSION = "0.1.0";
@@ -325,7 +333,38 @@ export interface ServerDeps {
   /** Tells the user how to link or remove accounts (differs between the CLI and the hosted connector). */
   manageHint?: string;
   jsonSchemaValidator?: jsonSchemaValidator;
+  /** Fetch for requests to other websites (one-click unsubscribe). Defaults to the global fetch. */
+  webFetch?: FetchLike;
+  /** Looks up a host's IP addresses so private ones can be refused. Defaults to systemResolveHost. */
+  resolveHost?: (hostname: string) => Promise<string[]>;
 }
+
+/**
+ * Looks up a host with the system resolver (Node). Skipped in Cloudflare Workers, whose fetch already
+ * refuses private addresses (global_fetch_strictly_public) and where a lookup would cost a subrequest.
+ */
+export async function systemResolveHost(hostname: string): Promise<string[]> {
+  if ((globalThis as { navigator?: { userAgent?: string } }).navigator?.userAgent === "Cloudflare-Workers") return [];
+  try {
+    const dnsModule = "node:dns"; // not bundled: only Node gets here
+    const dns = await import(dnsModule);
+    return ((await dns.promises.lookup(hostname, { all: true })) as { address: string }[]).map((r) => r.address);
+  } catch {
+    return []; // unknown host: the request itself will fail
+  }
+}
+
+/** How one sender will be unsubscribed from, or why it can't be. */
+type UnsubscribePlan =
+  | { method: "one-click"; url: string }
+  | { method: "email"; mail: NonNullable<UnsubscribeOptions["mailto"]>; note?: string }
+  | { method: "link"; link: string }
+  | { method: "refused"; reason: string }
+  | { method: "none" };
+
+const NO_UNSUBSCRIBE_NOTE =
+  "This sender's emails have no unsubscribe header. Clear them with bulk_trash or bulk_update, or set up a Gmail filter for this sender.";
+const ONE_CLICK_TIMEOUT_MS = 10_000;
 
 export function createServer(deps: ServerDeps): McpServer {
   const fetchImpl = deps.fetchImpl ?? defaultFetch;
@@ -1004,6 +1043,190 @@ export function createServer(deps: ServerDeps): McpServer {
       annotations: destructive,
     },
     async (args) => runBulk(args),
+  );
+
+  // ---------- unsubscribing ----------
+
+  const webFetch = deps.webFetch ?? defaultFetch;
+  const resolveHost = deps.resolveHost ?? systemResolveHost;
+
+  /** Why a one-click URL must not be contacted (an IP address, a local name, or a name for a private address). */
+  const oneClickRefusal = async (href: string): Promise<string | undefined> => {
+    const url = new URL(href);
+    const unsafe = unsafeUnsubscribeHost(url);
+    if (unsafe) return unsafe;
+    const addresses = await resolveHost(url.hostname).catch(() => [] as string[]);
+    const internal = addresses.find(isPrivateAddress);
+    return internal ? `${url.hostname} leads to a private network address (${internal})` : undefined;
+  };
+
+  const planFor = async (group: SenderGroup): Promise<UnsubscribePlan> => {
+    const options = unsubscribeOptions(group.newest.listUnsubscribe, group.newest.listUnsubscribePost);
+    const refused = options.oneClick ? await oneClickRefusal(options.oneClick) : undefined;
+    if (options.oneClick && !refused) return { method: "one-click", url: options.oneClick };
+    const why = refused && `The one-click address wasn't used: ${refused}.`;
+    if (options.mailto) return { method: "email", mail: options.mailto, ...(why ? { note: why } : {}) };
+    if (why) return { method: "refused", reason: why };
+    if (options.link) return { method: "link", link: options.link };
+    return { method: "none" };
+  };
+
+  const describePlan = (account: string, group: SenderGroup, plan: UnsubscribePlan) => ({
+    account,
+    sender: group.address,
+    ...(group.name ? { name: group.name } : {}),
+    method: plan.method,
+    ...(plan.method === "one-click" ? { via: new URL(plan.url).hostname } : {}),
+    ...(plan.method === "email" ? { to: plan.mail.to, ...(plan.note ? { note: plan.note } : {}) } : {}),
+    ...(plan.method === "link" ? { link: plan.link } : {}),
+    ...(plan.method === "refused" ? { reason: plan.reason } : {}),
+    ...(plan.method === "none" ? { note: NO_UNSUBSCRIBE_NOTE } : {}),
+    emailsScanned: group.count,
+    newestSubject: group.newest.subject,
+    ...(group.newest.date ? { newestDate: group.newest.date } : {}),
+  });
+
+  const carryOut = async (mb: Mailbox, plan: UnsubscribePlan): Promise<{ result: string; [key: string]: unknown }> => {
+    switch (plan.method) {
+      case "one-click":
+        try {
+          // RFC 8058: a POST with this exact body; never a GET, and redirects aren't followed.
+          const res = await webFetch(plan.url, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: "List-Unsubscribe=One-Click",
+            redirect: "manual",
+            signal: AbortSignal.timeout(ONE_CLICK_TIMEOUT_MS),
+          });
+          await res.body?.cancel().catch(() => undefined);
+          // With redirect "manual", Node and Workers hand back the 3xx itself.
+          if (res.status >= 200 && res.status < 400) return { result: "unsubscribed" };
+          return {
+            result: "failed",
+            reason: `The sender's unsubscribe service answered ${res.status}. The user can open the link to unsubscribe on the sender's site.`,
+            link: plan.url,
+          };
+        } catch (err) {
+          const name = (err as Error).name;
+          return {
+            result: "failed",
+            reason:
+              name === "TimeoutError" || name === "AbortError"
+                ? "The sender's unsubscribe service didn't answer within 10 seconds. The user can open the link instead."
+                : `Couldn't reach the sender's unsubscribe service (${(err as Error).message}). The user can open the link instead.`,
+            link: plan.url,
+          };
+        }
+      case "email":
+        try {
+          await mb.sendUnsubscribeEmail(plan.mail);
+          return { result: "unsubscribe email sent" };
+        } catch (err) {
+          return { result: "failed", reason: (err as Error).message };
+        }
+      case "link":
+        return { result: "open this link" };
+      case "refused":
+        return { result: "failed" };
+      case "none":
+        return { result: "no unsubscribe option" };
+    }
+  };
+
+  server.registerTool(
+    "unsubscribe",
+    {
+      title: "Unsubscribe from senders",
+      description:
+        "Unsubscribes the user from newsletters and store or alert emails, in one or every linked account. Choose the emails with a Gmail search `query` (e.g. \"from:levi.com\" or \"category:promotions newer_than:30d\"; every account by default) or `messageIds` from one account. The newest matching emails are grouped by account and sender, and each sender is unsubscribed once, the way its emails' List-Unsubscribe header offers: `one-click` (the connector sends the sender's standard one-click request), `email` (sends an unsubscribe email from that account; it shows up in Sent), `link` (the sender only offers a web page: give the user the link; the connector never opens links), or `none` (no unsubscribe option: suggest bulk_trash or bulk_update, or a Gmail filter). ALWAYS run with dryRun: true first, show the user the plan (account, sender, method) and get their OK before running it for real. Afterwards, bulk_update (archive) or bulk_trash with the same query can clear the emails already received. Don't use it on spam: unsubscribing confirms the address to spammers, so mark it as spam with bulk_trash instead.",
+      inputSchema: {
+        account: z
+          .string()
+          .optional()
+          .describe('With `query`: one account (email or alias) or "all"; defaults to every linked account. With messageIds: the one account those IDs belong to.'),
+        query: z.string().optional().describe("Gmail search for emails from the senders to unsubscribe from. Drafts are never included."),
+        messageIds: z.array(z.string()).min(1).max(100).optional().describe("Optional. Unsubscribe from the senders of these emails (one account)."),
+        maxSenders: z
+          .number()
+          .int()
+          .min(1)
+          .max(20)
+          .optional()
+          .describe("Optional. Most senders to handle per run, across all accounts (default 10, max 20). Senders with the most emails come first."),
+        dryRun: z.boolean().optional().describe("Optional. Show the plan for each sender without doing anything."),
+      },
+      annotations: sends,
+    },
+    async (args) =>
+      run(async () => {
+        if ((args.query !== undefined) === Boolean(args.messageIds?.length)) {
+          throw new AccountError("Give exactly one of `query` or `messageIds`.");
+        }
+        const mailboxes = args.query !== undefined ? await router.many(args.account) : [await router.one(args.account)];
+        // Scanning 50 instead of 100 emails per account when there are many keeps a run within
+        // Cloudflare's 50-call limit: per account a token, a search and one metadata batch.
+        const perAccount = mailboxes.length > 3 ? 50 : 100;
+        const scans = await Promise.all(
+          mailboxes.map(async (mb) => {
+            try {
+              return { mb, ...(await mb.scanSenders({ query: args.query, messageIds: args.messageIds }, perAccount)) };
+            } catch (err) {
+              if (mailboxes.length === 1) throw err;
+              return { mb, senders: [] as SenderGroup[], error: (err as Error).message };
+            }
+          }),
+        );
+        const errors = scans.flatMap((s) => ("error" in s ? [{ account: s.mb.email, error: s.error }] : []));
+        const unavailable = scans.flatMap((s) => ("unavailable" in s && s.unavailable ? [{ account: s.mb.email, messageIds: s.unavailable }] : []));
+        const maxSenders = args.maxSenders ?? 10;
+        const found = scans
+          .flatMap((s) => s.senders.map((group) => ({ mb: s.mb, group })))
+          .sort((x, y) => y.group.count - x.group.count || y.group.newest.time - x.group.newest.time);
+        const chosen = await Promise.all(found.slice(0, maxSenders).map(async (f) => ({ ...f, plan: await planFor(f.group) })));
+        // Their emails stay in the mailbox, so the same query would find the same senders first again:
+        // the rest are handed back as a search for just them, per account.
+        const rest = new Map<string, string[]>();
+        for (const f of found.slice(maxSenders)) rest.set(f.mb.email, [...(rest.get(f.mb.email) ?? []), f.group.address]);
+        const nextRuns = [...rest].map(([account, senders]) => {
+          const from = senders.length === 1 ? `from:${senders[0]}` : `(${senders.map((a) => `from:${a}`).join(" OR ")})`;
+          return { account, query: args.query?.trim() ? `(${args.query}) ${from}` : from };
+        });
+        const extra = {
+          ...(nextRuns.length
+            ? {
+                moreSenders: `${found.length - maxSenders} more sender(s) weren't included (maxSenders is ${maxSenders}). The same query would find the same senders first, so to continue, run it again with each account and query in nextRuns${maxSenders < 20 ? ", or raise maxSenders (up to 20)" : ""}.`,
+                nextRuns,
+              }
+            : {}),
+          ...(errors.length ? { errors } : {}),
+          ...(unavailable.length ? { unavailable } : {}),
+        };
+        if (args.dryRun) {
+          return {
+            dryRun: true,
+            senders: chosen.map((c) => describePlan(c.mb.email, c.group, c.plan)),
+            ...extra,
+            note: chosen.length
+              ? "Nothing was done yet. Show the user this plan and get their OK, then run it again without dryRun."
+              : "No emails from other senders matched.",
+          };
+        }
+        // Each sender takes at most one call: the one-click request or the unsubscribe email.
+        const senders = await mapLimit(chosen, 6, async (c) => ({ ...describePlan(c.mb.email, c.group, c.plan), ...(await carryOut(c.mb, c.plan)) }));
+        const count = (result: string) => senders.filter((r) => r.result === result).length;
+        return {
+          senders,
+          summary: {
+            unsubscribed: count("unsubscribed"),
+            emailsSent: count("unsubscribe email sent"),
+            linksToOpen: count("open this link"),
+            noOption: count("no unsubscribe option"),
+            failed: count("failed"),
+          },
+          ...extra,
+          note: "Emails already received are still there: bulk_update (archive) or bulk_trash with the same query can clear them.",
+        };
+      }),
   );
 
   // ---------- trash & spam ----------

@@ -310,6 +310,110 @@ function changeFilter(add: ApiLabel[], remove: ApiLabel[], includeSpamTrash: boo
   return { q: terms.length === 1 ? terms[0] : `(${terms.join(" OR ")})` };
 }
 
+// ---------- unsubscribing ----------
+
+/** Headers a sender scan needs (defined here rather than in format.ts, which other tools share). */
+const UNSUBSCRIBE_HEADERS = ["From", "Subject", "Date", "List-Unsubscribe", "List-Unsubscribe-Post", "List-Id"];
+
+/** One sender found by scanSenders, with their newest email among those scanned. */
+export interface SenderGroup {
+  address: string;
+  name?: string;
+  /** How many of the scanned emails came from this sender. */
+  count: number;
+  newest: {
+    id: string;
+    subject: string;
+    date?: string;
+    time: number;
+    listUnsubscribe?: string;
+    listUnsubscribePost?: string;
+    listId?: string;
+  };
+}
+
+/** The ways a sender's List-Unsubscribe header (RFC 2369, RFC 8058) offers to unsubscribe. */
+export interface UnsubscribeOptions {
+  /** An https URL that takes a one-click POST (RFC 8058). */
+  oneClick?: string;
+  /** An address to email, with the subject and body the sender asks for. */
+  mailto?: { to: string; subject: string; body: string };
+  /** A web page the user has to open themselves. */
+  link?: string;
+}
+
+export function unsubscribeOptions(listUnsubscribe: string | undefined, listUnsubscribePost: string | undefined): UnsubscribeOptions {
+  if (!listUnsubscribe) return {};
+  // Entries are <uri>, comma separated; a few senders leave out the angle brackets.
+  const bracketed = [...listUnsubscribe.matchAll(/<([^>]*)>/g)].map((m) => m[1]);
+  const uris = (bracketed.length ? bracketed : listUnsubscribe.split(",")).map((u) => u.trim()).filter(Boolean);
+  const out: UnsubscribeOptions = {};
+  for (const uri of uris) {
+    let url: URL;
+    try {
+      url = new URL(uri);
+    } catch {
+      continue;
+    }
+    if (url.protocol === "https:" || url.protocol === "http:") {
+      out.link ??= url.href;
+      // RFC 8058: one-click needs https and the List-Unsubscribe-Post header.
+      if (url.protocol === "https:" && /^\s*List-Unsubscribe=One-Click\s*$/i.test(listUnsubscribePost ?? "")) out.oneClick ??= url.href;
+    } else if (url.protocol === "mailto:" && !out.mailto) {
+      let to = "";
+      try {
+        to = decodeURIComponent(url.pathname).split(",")[0].trim();
+      } catch {
+        continue;
+      }
+      if (!isValidAddress(to)) continue;
+      out.mailto = {
+        to,
+        subject: url.searchParams.get("subject")?.trim() || "unsubscribe",
+        body: url.searchParams.get("body") ?? "unsubscribe",
+      };
+    }
+  }
+  return out;
+}
+
+const LOCAL_SUFFIXES = [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain"];
+
+/**
+ * Why a one-click unsubscribe URL must not be contacted, or undefined if it may. Only https to a
+ * named public host is allowed: no IP addresses (which also covers every private and link-local
+ * range) and no local names. A name that resolves to a private address is checked separately.
+ */
+export function unsafeUnsubscribeHost(url: URL): string | undefined {
+  if (url.protocol !== "https:") return "it isn't an https address";
+  // The URL parser already turned forms like 0x7f.1 or 2130706433 into 127.0.0.1.
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (host.startsWith("[") || /^\d+(\.\d+){3}$/.test(host)) return `it points to an IP address (${host}), not a website`;
+  if (host === "localhost" || !host.includes(".") || LOCAL_SUFFIXES.some((s) => host.endsWith(s))) {
+    return `it points to a local network name (${host}), not a website`;
+  }
+  return undefined;
+}
+
+/** True for loopback, private, link-local, shared (CGNAT), multicast and other non-public addresses. */
+export function isPrivateAddress(ip: string): boolean {
+  const v4 = /^(?:::ffff:)?(\d+)\.(\d+)\.(\d+)\.(\d+)$/i.exec(ip);
+  if (v4) {
+    const [a, b, c] = [Number(v4[1]), Number(v4[2]), Number(v4[3])];
+    return (
+      a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 192 && b === 0 && c === 0) ||
+      (a === 198 && (b === 18 || b === 19))
+    );
+  }
+  const v6 = ip.toLowerCase();
+  return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6) || v6.startsWith("ff") || v6.startsWith("::ffff:");
+}
+
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
   constructor(readonly client: GmailClient) {}
@@ -931,6 +1035,66 @@ export class Mailbox {
       ? await this.loader(msg.id)(attachment.id)
       : (findPart(msg, attachment.partId)?.body?.data ?? "");
     return { info: attachment, bytes: Buffer.from(data, "base64url"), message: msg };
+  }
+
+  // ---------- unsubscribing ----------
+
+  /**
+   * Finds who sent the newest emails matching a search (or the given emails): one entry per sender
+   * address, with that sender's newest email and how many of the scanned emails came from them.
+   * Drafts and emails this account sent itself are skipped. At most `limit` emails are scanned.
+   */
+  async scanSenders(sel: { query?: string; messageIds?: string[] }, limit: number) {
+    let ids: string[];
+    if (sel.query !== undefined) {
+      const page = await this.client.request("GET", "messages", {
+        query: {
+          q: sel.query.trim() ? `(${sel.query}) -in:draft` : "-in:draft",
+          maxResults: limit,
+          includeSpamTrash: mentionsSpamTrash(sel.query) || undefined,
+        },
+      });
+      ids = ((page.messages ?? []) as { id: string }[]).map((m) => m.id);
+    } else {
+      ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))].slice(0, limit);
+    }
+    const fetched = await this.client.batchGet<ApiMessage>(
+      ids.map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: UNSUBSCRIBE_HEADERS } })),
+    );
+    const { found, failed } = settle(ids, fetched);
+    const self = this.email.toLowerCase();
+    const senders = new Map<string, SenderGroup>();
+    let scanned = 0;
+    for (const { value: msg } of found) {
+      if (msg.labelIds?.includes("DRAFT")) continue;
+      const from = parseMailboxes(header(msg.payload, "From"))[0];
+      const address = from?.address.toLowerCase();
+      if (!address || address === self) continue;
+      scanned++;
+      const time = Number(msg.internalDate ?? 0);
+      const group = senders.get(address) ?? { address, count: 0, newest: { id: "", subject: "", time: -1 } };
+      group.count++;
+      if (time > group.newest.time) {
+        group.name = from.name;
+        group.newest = {
+          id: msg.id,
+          subject: (header(msg.payload, "Subject") ?? "").trim(),
+          date: msg.internalDate ? new Date(time).toISOString() : header(msg.payload, "Date"),
+          time,
+          listUnsubscribe: header(msg.payload, "List-Unsubscribe"),
+          listUnsubscribePost: header(msg.payload, "List-Unsubscribe-Post"),
+          listId: header(msg.payload, "List-Id"),
+        };
+      }
+      senders.set(address, group);
+    }
+    return { senders: [...senders.values()], scanned, ...(failed.length ? { unavailable: failed.map((f) => f.id) } : {}) };
+  }
+
+  /** Sends the unsubscribe email a sender's List-Unsubscribe header asks for (mailto:). */
+  async sendUnsubscribeEmail(mail: { to: string; subject: string; body: string }) {
+    const mime = buildMime({ to: [mail.to], subject: mail.subject, text: mail.body });
+    return this.sentResult(await this.sendMail(() => this.upload("POST", "messages/send", {}, mime)));
   }
 
   // ---------- bulk changes ----------

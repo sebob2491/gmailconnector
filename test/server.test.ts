@@ -9,7 +9,7 @@ import { AccountStore } from "../src/accountStore.js";
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
 import { createServer } from "../src/server.js";
-import { FakeGmail, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
+import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
 
 const PERSONAL = "me.personal@gmail.com";
@@ -26,6 +26,7 @@ const b64 = (s: string | Buffer) => Buffer.from(s).toString("base64");
 
 interface Ctx {
   fake: FakeGmail;
+  web: FakeWeb;
   store: AccountStore;
   client: Client;
   personal: FakeMailbox;
@@ -97,10 +98,13 @@ async function setup(opts: { accounts?: "both" | "personal"; defaultAccount?: st
   );
   work.labels.push({ id: "Label_7", name: "Reports", type: "user" });
 
+  const web = new FakeWeb();
   const server = createServer({
     store,
     fetchImpl: fake.fetch,
     tokens: new TokenProvider(async () => ({ clientId: "cid", clientSecret: "secret" }), fake.fetch),
+    webFetch: web.fetch,
+    resolveHost: web.resolve,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -118,7 +122,7 @@ async function setup(opts: { accounts?: "both" | "personal"; defaultAccount?: st
     }
     return { isError: Boolean(res.isError), text, json };
   };
-  return { fake, store, client, personal, work, call };
+  return { fake, web, store, client, personal, work, call };
 }
 
 /** Pulls headers and decoded text parts out of a raw MIME message for assertions. */
@@ -172,6 +176,7 @@ describe("tool catalogue", () => {
       "unlabel_thread",
       "unmark_message_spam",
       "unmark_thread_spam",
+      "unsubscribe",
       "untrash_message",
       "untrash_thread",
       "update_draft",
@@ -1683,6 +1688,215 @@ describe("combined search timeline", () => {
     // list_drafts and list_labels stay grouped by account.
     const drafts = await call("list_drafts", {});
     assert.ok(Array.isArray(drafts.json.accounts));
+  });
+});
+
+describe("unsubscribe", () => {
+  /** Delivers a list email with the given unsubscribe headers. */
+  function listMail(ctx: Ctx, mb: FakeMailbox, id: string, from: string, subject: string, unsub?: { header: string; oneClick?: boolean }) {
+    ctx.fake.deliver(
+      mb,
+      crlf([
+        `From: ${from}`,
+        `To: ${mb.email}`,
+        `Subject: ${subject}`,
+        ...(unsub ? [`List-Unsubscribe: ${unsub.header}`] : []),
+        ...(unsub?.oneClick ? ["List-Unsubscribe-Post: List-Unsubscribe=One-Click"] : []),
+        "",
+        "Deals!",
+      ]),
+      { id, labelIds: ["INBOX", "CATEGORY_PROMOTIONS"] },
+    );
+  }
+
+  async function storeMail() {
+    const ctx = await setup();
+    const levis = { header: "<https://unsub.levi.com/u?t=abc>, <mailto:unsub@levi.com>", oneClick: true };
+    listMail(ctx, ctx.work, "levi1", "Levi's <news@e.levi.com>", "Old sale", levis);
+    listMail(ctx, ctx.work, "levi2", "Levi's <news@e.levi.com>", "Jeans", levis);
+    listMail(ctx, ctx.work, "levi3", "Levi's <news@e.levi.com>", "Newest sale", levis);
+    listMail(ctx, ctx.work, "nord1", "Nordstrom <hello@nordstrom.com>", "Fall", { header: "<mailto:leave@nordstrom.com?subject=Remove%20me&body=Please%20remove>" });
+    listMail(ctx, ctx.work, "nord2", "Nordstrom <hello@nordstrom.com>", "Winter", { header: "<mailto:leave@nordstrom.com?subject=Remove%20me&body=Please%20remove>" });
+    listMail(ctx, ctx.work, "exp1", "Experian <alerts@experian.com>", "Your score", { header: "<https://www.experian.com/unsubscribe?id=9>" });
+    listMail(ctx, ctx.work, "li1", "LinkedIn <jobs@linkedin.com>", "New jobs");
+    return ctx;
+  }
+
+  test("a dry run shows one plan per sender and does nothing", async () => {
+    const ctx = await storeMail();
+    const res = await ctx.call("unsubscribe", { account: "work", query: "category:promotions", dryRun: true });
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.dryRun, true);
+    assert.deepEqual(
+      res.json.senders.map((p: any) => [p.sender, p.method, p.emailsScanned]),
+      [
+        ["news@e.levi.com", "one-click", 3],
+        ["hello@nordstrom.com", "email", 2],
+        ["jobs@linkedin.com", "none", 1],
+        ["alerts@experian.com", "link", 1],
+      ],
+    );
+    const [levi, nord, linkedin, experian] = res.json.senders;
+    assert.deepEqual(levi, {
+      account: WORK,
+      sender: "news@e.levi.com",
+      name: "Levi's",
+      method: "one-click",
+      via: "unsub.levi.com",
+      emailsScanned: 3,
+      newestSubject: "Newest sale",
+      newestDate: levi.newestDate,
+    });
+    assert.match(levi.newestDate, /^2026-/);
+    assert.equal(nord.to, "leave@nordstrom.com");
+    assert.equal(experian.link, "https://www.experian.com/unsubscribe?id=9");
+    assert.match(linkedin.note, /bulk_trash or bulk_update, or set up a Gmail filter/);
+    assert.match(res.json.note, /get their OK/);
+    assert.equal(ctx.web.requests.length, 0);
+    assert.equal(ctx.fake.sentBy(WORK).length, 0);
+  });
+
+  test("a real run posts the one-click request, emails mailto senders and hands back links", async () => {
+    const ctx = await storeMail();
+    const res = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
+    assert.equal(res.isError, false, res.text);
+    const byResult = Object.fromEntries(res.json.senders.map((r: any) => [r.sender, r]));
+    assert.equal(byResult["news@e.levi.com"].result, "unsubscribed");
+    assert.equal(byResult["hello@nordstrom.com"].result, "unsubscribe email sent");
+    assert.equal(byResult["alerts@experian.com"].result, "open this link");
+    assert.equal(byResult["alerts@experian.com"].link, "https://www.experian.com/unsubscribe?id=9");
+    assert.equal(byResult["jobs@linkedin.com"].result, "no unsubscribe option");
+    assert.deepEqual(res.json.summary, { unsubscribed: 1, emailsSent: 1, linksToOpen: 1, noOption: 1, failed: 0 });
+    assert.match(res.json.note, /bulk_update \(archive\) or bulk_trash/);
+
+    // One POST per sender (three Levi's emails, one request), RFC 8058 style; links are never opened.
+    assert.deepEqual(ctx.web.requests, [
+      {
+        url: "https://unsub.levi.com/u?t=abc",
+        method: "POST",
+        contentType: "application/x-www-form-urlencoded",
+        body: "List-Unsubscribe=One-Click",
+        redirect: "manual",
+        hasSignal: true,
+      },
+    ]);
+    const [sent] = ctx.fake.sentBy(WORK);
+    const mime = inspectMime(sent.raw);
+    assert.equal(mime.get("To"), "leave@nordstrom.com");
+    assert.equal(mime.get("Subject"), "Remove me");
+    assert.equal(mime.parts[0].text, "Please remove");
+  });
+
+  test("a mailto without a subject gets \"unsubscribe\"; failures say why", async () => {
+    const ctx = await setup();
+    listMail(ctx, ctx.work, "a1", "a@list.example", "A", { header: "<mailto:off@list.example>" });
+    listMail(ctx, ctx.work, "b1", "b@shop.example", "B", { header: "<https://shop.example/u>", oneClick: true });
+    listMail(ctx, ctx.work, "c1", "c@store.example", "C", { header: "<https://store.example/u>", oneClick: true });
+    listMail(ctx, ctx.work, "d1", "d@redirect.example", "D", { header: "<https://redirect.example/u>", oneClick: true });
+    ctx.web.answers.set("https://shop.example/", 500);
+    ctx.web.answers.set("https://store.example/", "timeout");
+    ctx.web.answers.set("https://redirect.example/", 302);
+    const res = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
+    const by = Object.fromEntries(res.json.senders.map((r: any) => [r.sender, r]));
+    assert.equal(inspectMime(ctx.fake.sentBy(WORK)[0].raw).get("Subject"), "unsubscribe");
+    assert.equal(by["b@shop.example"].result, "failed");
+    assert.match(by["b@shop.example"].reason, /answered 500/);
+    assert.equal(by["b@shop.example"].link, "https://shop.example/u");
+    assert.match(by["c@store.example"].reason, /didn't answer within 10 seconds/);
+    assert.equal(by["d@redirect.example"].result, "unsubscribed", "a redirect counts as done, and isn't followed");
+    assert.equal(ctx.web.requests.filter((r) => r.url.startsWith("https://redirect.example")).length, 1);
+  });
+
+  test("one-click addresses on IP addresses, local names or private networks are refused", async () => {
+    const ctx = await setup();
+    const oneClick = (url: string, mailto?: string) => ({ header: [`<${url}>`, ...(mailto ? [`<mailto:${mailto}>`] : [])].join(", "), oneClick: true });
+    listMail(ctx, ctx.work, "i1", "a@one.example", "A", oneClick("https://10.0.0.5/u"));
+    listMail(ctx, ctx.work, "i2", "b@two.example", "B", oneClick("https://0x7f.1/u"));
+    listMail(ctx, ctx.work, "i3", "c@three.example", "C", oneClick("https://localhost/u"));
+    listMail(ctx, ctx.work, "i4", "d@four.example", "D", oneClick("https://[::1]/u"));
+    listMail(ctx, ctx.work, "i5", "e@five.example", "E", oneClick("https://printer.local/u"));
+    listMail(ctx, ctx.work, "i6", "f@six.example", "F", oneClick("https://unsub.rebind.example/u"));
+    listMail(ctx, ctx.work, "i7", "g@seven.example", "G", oneClick("https://192.168.1.1/u", "off@seven.example"));
+    listMail(ctx, ctx.work, "i8", "h@eight.example", "H", oneClick("http://plain.example/u"));
+    ctx.web.dns.set("unsub.rebind.example", ["203.0.113.7", "169.254.169.254"]);
+    const dry = await ctx.call("unsubscribe", { account: "work", query: "", dryRun: true, maxSenders: 20 });
+    const by = Object.fromEntries(dry.json.senders.map((r: any) => [r.sender, r]));
+    for (const sender of ["a@one.example", "b@two.example", "d@four.example"]) {
+      assert.equal(by[sender].method, "refused", sender);
+      assert.match(by[sender].reason, /IP address/);
+    }
+    assert.match(by["b@two.example"].reason, /127\.0\.0\.1/);
+    assert.match(by["c@three.example"].reason, /local network name \(localhost\)/);
+    assert.match(by["e@five.example"].reason, /local network name \(printer\.local\)/);
+    assert.match(by["f@six.example"].reason, /unsub\.rebind\.example leads to a private network address \(169\.254\.169\.254\)/);
+    assert.equal(by["g@seven.example"].method, "email", "the mailto option is used instead");
+    assert.match(by["g@seven.example"].note, /one-click address wasn't used/);
+    assert.equal(by["h@eight.example"].method, "link", "plain http is never posted to");
+    const real = await ctx.call("unsubscribe", { account: "work", query: "", maxSenders: 20 });
+    assert.ok(real.json.senders.filter((r: any) => r.method === "refused").every((r: any) => r.result === "failed" && r.reason));
+    assert.equal(ctx.web.requests.length, 0, "nothing was contacted");
+  });
+
+  test("senders are grouped per account, and maxSenders counts across accounts, busiest first", async () => {
+    const ctx = await setup();
+    const oc = (host: string) => ({ header: `<https://${host}/u>`, oneClick: true });
+    for (const [mb, prefix] of [[ctx.personal, "p"], [ctx.work, "w"]] as const) {
+      listMail(ctx, mb, `${prefix}s1`, "news@same.example", "S1", oc("same.example"));
+      listMail(ctx, mb, `${prefix}s2`, "news@same.example", "S2", oc("same.example"));
+    }
+    listMail(ctx, ctx.work, "w3", "x@three.example", "3a", oc("three.example"));
+    listMail(ctx, ctx.work, "w4", "x@three.example", "3b", oc("three.example"));
+    listMail(ctx, ctx.work, "w5", "x@three.example", "3c", oc("three.example"));
+    listMail(ctx, ctx.personal, "p6", "y@one.example", "1", oc("one.example"));
+    const res = await ctx.call("unsubscribe", { query: "category:promotions", maxSenders: 3, dryRun: true });
+    assert.deepEqual(
+      res.json.senders.map((p: any) => [p.account, p.sender, p.emailsScanned]),
+      [
+        [WORK, "x@three.example", 3],
+        [PERSONAL, "news@same.example", 2], // same count and date: in account order
+        [WORK, "news@same.example", 2],
+      ],
+    );
+    assert.match(res.json.moreSenders, /1 more sender\(s\) weren't included \(maxSenders is 3\).*query in nextRuns, or raise maxSenders/);
+    assert.deepEqual(res.json.nextRuns, [{ account: PERSONAL, query: "(category:promotions) from:y@one.example" }]);
+    const next = await ctx.call("unsubscribe", { ...res.json.nextRuns[0], dryRun: true });
+    assert.deepEqual(next.json.senders.map((p: any) => [p.account, p.sender]), [[PERSONAL, "y@one.example"]]);
+    const bad = await ctx.call("unsubscribe", { query: "x", messageIds: ["w3"] });
+    assert.match(bad.text, /exactly one of `query` or `messageIds`/);
+    const byId = await ctx.call("unsubscribe", { account: "work", messageIds: ["w3", "w4"], dryRun: true });
+    assert.deepEqual(byId.json.senders.map((p: any) => [p.sender, p.emailsScanned]), [["x@three.example", 2]]);
+  });
+
+  test("five accounts with 20 senders stay under 40 Gmail and web calls", async () => {
+    const ctx = await setup();
+    for (let i = 3; i <= 5; i++) {
+      const email = `extra${i}@example.com`;
+      ctx.fake.addMailbox(email, `rt-${i}`);
+      await ctx.store.upsert({ email, refreshToken: `rt-${i}`, scopes: [], addedAt: "" });
+    }
+    for (const [n, mb] of ctx.fake.mailboxes.entries()) {
+      for (let s = 0; s < 6; s++) {
+        for (let k = 0; k < 10; k++) {
+          listMail(ctx, mb, `a${n}s${s}k${k}`, `news@sender${s}.example`, `Deal ${k}`, { header: `<https://sender${s}.example/u/${n}>`, oneClick: true });
+        }
+      }
+    }
+    ctx.fake.outboundCalls = 0;
+    const res = await ctx.call("unsubscribe", { query: "category:promotions", maxSenders: 20 });
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.summary.unsubscribed, 20);
+    // 50 newest emails per account: 5 senders each, 25 in all.
+    assert.match(res.json.moreSenders, /^5 more sender\(s\) weren't included \(maxSenders is 20\)\. .*query in nextRuns\.$/);
+    assert.deepEqual(res.json.nextRuns, [
+      {
+        account: "extra5@example.com",
+        query: "(category:promotions) (from:news@sender5.example OR from:news@sender4.example OR from:news@sender3.example OR from:news@sender2.example OR from:news@sender1.example)",
+      },
+    ]);
+    // Per account: a token, one search and one metadata batch (50 emails); then one request per sender.
+    assert.equal(ctx.fake.outboundCalls, 5 * 3);
+    assert.equal(ctx.web.requests.length, 20);
+    assert.ok(ctx.fake.outboundCalls + ctx.web.requests.length <= 40);
   });
 });
 
