@@ -3,8 +3,8 @@ import { Buffer } from "node:buffer";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
-import { attachmentText } from "../src/format.js";
-import { decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, sniffType } from "../src/attachments.js";
+import { attachmentCharset, attachmentText } from "../src/format.js";
+import { decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
 import { docx, docxOf, pdf, pdfOf, png, pptx, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
@@ -287,4 +287,58 @@ test("PowerPoint keeps line breaks and follows the presentation's slide order", 
 test("attachment text keeps its spaces and tabs", () => {
   const yaml = "﻿server:\n  port: 80\n  hosts:\n    - a\u0000\nname\t\tamount\n";
   assert.equal(attachmentText(yaml), "server:\n  port: 80\n  hosts:\n    - a\nname\t\tamount\n");
+});
+
+// ---------- text files and types ----------
+
+test("text attachments decode by byte-order mark, declared charset, or a Windows-1252 guess", () => {
+  // Excel's "CSV" on Windows writes Windows-1252; it is not valid UTF-8, so that is the guess.
+  const csv = Buffer.from([...Buffer.from("Name;Stadt;Betrag\nJ\xfcrgen;K\xf6ln;12,50 ", "latin1"), 0x80]);
+  assert.equal(decodeTextFile(csv, "text/csv", "export.csv"), "Name;Stadt;Betrag\nJürgen;Köln;12,50 €");
+  // A declared charset is used (here from the attachment's Content-Type).
+  assert.equal(decodeTextFile(Buffer.from([0x93, 0x8c, 0x8b, 0x9e]), "text/plain", "memo.txt", "Shift_JIS"), "東京");
+  assert.equal(decodeTextFile(Buffer.from("\x1b$B$3$s$K$A$O\x1b(B", "latin1"), "text/plain", "jp.txt", '"iso-2022-jp"'), "こんにちは");
+  // HTML can declare it in a <meta> tag.
+  const html = Buffer.from('<html><head><meta charset="windows-1251"></head><body><p>\xcf\xf0\xe8\xe2\xe5\xf2</p></body></html>', "latin1");
+  assert.equal(decodeTextFile(html, "text/html", "page.html"), "Привет");
+  // Valid UTF-8 stays UTF-8, even when labeled US-ASCII.
+  assert.equal(decodeTextFile(Buffer.from("Café ✓"), "text/plain", "a.txt", "us-ascii"), "Café ✓");
+  assert.equal(decodeTextFile(Buffer.from("﻿BOM first"), "text/plain", "a.txt", "windows-1252"), "BOM first");
+});
+
+test("long text attachments are decoded only as far as needed", () => {
+  const big = Buffer.from("line of text ✓\n".repeat(200_000));
+  const some = readTextFile(big, "text/plain", "log.txt", { maxChars: 20_000 });
+  assert.equal(some.more, true);
+  assert.ok(some.text.length >= 20_000 && some.text.length <= 80_004);
+  assert.equal(readTextFile(big, "text/plain", "log.txt", { maxChars: 0 }).more, undefined);
+});
+
+test("file types: content signatures win, odd type names are understood", () => {
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1]);
+  assert.equal(sniffType(jpeg, "image/jpg", "photo.jpg"), "image/jpeg");
+  assert.equal(sniffType(Buffer.from("not really"), "image/pjpeg", "photo.jpg"), "image/jpeg");
+  assert.equal(sniffType(png, "image/jpeg", "misnamed.jpg"), "image/png");
+  assert.equal(sniffType(pdf([]), "application/x-download", "statement"), "application/pdf");
+  assert.equal(sniffType(Buffer.from("%PDF-1.7"), "application/force-download", "invoice.pdf"), "application/pdf");
+  assert.equal(sniffType(docx(["x"]), "application/zip", "letter.docx"), "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+  assert.equal(kindOf(sniffType(docx(["x"]), "application/octet-stream", "budget.xlsm"), "budget.xlsm"), "office");
+  assert.equal(sniffType(Buffer.from("a,b"), "application/download", "data.bin"), "application/download");
+  // Only exact text types count: x-sh is shell, but not x-sharedlib or x-shockwave-flash.
+  assert.equal(kindOf("application/x-sh", "run.sh"), "text");
+  assert.equal(kindOf("application/x-sharedlib", "libfoo.so"), "binary");
+  assert.equal(kindOf("application/x-shockwave-flash", "a.swf"), "binary");
+});
+
+test("the charset of an attachment comes from its part's Content-Type", () => {
+  const payload = {
+    partId: "",
+    mimeType: "multipart/mixed",
+    parts: [
+      { partId: "0", mimeType: "text/plain", headers: [{ name: "Content-Type", value: "text/plain; charset=utf-8" }] },
+      { partId: "1", mimeType: "text/csv", filename: "x.csv", headers: [{ name: "Content-Type", value: 'text/csv; charset="windows-1252"; name="x.csv"' }] },
+    ],
+  };
+  assert.equal(attachmentCharset(payload, "1"), "windows-1252");
+  assert.equal(attachmentCharset(payload, "2"), undefined);
 });

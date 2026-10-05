@@ -13,48 +13,130 @@ import { htmlToText } from "./mime.js";
 
 export type AttachmentKind = "text" | "image" | "pdf" | "office" | "binary";
 
-const TEXT_TYPES = /^(text\/|application\/(json|xml|csv|x-csv|ics|rtf|javascript|x-yaml|yaml|sql|x-sh))|\+(json|xml)$/i;
+const TEXT_TYPES =
+  /^(?:text\/|application\/(?:json|xml|csv|x-csv|ics|rtf|javascript|x-javascript|ecmascript|x-yaml|yaml|sql|x-sh|x-ndjson)$)|\+(?:json|xml)$/i;
 const TEXT_EXTENSIONS = /\.(txt|csv|tsv|json|xml|ics|vcf|md|log|ya?ml|html?|eml|rtf|sql|ini|cfg|conf)$/i;
 const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const OFFICE_TYPE = /officedocument\.(wordprocessingml|spreadsheetml|presentationml)|ms-(word|excel|powerpoint)\.[\w.]*macroenabled/i;
 
-/** Recognizes a file from its leading bytes when the declared type is generic or missing. */
+/** Types that say nothing about the content ("download this"), so the file name decides. */
+const GENERIC_TYPES = new Set([
+  "",
+  "application/octet-stream",
+  "binary/octet-stream",
+  "application/binary",
+  "application/download",
+  "application/x-download",
+  "application/force-download",
+  "application/unknown",
+  "application/x-unknown",
+]);
+
+/** Common non-standard names for types we read. */
+const TYPE_ALIASES: Record<string, string> = {
+  "image/jpg": "image/jpeg",
+  "image/pjpeg": "image/jpeg",
+  "image/x-png": "image/png",
+  "application/x-pdf": "application/pdf",
+  "application/acrobat": "application/pdf",
+};
+
+const OOXML = "application/vnd.openxmlformats-officedocument";
+const BY_EXTENSION: Record<string, string> = {
+  docx: `${OOXML}.wordprocessingml.document`,
+  dotx: `${OOXML}.wordprocessingml.template`,
+  docm: "application/vnd.ms-word.document.macroEnabled.12",
+  xlsx: `${OOXML}.spreadsheetml.sheet`,
+  xltx: `${OOXML}.spreadsheetml.template`,
+  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+  pptx: `${OOXML}.presentationml.presentation`,
+  potx: `${OOXML}.presentationml.template`,
+  pptm: "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+  pdf: "application/pdf",
+};
+
+/**
+ * The type to read a file as. Content with an unmistakable signature (PDF, PNG, JPEG, GIF, WebP)
+ * wins over whatever the sender declared; ZIP files named .docx/.xlsx/.pptx are Office files; generic
+ * types ("application/octet-stream", "application/x-download", …) fall back to the file name.
+ */
 export function sniffType(bytes: Uint8Array, mimeType: string, filename: string): string {
-  const lower = mimeType.toLowerCase();
-  if (lower && lower !== "application/octet-stream" && lower !== "binary/octet-stream") return lower;
+  const declared = mimeType.toLowerCase().split(";")[0].trim();
   const head = Buffer.from(bytes.subarray(0, 12)).toString("latin1");
   if (head.startsWith("%PDF")) return "application/pdf";
   if (head.startsWith("\x89PNG")) return "image/png";
   if (head.startsWith("\xff\xd8\xff")) return "image/jpeg";
   if (head.startsWith("GIF8")) return "image/gif";
   if (head.startsWith("RIFF") && head.slice(8, 12) === "WEBP") return "image/webp";
-  const ext = /\.([a-z0-9]+)$/i.exec(filename)?.[1]?.toLowerCase();
-  const byExt: Record<string, string> = {
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    pdf: "application/pdf",
-  };
-  if (ext && byExt[ext]) return byExt[ext];
-  return lower || "application/octet-stream";
+  const type = TYPE_ALIASES[declared] ?? declared;
+  const byName = BY_EXTENSION[/\.([a-z0-9]+)$/i.exec(filename)?.[1]?.toLowerCase() ?? ""];
+  if (head.startsWith("PK\x03\x04") && byName && (GENERIC_TYPES.has(type) || /zip|officedocument|ms-(word|excel|powerpoint)|msword/.test(type))) {
+    return byName;
+  }
+  if (!GENERIC_TYPES.has(type)) return type;
+  return byName ?? (type || "application/octet-stream");
 }
 
 export function kindOf(mimeType: string, filename: string): AttachmentKind {
   const type = mimeType.toLowerCase();
   if (IMAGE_TYPES.has(type)) return "image";
   if (type === "application/pdf") return "pdf";
-  if (/officedocument\.(wordprocessingml|spreadsheetml|presentationml)/.test(type)) return "office";
+  if (OFFICE_TYPE.test(type)) return "office";
   if (TEXT_TYPES.test(type) || type === "message/rfc822" || TEXT_EXTENSIONS.test(filename)) return "text";
   return "binary";
 }
 
-/** Decodes text bytes, honoring a UTF-8/UTF-16 byte-order mark; HTML is converted to readable text. */
-export function decodeTextFile(bytes: Uint8Array, mimeType: string, filename: string): string {
-  let text: string;
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) text = new TextDecoder("utf-16le").decode(bytes.subarray(2));
-  else if (bytes[0] === 0xfe && bytes[1] === 0xff) text = new TextDecoder("utf-16be").decode(bytes.subarray(2));
-  else text = new TextDecoder("utf-8").decode(bytes);
-  if (/html/i.test(mimeType) || /\.html?$/i.test(filename)) return htmlToText(text);
-  return text.replace(/^﻿/, "");
+/** Charsets that mean "UTF-8 if it is valid": senders often label Windows-1252 text as one of these. */
+const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-utf-8"]);
+
+/**
+ * Decodes text bytes: a byte-order mark wins, then a declared charset (the attachment's Content-Type,
+ * or an HTML <meta>), then UTF-8 if the bytes are valid UTF-8, else Windows-1252 (what Excel and
+ * Windows programs write). `partial` says the bytes are cut off, so a split last character is fine.
+ */
+function decodeText(bytes: Uint8Array, declared: string | undefined, html: boolean, partial: boolean): string {
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder("utf-8").decode(bytes);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes.subarray(2));
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes.subarray(2));
+  let charset = declared?.trim().replace(/^["']|["']$/g, "").toLowerCase();
+  if (!charset && html) {
+    const head = Buffer.from(bytes.subarray(0, 1024)).toString("latin1");
+    charset = /<meta[^>]{0,200}?charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(head)?.[1]?.toLowerCase();
+  }
+  if (charset && !UTF8_LIKE.has(charset)) {
+    try {
+      return new TextDecoder(charset).decode(bytes);
+    } catch {
+      // Unknown charset name: guess below.
+    }
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: partial });
+  } catch {
+    return new TextDecoder("windows-1252").decode(bytes);
+  }
+}
+
+export interface TextReadOptions extends ReadOptions {
+  /** The charset parameter of the attachment's Content-Type, if any. */
+  charset?: string;
+}
+
+/** Reads a text attachment (HTML is converted to readable text), decoding only as much as `maxChars` needs. */
+export function readTextFile(bytes: Uint8Array, mimeType: string, filename: string, opts: TextReadOptions = {}): ReadResult {
+  const budget = new Budget(opts.maxChars);
+  const html = /html/i.test(mimeType) || /\.html?$/i.test(filename);
+  // A character takes at most 4 bytes; HTML markup can take many more bytes per character of text.
+  const maxBytes = html ? budget.chars * 50 : budget.chars * 4 + 4;
+  const partial = bytes.length > maxBytes;
+  const decoded = decodeText(partial ? bytes.subarray(0, maxBytes) : bytes, opts.charset, html, partial);
+  const text = html ? htmlToText(decoded) : decoded.replace(/^\ufeff/, "");
+  return budget.result(text, partial || text.length > budget.chars);
+}
+
+/** The text of a text attachment as one string (with a note when it is incomplete). */
+export function decodeTextFile(bytes: Uint8Array, mimeType: string, filename: string, charset?: string): string {
+  return withNote(readTextFile(bytes, mimeType, filename, { charset }));
 }
 
 // ---------- limits ----------

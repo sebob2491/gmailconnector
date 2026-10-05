@@ -162,9 +162,29 @@ export function bareAddress(address: string): string {
   return (parseMailboxes(address)[0]?.address ?? address).trim().toLowerCase();
 }
 
+/** The charset parameter of a Content-Type header value, if any. */
+export function charsetOf(contentType: string | undefined): string | undefined {
+  return /charset\s*=\s*"?([^";\s]+)"?/i.exec(contentType ?? "")?.[1];
+}
+
+/**
+ * The declared charset of the message part with `partId` (e.g. a Windows-1252 CSV attachment), from
+ * its Content-Type header. Pass it to readTextFile/decodeTextFile so text attachments decode correctly.
+ */
+export function attachmentCharset(payload: ApiMessagePart | undefined, partId: string | undefined): string | undefined {
+  if (partId === undefined) return undefined;
+  const stack = payload ? [payload] : [];
+  while (stack.length) {
+    const part = stack.pop()!;
+    if (part.partId === partId) return charsetOf(header(part, "Content-Type"));
+    stack.push(...(part.parts ?? []));
+  }
+  return undefined;
+}
+
 export function decodeBody(data: string, contentType?: string): string {
   const buf = Buffer.from(data, "base64url");
-  const charset = /charset="?([^";\s]+)"?/i.exec(contentType ?? "")?.[1] ?? "utf-8";
+  const charset = charsetOf(contentType) ?? "utf-8";
   try {
     return new TextDecoder(charset).decode(buf);
   } catch {
