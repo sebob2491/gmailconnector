@@ -1175,7 +1175,7 @@ describe("bulk changes", () => {
     ] as const) {
       for (let i = 1; i <= 2; i++) {
         fake(ctx).deliver(mb, crlf([`From: deals${i}@shop.example`, `To: ${email}`, `Subject: Sale ${i}`, "", "50% off"]), {
-          id: `${email.split("@")[0]}-promo${i}`,
+          id: `${email.split("@")[0].replace(/\./g, "")}-promo${i}`, // Gmail IDs have no dots
           labelIds: ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"],
         });
       }
@@ -1194,7 +1194,7 @@ describe("bulk changes", () => {
     assert.equal(byAccount[WORK].wouldChange, 2);
     assert.deepEqual(byAccount[PERSONAL].preview.map((p: any) => p.subject).sort(), ["Sale 1", "Sale 2"]);
     assert.equal(f.batchModifyCalls.length, 0);
-    assert.ok(labelsOf(personal, "me.personal-promo1").includes("INBOX"));
+    assert.ok(labelsOf(personal, "mepersonal-promo1").includes("INBOX"));
   });
 
   test("archive and mark read apply to just the matching emails, in one call per account", async () => {
@@ -1202,7 +1202,7 @@ describe("bulk changes", () => {
     const res = await call("bulk_update", { query: "category:promotions", action: "archive" });
     assert.deepEqual(res.json.accounts.map((a: any) => a.changed), [2, 2]);
     assert.equal(f.batchModifyCalls.length, 2);
-    assert.ok(!labelsOf(personal, "me.personal-promo1").includes("INBOX"));
+    assert.ok(!labelsOf(personal, "mepersonal-promo1").includes("INBOX"));
     assert.ok(!labelsOf(work, "me-promo2").includes("INBOX"));
     assert.ok(labelsOf(personal, "p1").includes("INBOX"), "non-promotions stay in the inbox");
 
@@ -1265,5 +1265,31 @@ describe("bulk changes", () => {
     assert.equal(res.json.accounts.length, 5);
     assert.ok(res.json.accounts.every((a: any) => a.changed > 0), res.text);
     assert.ok(ctx.fake.outboundCalls <= 20, `made ${ctx.fake.outboundCalls} calls`);
+  });
+});
+
+describe("fixes from the second review", () => {
+  test("IDs that aren't plain Gmail IDs are rejected before any request", async () => {
+    const { call, fake, work } = await setup();
+    const before = fake.requests.length;
+    const res = await call("delete_draft", { account: "work", draftId: "../labels/Label_7" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /Invalid draft ID "\.\.\/labels\/Label_7"/);
+    assert.ok(work.labels.some((l) => l.id === "Label_7"), "the label is untouched");
+    for (const [tool, args] of [
+      ["get_thread", { threadId: "wt1/../../labels" }],
+      ["get_message", { messageId: "w1?format=raw" }],
+      ["trash_message", { messageId: ".." }],
+      ["bulk_update", { messageIds: ["w1", "../threads/wt1"], action: "archive" }],
+    ] as const) {
+      const r = await call(tool, { account: "work", ...args });
+      assert.equal(r.isError, true, `${tool} ${r.text}`);
+      assert.match(r.text, /Invalid (thread|message) ID/);
+    }
+    assert.equal(fake.requests.length, before, "nothing reached Gmail");
+    // Real IDs look like these and still work.
+    const draft = await call("create_draft", { account: "work", to: ["a@example.com"], body: "x" });
+    assert.match(draft.json.id, /^r-/);
+    assert.equal((await call("get_draft", { account: "work", draftId: ` ${draft.json.id} ` })).isError, false);
   });
 });

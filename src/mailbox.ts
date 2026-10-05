@@ -117,6 +117,20 @@ function toAttachments(inputs: AttachmentInput[] | undefined): OutgoingAttachmen
   }));
 }
 
+/**
+ * Gmail IDs (messages, threads, drafts, labels, attachments) only use URL-safe characters. Checking
+ * them keeps an ID such as "../labels/Label_1" from turning a call into one on another API path.
+ */
+function checkId(id: string, what: string): string {
+  const clean = id.trim();
+  if (!/^[A-Za-z0-9_-]+$/.test(clean)) {
+    throw new MimeError(
+      `Invalid ${what} ID ${JSON.stringify(id.slice(0, 100))}: Gmail IDs only contain letters, digits, "-" and "_". Use the ID exactly as a tool returned it.`,
+    );
+  }
+  return clean;
+}
+
 /** True when the query asks for drafts (`in:draft`), but not when it excludes them (`-in:draft`). */
 function mentionsDrafts(query: string | undefined): boolean {
   return /(?:^|[\s({])(?:in|is):drafts?\b/i.test(query ?? "");
@@ -155,7 +169,8 @@ export class Mailbox {
 
   private loader(messageId: string) {
     return async (attachmentId: string) =>
-      (await this.client.request("GET", `messages/${messageId}/attachments/${attachmentId}`)).data as string;
+      (await this.client.request("GET", `messages/${checkId(messageId, "message")}/attachments/${checkId(attachmentId, "attachment")}`))
+        .data as string;
   }
 
   private format(msg: ApiMessage, format: MessageFormat, opts: FormatOptions = {}): Promise<FormattedMessage> {
@@ -237,7 +252,7 @@ export class Mailbox {
 
   async getThread(threadId: string, format: MessageFormat, opts: FormatOptions = {}) {
     if (format === "RAW") throw new MimeError("RAW format is not supported for threads; use get_message instead.");
-    const thread = await this.client.request("GET", `threads/${threadId}`, {
+    const thread = await this.client.request("GET", `threads/${checkId(threadId, "thread")}`, {
       query: { format: apiFormat(format), metadataHeaders: format === "MINIMAL" || format === "METADATA_ONLY" ? METADATA_HEADERS : undefined },
     });
     const messages = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT"));
@@ -250,13 +265,13 @@ export class Mailbox {
   }
 
   async getRawMessage(messageId: string, format: "full" | "metadata" = "full"): Promise<ApiMessage> {
-    return this.client.request("GET", `messages/${messageId}`, {
+    return this.client.request("GET", `messages/${checkId(messageId, "message")}`, {
       query: { format, metadataHeaders: format === "metadata" ? METADATA_HEADERS : undefined },
     });
   }
 
   async getMessage(messageId: string, format: MessageFormat, opts: FormatOptions = {}) {
-    const msg: ApiMessage = await this.client.request("GET", `messages/${messageId}`, {
+    const msg: ApiMessage = await this.client.request("GET", `messages/${checkId(messageId, "message")}`, {
       query: { format: apiFormat(format), metadataHeaders: apiFormat(format) === "metadata" ? METADATA_HEADERS : undefined },
     });
     return this.format(msg, format, opts);
@@ -344,7 +359,7 @@ export class Mailbox {
 
   async sendMessage(input: ComposeInput & { draftId?: string; replyThreadId?: string; replyToMessageId?: string }) {
     if (input.draftId) {
-      const sent = await this.client.request("POST", "drafts/send", { json: { id: input.draftId } });
+      const sent = await this.client.request("POST", "drafts/send", { json: { id: checkId(input.draftId, "draft") } });
       return this.sentResult(sent);
     }
     const to = input.to ?? [];
@@ -370,7 +385,7 @@ export class Mailbox {
     } else if (input.replyThreadId) {
       // Gmail only threads a message that also carries In-Reply-To/References and a matching
       // subject, so take them from the thread's latest message.
-      const thread = await this.client.request("GET", `threads/${input.replyThreadId}`, {
+      const thread = await this.client.request("GET", `threads/${checkId(input.replyThreadId, "thread")}`, {
         query: { format: "metadata", metadataHeaders: METADATA_HEADERS },
       });
       const last = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT")).at(-1);
@@ -510,7 +525,7 @@ export class Mailbox {
 
   async getDraft(draftId: string, format: MessageFormat, opts: FormatOptions = {}) {
     // drafts.get has no metadataHeaders parameter; metadata format returns every header.
-    const draft = await this.client.request("GET", `drafts/${draftId}`, { query: { format: apiFormat(format) } });
+    const draft = await this.client.request("GET", `drafts/${checkId(draftId, "draft")}`, { query: { format: apiFormat(format) } });
     return this.formatDraft(draft, format, opts);
   }
 
@@ -543,7 +558,8 @@ export class Mailbox {
    * Existing attachments are kept unless `attachments` is given (pass [] to remove them all).
    */
   async updateDraft(input: ComposeInput & { draftId: string }) {
-    const existing = await this.client.request("GET", `drafts/${input.draftId}`, { query: { format: "full" } });
+    const draftId = checkId(input.draftId, "draft");
+    const existing = await this.client.request("GET", `drafts/${draftId}`, { query: { format: "full" } });
     const msg = existing.message as ApiMessage;
     const p = msg.payload;
     const content = await extractContent(p, this.loader(msg.id));
@@ -566,12 +582,12 @@ export class Mailbox {
       references: header(p, "References"),
       attachments: input.attachments ? toAttachments(input.attachments) : await this.downloadAttachments(msg),
     });
-    const draft = await this.upload("PUT", `drafts/${input.draftId}`, { id: input.draftId, message: { threadId: msg.threadId } }, mime);
+    const draft = await this.upload("PUT", `drafts/${draftId}`, { id: draftId, message: { threadId: msg.threadId } }, mime);
     return this.draftResult(draft);
   }
 
   async deleteDraft(draftId: string) {
-    await this.client.request("DELETE", `drafts/${draftId}`);
+    await this.client.request("DELETE", `drafts/${checkId(draftId, "draft")}`);
     return { deleted: draftId };
   }
 
@@ -668,7 +684,8 @@ export class Mailbox {
   }
 
   async modifyIds(kind: "messages" | "threads", id: string, addLabelIds: string[], removeLabelIds: string[]) {
-    const res = await this.client.request("POST", `${kind}/${id}/modify`, { json: { addLabelIds, removeLabelIds } });
+    const what = kind === "messages" ? "message" : "thread";
+    const res = await this.client.request("POST", `${kind}/${checkId(id, what)}/modify`, { json: { addLabelIds, removeLabelIds } });
     return this.modifyResult(kind, res);
   }
 
@@ -733,7 +750,7 @@ export class Mailbox {
     }
     if (sel.threadIds?.length) {
       const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
-        sel.threadIds.map((id) => ({ path: `threads/${id}`, query: { format: "minimal" } })),
+        sel.threadIds.map((id) => ({ path: `threads/${checkId(id, "thread")}`, query: { format: "minimal" } })),
       );
       const ids: string[] = [];
       fetched.forEach((r, i) => {
@@ -745,7 +762,7 @@ export class Mailbox {
       });
       return { ids: ids.slice(0, max), more: ids.length > max };
     }
-    const ids = [...new Set(sel.messageIds ?? [])];
+    const ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))];
     return { ids: ids.slice(0, max), more: ids.length > max };
   }
 
@@ -755,6 +772,9 @@ export class Mailbox {
     change: { add: string[]; remove: string[] },
     opts: { max: number; dryRun: boolean },
   ) {
+    // Check IDs before any call, so a bad one doesn't leave the change half done.
+    sel.threadIds?.forEach((id) => checkId(id, "thread"));
+    sel.messageIds?.forEach((id) => checkId(id, "message"));
     const labels = change.add.length || change.remove.length
       ? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[])
       : [];
@@ -791,7 +811,8 @@ export class Mailbox {
   }
 
   async trash(kind: "messages" | "threads", id: string, untrash = false) {
-    const res = await this.client.request("POST", `${kind}/${id}/${untrash ? "untrash" : "trash"}`);
+    const what = kind === "messages" ? "message" : "thread";
+    const res = await this.client.request("POST", `${kind}/${checkId(id, what)}/${untrash ? "untrash" : "trash"}`);
     return this.modifyResult(kind, res);
   }
 
