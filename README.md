@@ -17,7 +17,7 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 | Situation | Behaviour |
 |---|---|
-| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account and groups results by account. The returned `nextPageToken` continues every account at once. If one account fails, the others still return results. |
+| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account and groups results by account. The returned `nextPageToken` continues every account at once. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
 | Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
 | IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
@@ -35,7 +35,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
   promotions older than a week"). They support a dry run that previews what would change, and Claude
   is told to show you that preview first. Up to 500 emails per account per run by default (`maxEmails`
-  raises it to 2,000).
+  raises it to 2,000). Only emails that don't already have the change are counted and changed (archiving
+  "category:promotions" only touches promotions still in the inbox), so running the same change again
+  continues with the rest. With thread or message IDs, the IDs left over are returned to pass next time.
+  If a run fails partway, the result says how many emails were changed and how to finish.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
   Results are compact: one-email threads are shown flat, previews are cleaned of the invisible padding
@@ -54,7 +57,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   one email in full.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
-- `forward` re-attaches the original message's attachments.
+- `forward` re-attaches the original message's attachments, up to Gmail's 25 MB limit (larger ones are
+  refused before anything is downloaded; forward those in Gmail, which sends them as Drive links).
+- If sending fails with a server or network error, the error says the email may have gone out anyway,
+  so Claude checks your Sent folder instead of sending it twice.
 - The two legacy `apply_sensitive_*_label` tools are left out. `trash_*` and `mark_*_spam` cover them.
 
 ## Setup: hosted, for claude.ai on the web and phone
@@ -124,9 +130,10 @@ with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the dashboard are kept when 
 redeploys.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
-batches Gmail calls to stay well inside that (searching five inboxes takes about 15 calls). If
-Claude ever reports errors like "exceeded CPU" or "too many subrequests", switch the Worker to the
-Workers Paid plan ($5/month), which raises both limits.
+batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, and
+archiving 2,000 emails in each of five inboxes about 35. If Claude ever reports errors like "exceeded
+CPU" or "too many subrequests", switch the Worker to the Workers Paid plan ($5/month), which raises
+both limits.
 
 **If the first deploy fails to create storage:** in Cloudflare, go to **Storage & Databases → KV →
 Create** and make a namespace. Then under your Worker's **Settings → Bindings → Add → KV
