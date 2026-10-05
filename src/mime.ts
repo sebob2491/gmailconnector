@@ -189,7 +189,7 @@ function leafPart(headers: string[], content: Buffer): string {
  */
 function sevenBitMessage(content: Buffer): string | undefined {
   for (const byte of content) if (byte > 0x7e || byte === 0) return undefined;
-  const text = content.toString("latin1").replace(/\r?\n/g, CRLF);
+  const text = latin1(content).replace(/\r?\n/g, CRLF);
   if (text.split(CRLF).some((line) => line.length > 998 || line.includes("\r"))) return undefined;
   return text.endsWith(CRLF) ? text.slice(0, -2) : text;
 }
@@ -384,6 +384,14 @@ function codePointText(code: number): string {
 }
 
 /** Decodes HTML character references: named (HTML 4 and common HTML5 names) and numeric. */
+/**
+ * Bytes as a Latin-1 string, one character per byte. (Typed via Uint8Array: the Worker's and Node's
+ * type definitions disagree about Buffer#toString's parameters.)
+ */
+export function latin1(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("latin1");
+}
+
 export function decodeEntities(text: string): string {
   if (!text.includes("&")) return text;
   return text.replace(ENTITY, (match: string, hex: string | undefined, dec: string | undefined, name: string | undefined, semi: string, offset: number) => {

@@ -329,12 +329,12 @@ export function cleanBody(text: string): string {
 }
 
 /**
- * Text from an attachment, as it is in the file: only a byte-order mark and NUL characters are removed.
- * Unlike cleanBody, spaces and tabs are kept (they are indentation in code and YAML, and empty cells
- * in tab-separated data).
+ * Text from an attachment, as it is in the file: only a byte-order mark and NUL characters are removed,
+ * and Windows (CRLF) line ends become plain newlines. Unlike cleanBody, spaces and tabs are kept (they
+ * are indentation in code and YAML, and empty cells in tab-separated data).
  */
 export function attachmentText(text: string): string {
-  return text.replace(/^\ufeff/, "").replace(/\0/g, "");
+  return text.replace(/^\ufeff/, "").replace(/\0/g, "").replace(/\r\n?/g, "\n");
 }
 
 /**

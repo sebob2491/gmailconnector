@@ -32,7 +32,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 - New `get_attachment` tool: Claude can read attachments. Text, CSV, HTML, calendar invites, Word
   (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images as images; PDFs as extracted
   text (when the PDF has a text layer with standard fonts), otherwise as the PDF file itself for clients
-  that read PDFs.
+  that read PDFs. Spreadsheets keep empty cells in place and show dates as dates; Word tables come out
+  row by row. Text files are decoded in their own character set. Very large files (and booby-trapped
+  ones) are read only as far as needed, with a note saying what was left out.
 - New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
   promotions older than a week"). They support a dry run that previews what would change, and Claude
@@ -86,7 +88,8 @@ phone browser. It takes about 15 minutes, in three places: Cloudflare, Google Cl
    `gmailconnector`.
 3. Fill in the form:
    - **Project name:** `gmail-multi-mcp` (it must match `name` in `wrangler.jsonc`).
-   - **Deploy command:** `npx wrangler deploy` (the default). Leave the build command empty.
+   - **Build command:** `npm test`. Every deploy runs the tests first, and a failing test stops it.
+   - **Deploy command:** `npx wrangler deploy` (the default).
 4. Deploy. The first deploy creates the Worker's storage (a KV namespace) automatically.
 5. Open the Worker's URL, `https://gmail-multi-mcp.<your-subdomain>.workers.dev`. You'll see a
    **setup page** that lists the exact URLs for the next steps, each with a Copy button.

@@ -10,7 +10,7 @@
 import { Buffer } from "node:buffer";
 import { inflateRawSync, inflateSync } from "node:zlib";
 import { attachmentText, limitLength } from "./format.js";
-import { htmlToText } from "./mime.js";
+import { htmlToText, latin1 } from "./mime.js";
 
 export type AttachmentKind = "text" | "image" | "pdf" | "office" | "binary";
 
@@ -112,7 +112,7 @@ function decodeText(bytes: Uint8Array, declared: string | undefined, html: boole
     }
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: partial });
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes, { stream: partial });
   } catch {
     return new TextDecoder("windows-1252").decode(bytes);
   }
@@ -937,7 +937,10 @@ export async function officeText(bytes: Uint8Array, opts: ReadOptions = {}): Pro
 const win1252Decoder = new TextDecoder("windows-1252");
 const win1252 = {
   /** Plain ASCII needs no decoding, which skips a costly round trip for most strings. */
-  decode: (bytes: Buffer) => (/[^\x00-\x7f]/.test(bytes.toString("latin1")) ? win1252Decoder.decode(bytes) : bytes.toString("latin1")),
+  decode: (bytes: Uint8Array) => {
+    const text = latin1(bytes);
+    return /[^\x00-\x7f]/.test(text) ? win1252Decoder.decode(bytes) : text;
+  },
 };
 
 const LITERAL_SPECIAL = /[\\()]/g;
@@ -1114,7 +1117,7 @@ export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promis
         continue;
       }
     } else if (/\/Filter/.test(dict)) continue;
-    const content = data.toString("latin1");
+    const content = latin1(data);
     if (!/\bBT\b/.test(content) || !/T[jJ]|'|"/.test(content)) continue;
     const text = contentText(content, budget.chars - total + 1).trim();
     if (text) {

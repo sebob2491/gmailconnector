@@ -23,8 +23,8 @@
     "start": "node dist/src/index.js",
     "build:worker": "wrangler deploy --dry-run --outdir dist-worker",
     "deploy": "wrangler deploy",
-    "test": "npm run build && npm run build:worker && node --test \"dist/test/*.test.js\"",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test": "npm run build && tsc -p worker/tsconfig.json --noEmit && npm run build:worker && node --test \"dist/test/*.test.js\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p worker/tsconfig.json --noEmit"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
