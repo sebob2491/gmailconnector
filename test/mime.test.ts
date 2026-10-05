@@ -132,10 +132,11 @@ test("htmlToText stays fast on hostile HTML", () => {
     "unclosed quotes": '<x a="'.repeat(50_000),
   };
   for (const [name, html] of Object.entries(inputs)) {
-    const start = performance.now();
+    const start = process.cpuUsage();
     htmlToText(html);
-    const ms = performance.now() - start;
-    assert.ok(ms < 200, `${name}: ${ms.toFixed(0)} ms`);
+    const used = process.cpuUsage(start);
+    const ms = (used.user + used.system) / 1000;
+    assert.ok(ms < 200, `${name}: ${ms.toFixed(0)} ms of CPU`);
   }
 });
 

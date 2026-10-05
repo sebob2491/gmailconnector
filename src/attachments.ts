@@ -2,6 +2,10 @@
  * Turns attachment bytes into something Claude can read: text for documents (including Word,
  * Excel, PowerPoint and many PDFs), or an image. Runs in Node and Cloudflare Workers (node:zlib is
  * available there via nodejs_compat; it is ~25x cheaper than DecompressionStream for many small streams).
+ *
+ * Readers take a character budget and stop once they have that much text, and unpack at most
+ * MAX_PART_BYTES per part and MAX_FILE_BYTES per file, so large files and decompression bombs stay
+ * within the Worker's memory and CPU limits. Results say when the text is incomplete and why.
  */
 import { Buffer } from "node:buffer";
 import { inflateRawSync, inflateSync } from "node:zlib";
@@ -53,12 +57,96 @@ export function decodeTextFile(bytes: Uint8Array, mimeType: string, filename: st
   return text.replace(/^﻿/, "");
 }
 
+// ---------- limits ----------
+
+/** Most text a reader returns, even when asked for everything (maxChars: 0). */
+export const MAX_TEXT_CHARS = 1_000_000;
+/** Most bytes one ZIP entry or PDF stream may unpack to (the Worker has 128 MB of memory in all). */
+const MAX_PART_BYTES = 8 * 1024 * 1024;
+/** Most bytes all parts of one file may unpack to together, which also bounds the CPU spent. */
+const MAX_FILE_BYTES = 32 * 1024 * 1024;
+/** Large parts compressed more than this are decompression bombs; real documents stay far below it. */
+const MAX_RATIO = 500;
+
+const PART_TOO_LARGE = "Part of this file is too large to read here, so only its beginning is shown.";
+const FILE_TOO_LARGE = "This file is too large to read here in full, so only its beginning is shown.";
+const TEXT_TOO_LONG = `The text is longer than ${MAX_TEXT_CHARS.toLocaleString("en-US")} characters, so only the beginning is shown.`;
+
+/** Thrown when a file can't be read within the memory limits, e.g. a decompression bomb. */
+export class FileTooLargeError extends Error {}
+
+export interface ReadOptions {
+  /** Stop once this many characters of text are collected; 0 (or omitted) reads up to MAX_TEXT_CHARS. */
+  maxChars?: number;
+}
+
+export interface ReadResult {
+  text: string;
+  /** Reading stopped because `maxChars` characters were collected; asking for more shows more. */
+  more?: boolean;
+  /** Why the text stops early no matter what `maxChars` asks for (size limits). */
+  incomplete?: string;
+}
+
+/** Tracks what one file's reading may still spend. */
+class Budget {
+  /** Characters to collect before stopping. */
+  readonly chars: number;
+  /** True when `chars` is the caller's own limit rather than MAX_TEXT_CHARS. */
+  private readonly callerLimit: boolean;
+  private unpacked = 0;
+  incomplete?: string;
+
+  constructor(maxChars?: number) {
+    this.callerLimit = Boolean(maxChars && maxChars > 0 && maxChars < MAX_TEXT_CHARS);
+    this.chars = this.callerLimit ? maxChars! : MAX_TEXT_CHARS;
+  }
+
+  /** Bytes the next part may unpack to. */
+  get partBytes(): number {
+    return Math.min(MAX_PART_BYTES, MAX_FILE_BYTES - this.unpacked);
+  }
+
+  spend(bytes: number) {
+    this.unpacked += bytes;
+  }
+
+  cut(reason: string) {
+    this.incomplete ??= reason;
+  }
+
+  /** The result, given the text and whether reading stopped because enough text was collected. */
+  result(text: string, stopped: boolean): ReadResult {
+    const out: ReadResult = { text };
+    if (stopped) {
+      if (this.callerLimit) out.more = true;
+      else this.cut(TEXT_TOO_LONG);
+    }
+    if (this.incomplete) out.incomplete = this.incomplete;
+    return out;
+  }
+}
+
+/** Appends a note about missing text, for callers that only take a string. */
+function withNote(result: ReadResult): string {
+  return result.incomplete ? `${result.text}\n\n[${result.incomplete}]` : result.text;
+}
+
 // ---------- decompression ----------
 
-function inflate(data: Uint8Array, format: "deflate" | "deflate-raw"): Uint8Array {
-  // finishFlush tolerates streams with trailing bytes or a missing end marker, common in PDFs.
-  const opts = { finishFlush: 2 /* Z_SYNC_FLUSH */ };
+/**
+ * Inflates zlib or raw deflate data, refusing to produce more than `maxBytes` (it throws instead, so
+ * a decompression bomb can't exhaust memory). Z_SYNC_FLUSH tolerates streams with trailing bytes or
+ * a missing end marker (common in PDFs), and makes a cut-off input inflate to the start of the output.
+ */
+function inflate(data: Uint8Array, format: "deflate" | "deflate-raw", maxBytes: number): Buffer {
+  const opts = { finishFlush: 2 /* Z_SYNC_FLUSH */, maxOutputLength: Math.max(1, maxBytes) };
   return format === "deflate" ? inflateSync(data, opts) : inflateRawSync(data, opts);
+}
+
+/** True for the error inflate throws when output would pass maxOutputLength (Node and Workers word it differently). */
+function isOverLimit(err: unknown): boolean {
+  return err instanceof RangeError || /too large|memory limit|maxOutputLength/i.test(String((err as Error | undefined)?.message));
 }
 
 // ---------- ZIP (the container format of .docx/.xlsx/.pptx) ----------
@@ -67,6 +155,7 @@ interface ZipEntry {
   name: string;
   method: number;
   compressedSize: number;
+  size: number;
   localOffset: number;
 }
 
@@ -92,6 +181,7 @@ function zipEntries(bytes: Uint8Array): ZipEntry[] {
     entries.push({
       method: view.getUint16(pos + 10, true),
       compressedSize: view.getUint32(pos + 20, true),
+      size: view.getUint32(pos + 24, true),
       localOffset: view.getUint32(pos + 42, true),
       name: new TextDecoder().decode(bytes.subarray(pos + 46, pos + 46 + nameLength)),
     });
@@ -100,12 +190,54 @@ function zipEntries(bytes: Uint8Array): ZipEntry[] {
   return entries;
 }
 
-async function zipRead(bytes: Uint8Array, entry: ZipEntry): Promise<string> {
+/**
+ * Reads up to `want` bytes of an entry's content as text; `cut` says the entry has more. Entries larger
+ * than needed are read by inflating a matching share of their compressed data, so a large sheet costs
+ * only what is shown. Throws FileTooLargeError for entries that unpack to far more than they claim.
+ */
+function readEntry(bytes: Uint8Array, entry: ZipEntry, budget: Budget, want = MAX_PART_BYTES): { xml: string; cut: boolean } {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const start = entry.localOffset + 30 + view.getUint16(entry.localOffset + 26, true) + view.getUint16(entry.localOffset + 28, true);
-  const data = bytes.subarray(start, start + entry.compressedSize);
-  const raw = entry.method === 8 ? inflate(data, "deflate-raw") : data;
-  return new TextDecoder().decode(raw);
+  const packed = bytes.subarray(start, start + entry.compressedSize);
+  const limit = Math.min(want, budget.partBytes);
+  if (limit <= 0) {
+    budget.cut(FILE_TOO_LARGE);
+    return { xml: "", cut: true };
+  }
+  const done = (data: Uint8Array, cut: boolean) => {
+    budget.spend(data.length);
+    return { xml: new TextDecoder().decode(data), cut };
+  };
+  if (entry.method === 0) return done(packed.subarray(0, limit), packed.length > limit);
+  if (entry.method !== 8) throw new Error(`unsupported ZIP compression method ${entry.method}`);
+  if (entry.size > MAX_PART_BYTES && entry.size / Math.max(1, packed.length) > MAX_RATIO) {
+    throw new FileTooLargeError(
+      "This file unpacks to far more data than its size suggests (a damaged file or a decompression bomb), so it wasn't read.",
+    );
+  }
+  if (entry.size <= limit) {
+    try {
+      return done(inflate(packed, "deflate-raw", limit), false);
+    } catch (err) {
+      if (!isOverLimit(err)) throw err;
+      throw new FileTooLargeError("This file unpacks to more data than it declares (a damaged file or a decompression bomb), so it wasn't read.");
+    }
+  }
+  // Inflate only the share of the compressed data that should unpack to `limit` bytes.
+  let take = Math.max(1024, Math.floor(packed.length * (limit / entry.size) * 0.9));
+  for (let attempt = 0; attempt < 3; attempt++, take = Math.floor(take / 4)) {
+    try {
+      return done(inflate(packed.subarray(0, take), "deflate-raw", limit), true);
+    } catch (err) {
+      if (!isOverLimit(err)) throw err;
+    }
+  }
+  throw new FileTooLargeError("This file unpacks to far more data than its size suggests (a damaged file or a decompression bomb), so it wasn't read.");
+}
+
+/** How many bytes of XML to unpack first for `chars` characters of text (more is read when it falls short). */
+function firstReadBytes(chars: number): number {
+  return Math.min(MAX_PART_BYTES, Math.max(1024 * 1024, chars * 40));
 }
 
 function xmlText(xml: string): string {
@@ -114,63 +246,91 @@ function xmlText(xml: string): string {
 
 const byNumber = (a: string, b: string) => Number(/(\d+)\.xml$/.exec(a)?.[1] ?? 0) - Number(/(\d+)\.xml$/.exec(b)?.[1] ?? 0);
 
-/** Extracts the text of a Word, Excel or PowerPoint (Office Open XML) file. */
-export async function officeText(bytes: Uint8Array): Promise<string> {
+/**
+ * Reads an entry's XML for `parse`, unpacking more of it while the text falls short of the budget.
+ * Returns the parsed text and whether the entry was only partly read.
+ */
+function readGrowing(bytes: Uint8Array, entry: ZipEntry, budget: Budget, chars: number, parse: (xml: string) => string) {
+  for (let want = firstReadBytes(chars); ; want *= 4) {
+    const { xml, cut } = readEntry(bytes, entry, budget, want);
+    const text = parse(xml);
+    if (!cut || text.length >= chars || want >= MAX_PART_BYTES || budget.partBytes <= 0) {
+      if (cut && text.length < chars) budget.cut(PART_TOO_LARGE);
+      return text;
+    }
+  }
+}
+
+/** Extracts the text of a Word, Excel or PowerPoint (Office Open XML) file, stopping once `maxChars` are collected. */
+export async function readOffice(bytes: Uint8Array, opts: ReadOptions = {}): Promise<ReadResult> {
+  const budget = new Budget(opts.maxChars);
   const entries = zipEntries(bytes);
   const find = (name: string) => entries.find((e) => e.name === name);
-  const read = (entry: ZipEntry) => zipRead(bytes, entry);
+  const read = (entry: ZipEntry) => readEntry(bytes, entry, budget).xml;
 
   const doc = find("word/document.xml");
   if (doc) {
-    const xml = await read(doc);
-    return xmlText(
-      xml
-        .replace(/<w:tab\/>/g, "\t")
-        .replace(/<w:br[^>]*\/>/g, "\n")
-        .replace(/<\/w:p>/g, "\n")
-        .replace(/<\/w:tc>/g, "\t"),
-    ).trim();
+    const text = readGrowing(bytes, doc, budget, budget.chars, (xml) =>
+      xmlText(
+        xml
+          .replace(/<w:tab\/>/g, "\t")
+          .replace(/<w:br[^>]*\/>/g, "\n")
+          .replace(/<\/w:p>/g, "\n")
+          .replace(/<\/w:tc>/g, "\t"),
+      ).trim(),
+    );
+    return budget.result(text, text.length >= budget.chars);
   }
 
+  const parts: string[] = [];
+  let length = 0;
+  const add = (part: string) => {
+    parts.push(part);
+    length += part.length + 2;
+    return length >= budget.chars;
+  };
   const slides = entries.filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.name)).sort((a, b) => byNumber(a.name, b.name));
   if (slides.length) {
-    const parts: string[] = [];
     for (const [i, slide] of slides.entries()) {
-      const xml = await read(slide);
-      parts.push(`--- Slide ${i + 1} ---\n${xmlText(xml.replace(/<\/a:p>/g, "\n")).trim()}`);
+      const text = `--- Slide ${i + 1} ---\n${xmlText(read(slide).replace(/<\/a:p>/g, "\n")).trim()}`;
+      if (add(text)) return budget.result(parts.join("\n\n"), i < slides.length - 1);
     }
-    return parts.join("\n\n");
+    return budget.result(parts.join("\n\n"), false);
   }
 
   const sheets = entries.filter((e) => /^xl\/worksheets\/sheet\d+\.xml$/.test(e.name)).sort((a, b) => byNumber(a.name, b.name));
   if (sheets.length) {
     const sharedEntry = find("xl/sharedStrings.xml");
-    const shared = sharedEntry
-      ? [...(await read(sharedEntry)).matchAll(/<si>([\s\S]*?)<\/si>/g)].map((m) => xmlText(m[1]))
-      : [];
+    const shared = sharedEntry ? [...read(sharedEntry).matchAll(/<si>([\s\S]*?)<\/si>/g)].map((m) => xmlText(m[1])) : [];
     const workbookEntry = find("xl/workbook.xml");
     const names = workbookEntry
-      ? [...(await read(workbookEntry)).matchAll(/<sheet\b[^>]*\bname="([^"]*)"/g)].map((m) => decodeEntities(m[1]))
+      ? [...read(workbookEntry).matchAll(/<sheet\b[^>]*\bname="([^"]*)"/g)].map((m) => decodeEntities(m[1]))
       : [];
-    const parts: string[] = [];
     for (const [i, sheet] of sheets.entries()) {
-      const xml = await read(sheet);
-      const rows = [...xml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)].map((row) =>
-        [...row[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)]
-          .map(([, attrs, inner = ""]) => {
-            const type = /\bt="([^"]+)"/.exec(attrs)?.[1];
-            const value = /<v>([\s\S]*?)<\/v>/.exec(inner)?.[1];
-            if (type === "s" && value !== undefined) return shared[Number(value)] ?? "";
-            if (type === "inlineStr") return xmlText(inner);
-            return value !== undefined ? decodeEntities(value) : "";
-          })
-          .join("\t"),
-      );
-      parts.push(`--- Sheet: ${names[i] ?? i + 1} ---\n${rows.join("\n")}`);
+      const text = readGrowing(bytes, sheet, budget, budget.chars - length, (xml) => {
+        const rows = [...xml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)].map((row) =>
+          [...row[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)]
+            .map(([, attrs, inner = ""]) => {
+              const type = /\bt="([^"]+)"/.exec(attrs)?.[1];
+              const value = /<v>([\s\S]*?)<\/v>/.exec(inner)?.[1];
+              if (type === "s" && value !== undefined) return shared[Number(value)] ?? "";
+              if (type === "inlineStr") return xmlText(inner);
+              return value !== undefined ? decodeEntities(value) : "";
+            })
+            .join("\t"),
+        );
+        return `--- Sheet: ${names[i] ?? i + 1} ---\n${rows.join("\n")}`;
+      });
+      if (add(text)) return budget.result(parts.join("\n\n"), true);
     }
-    return parts.join("\n\n");
+    return budget.result(parts.join("\n\n"), false);
   }
   throw new Error("not a Word, Excel or PowerPoint file");
+}
+
+/** The text of an Office file as one string (with a note when it is incomplete). */
+export async function officeText(bytes: Uint8Array, opts: ReadOptions = {}): Promise<string> {
+  return withNote(await readOffice(bytes, opts));
 }
 
 // ---------- PDF ----------
@@ -225,8 +385,8 @@ function readLiteral(s: string, start: number): { value: string; end: number } {
 /** One token of a content stream: whitespace, comment, string start, array bracket, number, name or operator. */
 const TOKEN = /\s+|%[^\r\n]*|\(|<<|>>|<[0-9A-Fa-f\s]*>|\[|\]|[+-]?(?:\d+\.?\d*|\.\d+)|\/[^\s\/\[\]()<>{}%]*|[A-Za-z'"*]+|[^]/y;
 
-/** Pulls the text drawn by a page content stream (Tj, TJ, ', " operators, with line breaks). */
-function contentText(s: string): string {
+/** Pulls the text drawn by a page content stream (Tj, TJ, ', " operators, with line breaks), up to about `limit` characters. */
+function contentText(s: string, limit = Infinity): string {
   let out = "";
   const operands: (string | number | (string | number)[])[] = [];
   let array: (string | number)[] | undefined;
@@ -235,7 +395,7 @@ function contentText(s: string): string {
     if (out && !out.endsWith("\n")) out += "\n";
   };
   TOKEN.lastIndex = 0;
-  while (TOKEN.lastIndex < s.length) {
+  while (TOKEN.lastIndex < s.length && out.length < limit) {
     const at = TOKEN.lastIndex;
     const m = TOKEN.exec(s);
     if (!m) break;
@@ -285,48 +445,91 @@ function contentText(s: string): string {
 function looksReadable(text: string): boolean {
   const compact = text.replace(/\s+/g, "");
   if (compact.length < 20) return false;
-  const good = compact.match(/[\p{L}\p{N}.,;:'"!?()\-–—\/$%&@#*+=€£¥°§•…’“”]/gu)?.length ?? 0;
+  const good = compact.match(/[\p{L}\p{N}.,;:'"!?()\-–—\/$%&@#*+=€£¥°§•…’“”_|<>[\]{}~^©®™±×÷]/gu)?.length ?? 0;
   return good / compact.length > 0.9;
 }
 
-const PDF_SCAN_LIMIT = 4 * 1024 * 1024;
-const PDF_TEXT_LIMIT = 200_000;
+/** Streams that never hold page text: images, fonts, cross-reference and object streams, metadata, embedded files, color data. */
+const NOT_TEXT_STREAM =
+  /\/Subtype\s*\/(Image|Type1C|CIDFontType0C|OpenType|XML)\b|\/Type\s*\/(XRef|ObjStm|Metadata|EmbeddedFile|CMap)\b|\/(DCT|JPX|CCITTFax|JBIG2)Decode|\/Length[123]\b|\/(FunctionType|ShadingType)\b/;
+
+/** How far before "stream" a stream's dictionary may start. */
+const DICT_WINDOW = 4096;
+
+/** Ends each line without trailing spaces and keeps at most one blank line in a row (linear time). */
+function tidyLines(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 /**
  * Best-effort text extraction for PDFs whose fonts use standard encodings (most generated
- * statements, receipts and letters). Returns undefined when nothing readable comes out, e.g. for
- * scanned pages or fonts with custom glyph encodings.
+ * statements, receipts and letters), stopping once `maxChars` are collected. Returns undefined when
+ * nothing readable comes out, e.g. for scanned pages or fonts with custom glyph encodings.
  */
-export async function pdfText(bytes: Uint8Array): Promise<string | undefined> {
-  const s = Buffer.from(bytes.subarray(0, PDF_SCAN_LIMIT)).toString("latin1");
+export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promise<ReadResult | undefined> {
+  const budget = new Budget(opts.maxChars);
+  const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const parts: string[] = [];
   let total = 0;
-  const streamRe = /stream\r?\n/g;
-  for (let m = streamRe.exec(s); m && total < PDF_TEXT_LIMIT; m = streamRe.exec(s)) {
-    if (s.slice(Math.max(0, m.index - 3), m.index) === "end") continue;
-    const dictStart = s.lastIndexOf("obj", m.index);
-    const dict = s.slice(dictStart < 0 ? Math.max(0, m.index - 600) : dictStart, m.index);
-    const start = m.index + m[0].length;
-    const end = s.indexOf("endstream", start);
+  let stopped = false;
+  let pos = 0;
+  let previousEnd = 0;
+  for (;;) {
+    const at = buf.indexOf("stream", pos, "latin1");
+    if (at < 0) break;
+    pos = at + 6;
+    if (at >= 3 && buf.toString("latin1", at - 3, at) === "end") continue;
+    let start = at + 6;
+    if (buf[start] === 13) start++;
+    if (buf[start] !== 10) continue;
+    start++;
+    const end = buf.indexOf("endstream", start, "latin1");
     if (end < 0) break;
-    streamRe.lastIndex = end + 9;
-    if (/\/Subtype\s*\/Image|\/Type\s*\/(XRef|ObjStm|XObject)|\/(DCT|JPX|CCITTFax|JBIG2)Decode/.test(dict)) continue;
-    let data = Buffer.from(s.slice(start, end).replace(/\r?\n$/, ""), "latin1");
+    // The stream's dictionary: from its "N 0 obj" (looking back a bounded distance) to "stream".
+    const head = buf.toString("latin1", Math.max(previousEnd, at - DICT_WINDOW), at);
+    const dict = head.slice(Math.max(0, head.lastIndexOf("obj")));
+    pos = previousEnd = end + 9;
+    if (NOT_TEXT_STREAM.test(dict)) continue;
+    if (total >= budget.chars) {
+      stopped = true;
+      break;
+    }
+    let data: Buffer = buf.subarray(start, end);
+    if (data.at(-1) === 10) data = data.subarray(0, -1);
+    if (data.at(-1) === 13) data = data.subarray(0, -1);
     if (/\/FlateDecode/.test(dict)) {
+      if (budget.partBytes <= 0) {
+        budget.cut(FILE_TOO_LARGE);
+        break;
+      }
       try {
-        data = Buffer.from(inflate(data, "deflate"));
-      } catch {
+        data = inflate(data, "deflate", budget.partBytes);
+        budget.spend(data.length);
+      } catch (err) {
+        // A stream that unpacks to more than MAX_PART_BYTES is skipped (and noted); damaged ones just skipped.
+        if (isOverLimit(err)) budget.cut(PART_TOO_LARGE);
         continue;
       }
     } else if (/\/Filter/.test(dict)) continue;
     const content = data.toString("latin1");
     if (!/\bBT\b/.test(content) || !/T[jJ]|'|"/.test(content)) continue;
-    const text = contentText(content).trim();
+    const text = contentText(content, budget.chars - total + 1).trim();
     if (text) {
       parts.push(text);
-      total += text.length;
+      total += text.length + 2;
     }
   }
-  const text = parts.join("\n\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-  return looksReadable(text) ? text : undefined;
+  const text = tidyLines(parts.join("\n\n"));
+  return looksReadable(text) ? budget.result(text, stopped || total > budget.chars) : undefined;
+}
+
+/** The text of a PDF as one string (with a note when it is incomplete), or undefined if none is readable. */
+export async function pdfText(bytes: Uint8Array, opts: ReadOptions = {}): Promise<string | undefined> {
+  const result = await readPdf(bytes, opts);
+  return result && withNote(result);
 }
