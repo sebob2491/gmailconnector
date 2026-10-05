@@ -143,6 +143,37 @@ async function fanOut<T extends { nextPageToken?: string }>(
   return { accounts, ...(nextPageToken ? { nextPageToken } : {}) };
 }
 
+/** The newest date shown for a search result thread (its own date, or its latest listed message's). */
+function threadTime(thread: { date?: string; messages?: { date?: string }[] }): number {
+  const times = [thread.date, ...(thread.messages ?? []).map((m) => m.date)]
+    .map((d) => (d ? Date.parse(d) : NaN))
+    .filter((t) => !Number.isNaN(t));
+  return times.length ? Math.max(...times) : -Infinity;
+}
+
+/**
+ * Turns a search of several accounts into one timeline, newest first, each thread saying which
+ * account it's in. Problems with an account (errors, threads Gmail didn't return) and which accounts
+ * have more results move to the top level. Sorting is per page, since each account pages on its own.
+ */
+function mergeTimeline(result: { accounts: Record<string, any>[]; nextPageToken?: string }) {
+  const threads = result.accounts
+    .flatMap((a) => ((a.threads ?? []) as Record<string, any>[]).map((t): Record<string, any> => ({ account: a.account as string, ...t })))
+    .map((thread, order) => ({ thread, order, time: threadTime(thread) }))
+    .sort((x, y) => y.time - x.time || x.order - y.order)
+    .map(({ thread }) => thread);
+  const errors = result.accounts.filter((a) => a.error).map((a) => ({ account: a.account, error: a.error }));
+  const unavailable = result.accounts.filter((a) => a.unavailable).map((a) => ({ account: a.account, ...a.unavailable }));
+  const withMore = result.accounts.filter((a) => a.hasMore).map((a) => a.account);
+  return {
+    threads,
+    ...(errors.length ? { errors } : {}),
+    ...(unavailable.length ? { unavailable } : {}),
+    ...(withMore.length ? { accountsWithMore: withMore } : {}),
+    ...(result.nextPageToken ? { nextPageToken: result.nextPageToken } : {}),
+  };
+}
+
 function ok(value: unknown): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value) }] };
 }
@@ -358,7 +389,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Search email threads",
       description:
-        "Searches email threads in one or all linked Gmail accounts. Without `account`, every linked account is searched and results are grouped by account; pass that account back when opening a thread. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
+        "Searches email threads in one or all linked Gmail accounts. Without `account` (or with \"all\"), every linked account is searched and the results are merged into one `threads` list, newest first, where each thread's `account` says which inbox it's in: mention it to the user, and pass it back when opening the thread. Each account returns up to pageSize threads per page, so the order is newest first within each page; an account's problems are listed under `errors`, and `accountsWithMore` says which accounts have more. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
       inputSchema: {
         account: multiAccountArg,
         query: z.string().optional().describe(SEARCH_QUERY_HELP),
@@ -373,11 +404,12 @@ export function createServer(deps: ServerDeps): McpServer {
       annotations: read,
     },
     async (args) =>
-      run(async () =>
-        fanOut(await router.many(args.account), args.pageToken, (mb, pageToken) =>
+      run(async () => {
+        const result = await fanOut(await router.many(args.account), args.pageToken, (mb, pageToken) =>
           mb.searchThreads({ ...args, pageToken }),
-        ),
-      ),
+        );
+        return "accounts" in result ? mergeTimeline(result) : result;
+      }),
   );
 
   server.registerTool(

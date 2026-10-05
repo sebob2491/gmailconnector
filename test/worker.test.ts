@@ -463,10 +463,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
 
     const search = await callTool("search_threads", {});
     assert.equal(search.isError, false, search.text);
-    const subjects = Object.fromEntries(
-      search.json.accounts.map((a: any) => [a.account, a.threads.map((t: any) => t.subject)]),
-    );
-    assert.deepEqual(subjects, { [PERSONAL]: ["Lunch?"], [WORK]: ["Q3 report"] });
+    const subjects = Object.fromEntries(search.json.threads.map((t: any) => [t.account, t.subject]));
+    assert.deepEqual(subjects, { [PERSONAL]: "Lunch?", [WORK]: "Q3 report" });
 
     const sent = await callTool("reply", { account: WORK, messageId: "w1", body: "Thanks!" });
     assert.equal(sent.isError, false, sent.text);
@@ -572,8 +570,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
     fake.outboundCalls = 0;
     const res = await callTool("search_threads", {});
     assert.equal(res.isError, false, res.text);
-    assert.equal(res.json.accounts.length, 5);
-    assert.ok(res.json.accounts.every((a: any) => !a.error), res.text);
+    assert.ok(Array.isArray(res.json.threads), res.text);
+    assert.equal(res.json.errors, undefined, res.text);
     assert.ok(fake.outboundCalls <= 50, `made ${fake.outboundCalls} outbound calls`);
     // Unlink the extra accounts again for the tests below.
     for (let i = 3; i <= 5; i++) {

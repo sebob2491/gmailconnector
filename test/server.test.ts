@@ -272,18 +272,24 @@ describe("accounts", () => {
 });
 
 describe("search_threads", () => {
-  test("searches every account when `account` is omitted, grouped per account", async () => {
-    const { call, fake } = await setup();
+  test("searches every account when `account` is omitted, merged newest first with each thread's account", async () => {
+    const { call, fake, personal } = await setup();
+    // A reply makes the lunch thread the newest, although its first email is the oldest.
+    fake.deliver(personal, crlf(["From: alice@example.com", `To: ${PERSONAL}`, "Subject: Re: Lunch?", "", "Noon?"]), { id: "p2", threadId: "pt1" });
     const res = await call("search_threads", { query: "report OR lunch" });
     assert.equal(res.isError, false, res.text);
-    const byAccount = Object.fromEntries(res.json.accounts.map((a: any) => [a.account, a]));
-    assert.deepEqual(Object.keys(byAccount).sort(), [WORK, PERSONAL].sort());
-    assert.equal(byAccount[PERSONAL].threads[0].subject, "Lunch?");
+    assert.equal(res.json.accounts, undefined);
     assert.deepEqual(
-      byAccount[WORK].threads.map((t: any) => t.subject),
-      ["Benefits", "Q3 report"],
+      res.json.threads.map((t: any) => [t.account, t.id, t.subject]),
+      [
+        [PERSONAL, "pt1", "Lunch?"],
+        [WORK, "wt2", "Benefits"],
+        [WORK, "wt1", "Q3 report"],
+      ],
     );
-    assert.match(byAccount[WORK].threads[0].viewUrl, /authuser=me%40work\.example#all\/wt2$/);
+    assert.deepEqual(Object.keys(res.json.threads[0]).slice(0, 2), ["account", "id"]);
+    assert.match(res.json.threads[1].viewUrl, /authuser=me%40work\.example#all\/wt2$/);
+    assert.equal(res.json.errors, undefined);
     const qs = fake.requests.filter((r) => r.path === "threads").map((r) => r.query.get("q"));
     assert.deepEqual(qs, ["(report OR lunch) -in:draft", "(report OR lunch) -in:draft"]);
   });
@@ -303,14 +309,13 @@ describe("search_threads", () => {
     work.pageSize = 1;
     const first = await call("search_threads", {});
     assert.ok(first.json.nextPageToken.startsWith("multi:"));
-    const workGroup = first.json.accounts.find((a: any) => a.account === WORK);
-    assert.equal(workGroup.hasMore, true);
-    assert.equal(workGroup.threads.length, 1);
+    assert.deepEqual(first.json.accountsWithMore, [WORK]);
+    assert.equal(first.json.threads.filter((t: any) => t.account === WORK).length, 1);
 
     fake.requests.length = 0;
     const second = await call("search_threads", { pageToken: first.json.nextPageToken });
-    assert.deepEqual(second.json.accounts.map((a: any) => a.account), [WORK]);
-    assert.equal(second.json.accounts[0].threads[0].id, "wt1");
+    assert.deepEqual(second.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt1"]]);
+    assert.equal(second.json.accountsWithMore, undefined);
     assert.equal(second.json.nextPageToken, undefined);
     assert.ok(fake.requests.every((r) => r.email === WORK));
   });
@@ -320,10 +325,10 @@ describe("search_threads", () => {
     fake.revoked.add("rt-personal");
     const res = await call("search_threads", {});
     assert.equal(res.isError, false);
-    const personal = res.json.accounts.find((a: any) => a.account === PERSONAL);
-    const work = res.json.accounts.find((a: any) => a.account === WORK);
-    assert.match(personal.error, /Re-link/);
-    assert.equal(work.threads.length, 2);
+    assert.equal(res.json.errors.length, 1);
+    assert.equal(res.json.errors[0].account, PERSONAL);
+    assert.match(res.json.errors[0].error, /Re-link/);
+    assert.deepEqual(res.json.threads.map((t: any) => t.account), [WORK, WORK]);
   });
 });
 
@@ -806,8 +811,9 @@ describe("fixes from the code review", () => {
     fake.outboundCalls = 0;
     const res = await call("search_threads", {});
     assert.equal(res.isError, false, res.text);
-    assert.equal(res.json.accounts.length, 5);
-    assert.ok(res.json.accounts.every((a: any) => !a.error));
+    assert.equal(res.json.threads.length, 3 + 3 * 20);
+    assert.equal(new Set(res.json.threads.map((t: any) => t.account)).size, 5);
+    assert.equal(res.json.errors, undefined);
     // Cloudflare's free plan allows 50 outgoing calls per request; one call per thread would need ~70 here.
     assert.ok(fake.outboundCalls <= 15, `made ${fake.outboundCalls} calls`);
   });
@@ -1348,20 +1354,17 @@ describe("fixes from the second review", () => {
       for (let t = 0; t < 2; t++) fake.deliver(mb, crlf(["From: s@x.example", `To: ${mb.email}`, `Subject: T${t}`, "", "x"]), { threadId: `${mb === work ? "w" : "p"}x${t}` });
     }
     const page1 = await call("search_threads", {});
-    const workPage1 = page1.json.accounts.find((a: any) => a.account === WORK).threads[0].id;
+    const workPage1 = page1.json.threads.find((t: any) => t.account === WORK).id;
     fake.failAlways.set("threads", 500);
     const failed = await call("search_threads", { pageToken: page1.json.nextPageToken });
-    assert.ok(failed.json.accounts.every((a: any) => a.error && a.hasMore), failed.text);
+    assert.deepEqual(failed.json.errors.map((e: any) => e.account), [PERSONAL, WORK], failed.text);
+    assert.deepEqual(failed.json.accountsWithMore, [PERSONAL, WORK]);
     assert.ok(failed.json.nextPageToken, "the token still continues both accounts");
     fake.failAlways.clear();
     const page2 = await call("search_threads", { pageToken: failed.json.nextPageToken });
-    assert.equal(page2.json.accounts.length, 2);
-    const workPage2 = page2.json.accounts.find((a: any) => a.account === WORK).threads[0].id;
+    assert.deepEqual(page2.json.threads.map((t: any) => t.account).sort(), [PERSONAL, WORK].sort());
+    const workPage2 = page2.json.threads.find((t: any) => t.account === WORK).id;
     assert.notEqual(workPage2, workPage1, "it continues where page 1 stopped");
-    assert.deepEqual(
-      page2.json.accounts.map((a: any) => a.threads.length),
-      [1, 1],
-    );
   });
 
   test("excluding Spam or Trash in a bulk query doesn't pull in the other", async () => {
@@ -1665,6 +1668,21 @@ describe("smaller thread views", () => {
     assert.equal(minimal.json.subject, undefined);
     assert.deepEqual(minimal.json.messages.map((m: any) => m.subject), ["Lunch?", "Re: Lunch?", "Change of plans"]);
     assert.ok(minimal.json.messages.every((m: any) => m.snippet && m.threadId === "pt1"));
+  });
+});
+
+describe("combined search timeline", () => {
+  test("problems with one account are listed at the top, with the account", async () => {
+    const { call, fake } = await setup();
+    fake.failAlways.set("threads/wt1", 429);
+    const res = await call("search_threads", {});
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json.threads.map((t: any) => t.id), ["wt2", "pt1"]);
+    assert.deepEqual(res.json.unavailable, [{ account: WORK, threadIds: ["wt1"], error: res.json.unavailable[0].error }]);
+    assert.match(res.json.unavailable[0].error, /429/);
+    // list_drafts and list_labels stay grouped by account.
+    const drafts = await call("list_drafts", {});
+    assert.ok(Array.isArray(drafts.json.accounts));
   });
 });
 

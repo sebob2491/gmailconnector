@@ -17,7 +17,7 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 | Situation | Behaviour |
 |---|---|
-| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account and groups results by account. The returned `nextPageToken` continues every account at once. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
+| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account. `search_threads` merges the results from all accounts newest first, and each thread says which account it's in; `list_drafts` and `list_labels` group results by account. The returned `nextPageToken` continues every account at once (each account returns a page, so the merged order is newest first within each page). If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
 | Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
 | IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
