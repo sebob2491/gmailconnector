@@ -23,7 +23,7 @@ export const SERVER_VERSION = "0.1.0";
 
 const INSTRUCTIONS = `This server connects several Gmail accounts at once.
 - Call list_accounts to see which accounts are linked (email + optional alias like "work").
-- search_threads, list_drafts and list_labels cover every linked account when \`account\` is omitted, and group results by account.
+- search_threads, list_drafts and list_labels cover every linked account when \`account\` is omitted. search_threads merges the results into one list, newest first, and each thread's \`account\` says which inbox it's in; list_drafts and list_labels group results by account.
 - Message, thread, draft and label IDs belong to one account. When you act on an ID, pass the same \`account\` that returned it.
 - send_message, reply and forward require \`account\` whenever more than one account is linked. If the user has not said which address to send from, ask them.`;
 
