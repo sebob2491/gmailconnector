@@ -9,7 +9,7 @@
  */
 import { Buffer } from "node:buffer";
 import { inflateRawSync, inflateSync } from "node:zlib";
-import { decodeEntities, htmlToText } from "./mime.js";
+import { htmlToText } from "./mime.js";
 
 export type AttachmentKind = "text" | "image" | "pdf" | "office" | "binary";
 
@@ -237,94 +237,581 @@ function readEntry(bytes: Uint8Array, entry: ZipEntry, budget: Budget, want = MA
 
 /** How many bytes of XML to unpack first for `chars` characters of text (more is read when it falls short). */
 function firstReadBytes(chars: number): number {
-  return Math.min(MAX_PART_BYTES, Math.max(1024 * 1024, chars * 40));
+  return Math.min(MAX_PART_BYTES, Math.max(256 * 1024, chars * 16));
 }
 
-function xmlText(xml: string): string {
-  return decodeEntities(xml.replace(/<[^>]+>/g, ""));
+// ---------- XML ----------
+
+const XML_ENTITY = /&(?:#[xX]([0-9a-fA-F]{1,8})|#([0-9]{1,8})|(amp|lt|gt|quot|apos));/g;
+const XML_NAMED: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+/** Decodes XML's five named entities and numeric character references. */
+function decodeXml(text: string): string {
+  if (!text.includes("&")) return text;
+  return text.replace(XML_ENTITY, (match: string, hex: string | undefined, dec: string | undefined, name: string | undefined) => {
+    if (name) return XML_NAMED[name];
+    const code = hex ? parseInt(hex, 16) : parseInt(dec!, 10);
+    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;
+  });
 }
 
-const byNumber = (a: string, b: string) => Number(/(\d+)\.xml$/.exec(a)?.[1] ?? 0) - Number(/(\d+)\.xml$/.exec(b)?.[1] ?? 0);
+/** An element tag; `name` is the local name, without any namespace prefix (`x:row` and `row` are both "row"). */
+interface XmlTag {
+  name: string;
+  close: boolean;
+  empty: boolean;
+  attrs: string;
+}
 
 /**
- * Reads an entry's XML for `parse`, unpacking more of it while the text falls short of the budget.
- * Returns the parsed text and whether the entry was only partly read.
+ * One tag. Attributes must start with white space or "/", and their quoted values may contain ">".
+ * Every part starts with a different character, so a failed match never backtracks more than linearly.
  */
-function readGrowing(bytes: Uint8Array, entry: ZipEntry, budget: Budget, chars: number, parse: (xml: string) => string) {
-  for (let want = firstReadBytes(chars); ; want *= 4) {
-    const { xml, cut } = readEntry(bytes, entry, budget, want);
-    const text = parse(xml);
-    if (!cut || text.length >= chars || want >= MAX_PART_BYTES || budget.partBytes <= 0) {
-      if (cut && text.length < chars) budget.cut(PART_TOO_LARGE);
-      return text;
+const XML_TAG = /<(\/?)([^\s/>!?<"'=]+)((?:[\s/](?:[^<>"']|"[^"]*"|'[^']*')*)?)>/y;
+
+/**
+ * Walks XML in one pass: `onTag` gets each element tag and `onText` each run of character data
+ * (decoded). Either returns true to stop. Malformed markup ends the walk. Linear time.
+ */
+function walkXml(xml: string, onTag: (tag: XmlTag) => boolean | void, onText: (text: string) => boolean | void): void {
+  const n = xml.length;
+  let pos = 0;
+  while (pos < n) {
+    const lt = xml.indexOf("<", pos);
+    const textEnd = lt < 0 ? n : lt;
+    if (textEnd > pos && onText(decodeXml(xml.slice(pos, textEnd)))) return;
+    if (lt < 0) return;
+    if (xml.startsWith("<![CDATA[", lt)) {
+      const end = xml.indexOf("]]>", lt + 9);
+      if (end < 0 || onText(xml.slice(lt + 9, end))) return;
+      pos = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<!--", lt)) {
+      const end = xml.indexOf("-->", lt + 4);
+      if (end < 0) return;
+      pos = end + 3;
+      continue;
+    }
+    const c = xml.charCodeAt(lt + 1);
+    if (c === 33 /* <!DOCTYPE */ || c === 63 /* <?xml */) {
+      const end = xml.indexOf(">", lt);
+      if (end < 0) return;
+      pos = end + 1;
+      continue;
+    }
+    XML_TAG.lastIndex = lt;
+    const m = XML_TAG.exec(xml);
+    if (!m) return;
+    const qname = m[2];
+    if (onTag({ name: qname.slice(qname.indexOf(":") + 1), close: m[1] === "/", empty: m[3].endsWith("/"), attrs: m[3] })) return;
+    pos = lt + m[0].length;
+  }
+}
+
+const attrPatterns = new Map<string, RegExp>();
+
+/** An attribute's decoded value, by local name (any namespace prefix, or none). */
+function attr(attrs: string, name: string): string | undefined {
+  let re = attrPatterns.get(name);
+  if (!re) {
+    re = new RegExp(`(?:^|\\s)(?:[\\w.-]+:)?${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`);
+    attrPatterns.set(name, re);
+  }
+  const m = re.exec(attrs);
+  return m ? decodeXml(m[1] ?? m[2]) : undefined;
+}
+
+/** The relationship id (`r:id`) of an element; unlike `attr`, it needs a prefix, so a plain `id` doesn't match. */
+function relId(attrs: string): string | undefined {
+  const m = /(?:^|\s)[\w.-]+:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(attrs);
+  return m ? decodeXml(m[1] ?? m[2]) : undefined;
+}
+
+// ---------- Office Open XML packages ----------
+
+/** The folder part of a package path, with its trailing "/" ("" at the root). */
+const folderOf = (path: string) => path.slice(0, path.lastIndexOf("/") + 1);
+
+/** Resolves a relationship target against the folder of the part that refers to it. */
+function resolvePath(folder: string, target: string): string {
+  const out: string[] = [];
+  for (const segment of (target.startsWith("/") ? target.slice(1) : folder + target).split("/")) {
+    if (segment === "..") out.pop();
+    else if (segment && segment !== ".") out.push(segment);
+  }
+  return out.join("/");
+}
+
+/** A ZIP-based Office file: parts by name (case-insensitive, as OPC requires) and their relationships. */
+class Package {
+  private readonly parts = new Map<string, ZipEntry>();
+
+  constructor(
+    private readonly bytes: Uint8Array,
+    entries: ZipEntry[],
+    readonly budget: Budget,
+  ) {
+    for (const entry of entries) {
+      const key = entry.name.toLowerCase();
+      if (!this.parts.has(key)) this.parts.set(key, entry);
     }
   }
+
+  entry(path: string): ZipEntry | undefined {
+    return this.parts.get(path.toLowerCase());
+  }
+
+  /** Paths of parts matching `re` (tested against lower-cased names). */
+  find(re: RegExp): string[] {
+    return [...this.parts.keys()].filter((name) => re.test(name));
+  }
+
+  /** Up to `want` bytes of a part's XML; `cut` says it has more. */
+  read(path: string, want = MAX_PART_BYTES): { xml: string; cut: boolean } | undefined {
+    const entry = this.entry(path);
+    return entry && readEntry(this.bytes, entry, this.budget, want);
+  }
+
+  /** A part's relationships: id → target path and type. */
+  rels(path: string): Map<string, { target: string; type: string }> {
+    const out = new Map<string, { target: string; type: string }>();
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    const xml = this.read(`${folderOf(path)}_rels/${name}.rels`)?.xml ?? "";
+    walkXml(
+      xml,
+      (tag) => {
+        if (tag.name !== "Relationship" || tag.close || attr(tag.attrs, "TargetMode") === "External") return;
+        const id = attr(tag.attrs, "Id");
+        const target = attr(tag.attrs, "Target");
+        if (id && target) out.set(id, { target: resolvePath(folderOf(path), target), type: attr(tag.attrs, "Type") ?? "" });
+      },
+      () => {},
+    );
+    return out;
+  }
+
+  /**
+   * Parses a part with `parse(xml, limit)`, unpacking more of it until the parser has `limit`
+   * characters (it says so with `full`) or the part is read. Returns the parser's result.
+   */
+  parseGrowing(path: string, limit: number, parse: (xml: string, limit: number) => Parsed): Parsed {
+    for (let want = firstReadBytes(limit); ; want *= 4) {
+      const part = this.read(path, want);
+      if (!part) return { text: "", full: false };
+      const parsed = parse(part.xml, limit);
+      if (!part.cut || parsed.full || want >= MAX_PART_BYTES || this.budget.partBytes <= 0) {
+        if (part.cut && !parsed.full) this.budget.cut(PART_TOO_LARGE);
+        return parsed;
+      }
+    }
+  }
+}
+
+/** A parser's text, and whether it stopped because it reached its character limit. */
+interface Parsed {
+  text: string;
+  full: boolean;
+}
+
+/** Sorts part names like "slide10.xml" after "slide2.xml". */
+const byNumber = (a: string, b: string) => Number(/(\d+)\.xml$/.exec(a)?.[1] ?? 0) - Number(/(\d+)\.xml$/.exec(b)?.[1] ?? 0);
+
+/** Collects text up to a character limit. */
+class TextSink {
+  readonly parts: string[] = [];
+  length = 0;
+
+  constructor(readonly limit: number) {}
+
+  get full() {
+    return this.length >= this.limit;
+  }
+
+  add(text: string) {
+    this.parts.push(text);
+    this.length += text.length;
+  }
+}
+
+/**
+ * The text of WordprocessingML or DrawingML (Word bodies, PowerPoint slides): only the text runs
+ * (`t`), so deleted text, field codes and drawing coordinates are left out; tabs and line breaks;
+ * table rows as tab-separated cells; and only one branch of each mc:AlternateContent (Word stores
+ * text boxes twice, once as a fallback for old readers).
+ */
+function documentText(xml: string, limit: number): Parsed {
+  const sink = new TextSink(limit);
+  const cells: { parts: string[]; span: number }[] = [];
+  const rows: string[][] = [];
+  let inText = false;
+  let hidden = 0;
+  let tabStops = 0;
+  const put = (s: string) => {
+    const cell = cells.at(-1);
+    if (cell) cell.parts.push(s);
+    else sink.add(s);
+  };
+  walkXml(
+    xml,
+    ({ name, close, empty, attrs }) => {
+      if (name === "Fallback" || name === "del" || name === "moveFrom") {
+        if (!empty) hidden += close ? -1 : 1;
+        return;
+      }
+      if (hidden) return;
+      switch (name) {
+        case "t":
+          inText = !close && !empty;
+          break;
+        case "tabs":
+        case "tabLst":
+          if (!empty) tabStops += close ? -1 : 1;
+          break;
+        case "tab":
+        case "ptab":
+          if (!close && !tabStops) put("\t");
+          break;
+        case "br":
+        case "cr":
+          if (!close) put("\n");
+          break;
+        case "noBreakHyphen":
+          if (!close) put("-");
+          break;
+        case "p":
+          if (close || empty) put(cells.length ? " " : "\n");
+          break;
+        case "tr":
+          if (empty) break;
+          if (!close) rows.push([]);
+          else put(`${(rows.pop() ?? []).join("\t").replace(/\t+$/, "")}\n`);
+          break;
+        case "tc":
+          if (empty) break;
+          if (!close) cells.push({ parts: [], span: 1 });
+          else {
+            const cell = cells.pop();
+            const text = (cell?.parts.join("") ?? "").replace(/\s+/g, " ").trim();
+            const row = rows.at(-1);
+            if (row) row.push(text, ...Array<string>(Math.max(0, (cell?.span ?? 1) - 1)).fill(""));
+            else put(text);
+          }
+          break;
+        case "gridSpan": {
+          const cell = cells.at(-1);
+          if (cell) cell.span = Math.min(64, Math.max(1, Number(attr(attrs, "val")) || 1));
+          break;
+        }
+      }
+      return sink.full;
+    },
+    (text) => {
+      if (inText && !hidden) put(text);
+      return sink.full;
+    },
+  );
+  return { text: tidyLines(sink.parts.join("")), full: sink.full };
+}
+
+// ---------- spreadsheets ----------
+
+type DateKind = "date" | "time" | "datetime" | "duration";
+
+/** Built-in number formats that show dates or times (ids 27-36 and 50-58 are East Asian date formats). */
+function builtinDateKind(id: number): DateKind | undefined {
+  if ((id >= 14 && id <= 17) || (id >= 27 && id <= 31) || id === 36 || (id >= 50 && id <= 54) || id === 57 || id === 58) return "date";
+  if ((id >= 18 && id <= 21) || (id >= 32 && id <= 35) || id === 45 || id === 47 || id === 55 || id === 56) return "time";
+  if (id === 22) return "datetime";
+  if (id === 46) return "duration";
+  return undefined;
+}
+
+/** Whether a custom number format shows a date, a time, both, or an elapsed duration ([h]:mm). */
+function formatDateKind(code: string): DateKind | undefined {
+  const f = code
+    .split(";")[0]
+    .replace(/"[^"]*"/g, "")
+    .replace(/\\./g, "")
+    .replace(/[_*]./g, "")
+    .replace(/\[(?![hms]+\])[^\]]*\]/gi, "");
+  if (/\[[hms]+\]/i.test(f)) return "duration";
+  const date = /[yd]/i.test(f) || /m{3,}/i.test(f);
+  const time = /[hs]/i.test(f) || /am\/pm|a\/p/i.test(f);
+  return date && time ? "datetime" : date ? "date" : time ? "time" : undefined;
+}
+
+const pad = (n: number) => String(n).padStart(2, "0");
+
+/** Shows an Excel serial date/time number as ISO-style text; returns undefined when it isn't a plausible date. */
+function formatSerial(serial: number, kind: DateKind, date1904: boolean): string | undefined {
+  if (!Number.isFinite(serial) || serial < 0 || serial > 2_958_465) return undefined;
+  const seconds = Math.round(serial * 86400);
+  if (kind === "duration") {
+    return `${Math.floor(seconds / 3600)}:${pad(Math.floor(seconds / 60) % 60)}:${pad(seconds % 60)}`;
+  }
+  // Day 1 is 1900-01-01, and Excel counts a 1900-02-29 that never was (day 60).
+  const epoch = date1904 ? Date.UTC(1904, 0, 1) : serial < 60 ? Date.UTC(1899, 11, 31) : Date.UTC(1899, 11, 30);
+  const d = new Date(epoch + seconds * 1000);
+  const date = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+  const time = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}${d.getUTCSeconds() ? `:${pad(d.getUTCSeconds())}` : ""}`;
+  return kind === "date" ? date : kind === "time" ? time : `${date} ${time}`;
+}
+
+/** "C12" → 2 (zero-based column), or undefined. */
+function columnIndex(ref: string | undefined): number | undefined {
+  const letters = ref && /^[A-Za-z]{1,3}/.exec(ref)?.[0];
+  if (!letters) return undefined;
+  let n = 0;
+  for (const ch of letters.toUpperCase()) n = n * 26 + ch.charCodeAt(0) - 64;
+  return n - 1;
+}
+
+/** Cells further right than this are put right after the previous cell instead of padding the row with tabs. */
+const MAX_COLUMN_GAP = 200;
+/** Up to this many missing rows become blank lines; longer gaps get one line saying so. */
+const MAX_BLANK_ROWS = 10;
+
+interface SheetContext {
+  shared(index: number): string | undefined;
+  dateKinds: (DateKind | undefined)[];
+  date1904: boolean;
+}
+
+/** Cell text as Excel shows it (dates formatted, booleans as TRUE/FALSE), on one line. */
+function cellText(type: string | undefined, value: string, inline: string, style: number, ctx: SheetContext): string {
+  let text: string;
+  if (type === "s") text = value.trim() === "" ? "" : (ctx.shared(Number(value)) ?? "");
+  else if (type === "inlineStr") text = inline;
+  else if (type === "b") text = value.trim() === "1" ? "TRUE" : value.trim() === "0" ? "FALSE" : value;
+  else if (type === "str" || type === "e" || type === "d") text = value;
+  else {
+    const n = Number(value);
+    const kind = ctx.dateKinds[style];
+    text = value.trim() === "" || Number.isNaN(n) ? value : ((kind && formatSerial(n, kind, ctx.date1904)) ?? String(Number(n.toPrecision(15))));
+  }
+  return text.replace(/[\t\r\n]+/g, " ");
+}
+
+/** A worksheet as tab-separated rows, each cell in its column (Excel leaves empty cells out of the file). */
+function sheetText(xml: string, limit: number, ctx: SheetContext): Parsed {
+  const sink = new TextSink(limit);
+  let lastRow = 0;
+  let row = 0;
+  let cells: string[] = [];
+  let nextColumn = 0;
+  let cell: { column: number; type?: string; style: number; value: string; inline: string[] } | undefined;
+  let inValue = false;
+  let inInline = false;
+  let inText = false;
+  let phonetic = 0;
+  const flushRow = () => {
+    const gap = row - lastRow - 1;
+    if (gap > MAX_BLANK_ROWS) sink.add(`(rows ${lastRow + 1}–${row - 1} are empty)\n`);
+    else if (gap > 0) sink.add("\n".repeat(gap));
+    sink.add(`${Array.from(cells, (c) => c ?? "").join("\t").replace(/\t+$/, "")}\n`);
+    lastRow = row;
+  };
+  walkXml(
+    xml,
+    ({ name, close, empty, attrs }) => {
+      switch (name) {
+        case "row":
+          if (close) flushRow();
+          else {
+            row = Number(attr(attrs, "r")) || row + 1;
+            cells = [];
+            nextColumn = 0;
+            if (empty) flushRow();
+          }
+          break;
+        case "c":
+          if (close) {
+            if (cell) {
+              cells[cell.column] = cellText(cell.type, cell.value, cell.inline.join(""), cell.style, ctx);
+              nextColumn = cell.column + 1;
+            }
+            cell = undefined;
+          } else {
+            const column = columnIndex(attr(attrs, "r"));
+            const at = column !== undefined && column >= nextColumn && column - nextColumn <= MAX_COLUMN_GAP ? column : nextColumn;
+            if (empty) nextColumn = at + 1;
+            else cell = { column: at, type: attr(attrs, "t"), style: Number(attr(attrs, "s") ?? 0), value: "", inline: [] };
+          }
+          break;
+        case "v":
+          inValue = !close && !empty;
+          break;
+        case "is":
+          inInline = !close && !empty;
+          break;
+        case "t":
+          inText = !close && !empty;
+          break;
+        case "rPh":
+          if (!empty) phonetic += close ? -1 : 1;
+          break;
+      }
+      return sink.full;
+    },
+    (text) => {
+      if (!cell) return;
+      if (inValue) cell.value += text;
+      else if (inInline && inText && !phonetic) cell.inline.push(text);
+    },
+  );
+  return { text: sink.parts.join("").replace(/\n+$/, ""), full: sink.full };
+}
+
+/** The shared strings table, without phonetic guides (<rPh>, e.g. Japanese furigana). */
+function sharedStrings(xml: string): string[] {
+  const out: string[] = [];
+  let current: string[] | undefined;
+  let inText = false;
+  let phonetic = 0;
+  walkXml(
+    xml,
+    ({ name, close, empty }) => {
+      if (name === "si") {
+        if (empty) out.push("");
+        else if (close) {
+          out.push(current?.join("") ?? "");
+          current = undefined;
+        } else current = [];
+      } else if (name === "t") inText = !close && !empty;
+      else if (name === "rPh" && !empty) phonetic += close ? -1 : 1;
+    },
+    (text) => {
+      if (current && inText && !phonetic) current.push(text);
+    },
+  );
+  return out;
+}
+
+/** Which cell styles (by index) show dates or times. */
+function dateStyles(xml: string): (DateKind | undefined)[] {
+  const custom = new Map<number, DateKind | undefined>();
+  const kinds: (DateKind | undefined)[] = [];
+  let inCellXfs = false;
+  walkXml(
+    xml,
+    ({ name, close, empty, attrs }) => {
+      if (name === "numFmt" && !close) custom.set(Number(attr(attrs, "numFmtId")), formatDateKind(attr(attrs, "formatCode") ?? ""));
+      else if (name === "cellXfs" && !empty) inCellXfs = !close;
+      else if (name === "xf" && inCellXfs && !close) {
+        const id = Number(attr(attrs, "numFmtId") ?? 0);
+        kinds.push(custom.has(id) ? custom.get(id) : builtinDateKind(id));
+      }
+    },
+    () => {},
+  );
+  return kinds;
+}
+
+function readWorkbook(pkg: Package, workbookPath: string): ReadResult {
+  const { budget } = pkg;
+  const rels = pkg.rels(workbookPath);
+  const relOfType = (type: string) => [...rels.values()].find((r) => r.type.endsWith(`/${type}`))?.target;
+  const listed: { name: string; rel?: { target: string; type: string } }[] = [];
+  let date1904 = false;
+  walkXml(
+    pkg.read(workbookPath)?.xml ?? "",
+    ({ name, close, attrs }) => {
+      if (close) return;
+      if (name === "workbookPr") date1904 = /^(1|true)$/i.test(attr(attrs, "date1904") ?? "");
+      if (name !== "sheet") return;
+      const state = attr(attrs, "state");
+      const label = `${attr(attrs, "name") ?? listed.length + 1}${state && state !== "visible" ? " (hidden)" : ""}`;
+      listed.push({ name: label, rel: rels.get(relId(attrs) ?? "") });
+    },
+    () => {},
+  );
+  // Sheets in workbook order, found through the workbook's relationships. Chart and dialog sheets have no cells.
+  const sheets = listed
+    .filter((s) => s.rel?.type.endsWith("/worksheet"))
+    .map((s) => ({ name: s.name, path: s.rel!.target }));
+  if (!rels.size) {
+    // No relationships (not written by Office): match sheet files to names by position.
+    for (const [i, path] of pkg.find(/^xl\/worksheets\/sheet\d+\.xml$/).sort(byNumber).entries()) {
+      sheets.push({ name: listed[i]?.name ?? String(i + 1), path });
+    }
+  }
+
+  const sharedPath = relOfType("sharedStrings") ?? "xl/sharedStrings.xml";
+  let shared: string[] = [];
+  let sharedWant = 128 * 1024;
+  let sharedCut = true;
+  const loadShared = () => {
+    const part = pkg.read(sharedPath, (sharedWant *= 2));
+    shared = part ? sharedStrings(part.xml) : [];
+    sharedCut = Boolean(part?.cut);
+  };
+  const stylesXml = pkg.read(relOfType("styles") ?? "xl/styles.xml")?.xml;
+  const ctx: SheetContext = {
+    shared(index) {
+      // The table is read only as far as needed; read more of it when a cell points further.
+      while (index >= shared.length && sharedCut && sharedWant < MAX_PART_BYTES && budget.partBytes > 0) loadShared();
+      if (index >= shared.length && sharedCut) budget.cut(PART_TOO_LARGE);
+      return shared[index];
+    },
+    dateKinds: stylesXml ? dateStyles(stylesXml) : [],
+    date1904,
+  };
+  loadShared();
+
+  const parts: string[] = [];
+  let length = 0;
+  for (const [i, sheet] of sheets.entries()) {
+    const { text, full } = pkg.parseGrowing(sheet.path, budget.chars - length, (xml, max) => sheetText(xml, max, ctx));
+    const part = `--- Sheet: ${sheet.name} ---\n${text}`;
+    parts.push(part);
+    length += part.length + 2;
+    if (full) return budget.result(parts.join("\n\n"), true);
+    if (length >= budget.chars) return budget.result(parts.join("\n\n"), i < sheets.length - 1);
+  }
+  return budget.result(parts.join("\n\n"), false);
+}
+
+function readPresentation(pkg: Package, presentationPath: string): ReadResult {
+  const { budget } = pkg;
+  const rels = pkg.rels(presentationPath);
+  const slides: string[] = [];
+  walkXml(
+    pkg.read(presentationPath)?.xml ?? "",
+    ({ name, close, attrs }) => {
+      const rel = name === "sldId" && !close ? rels.get(relId(attrs) ?? "") : undefined;
+      if (rel) slides.push(rel.target);
+    },
+    () => {},
+  );
+  if (!slides.length) slides.push(...pkg.find(/^ppt\/slides\/slide\d+\.xml$/).sort(byNumber));
+  const parts: string[] = [];
+  let length = 0;
+  for (const [i, path] of slides.entries()) {
+    const { text, full } = pkg.parseGrowing(path, budget.chars - length, documentText);
+    const part = `--- Slide ${i + 1} ---\n${text}`;
+    parts.push(part);
+    length += part.length + 2;
+    if (full || length >= budget.chars) return budget.result(parts.join("\n\n"), full || i < slides.length - 1);
+  }
+  return budget.result(parts.join("\n\n"), false);
 }
 
 /** Extracts the text of a Word, Excel or PowerPoint (Office Open XML) file, stopping once `maxChars` are collected. */
 export async function readOffice(bytes: Uint8Array, opts: ReadOptions = {}): Promise<ReadResult> {
-  const budget = new Budget(opts.maxChars);
-  const entries = zipEntries(bytes);
-  const find = (name: string) => entries.find((e) => e.name === name);
-  const read = (entry: ZipEntry) => readEntry(bytes, entry, budget).xml;
-
-  const doc = find("word/document.xml");
-  if (doc) {
-    const text = readGrowing(bytes, doc, budget, budget.chars, (xml) =>
-      xmlText(
-        xml
-          .replace(/<w:tab\/>/g, "\t")
-          .replace(/<w:br[^>]*\/>/g, "\n")
-          .replace(/<\/w:p>/g, "\n")
-          .replace(/<\/w:tc>/g, "\t"),
-      ).trim(),
-    );
-    return budget.result(text, text.length >= budget.chars);
+  const pkg = new Package(bytes, zipEntries(bytes), new Budget(opts.maxChars));
+  // The package's own relationships name its main part (usually word/document.xml, xl/workbook.xml or ppt/presentation.xml).
+  const main = [...pkg.rels("").values()].find((r) => r.type.endsWith("/officeDocument"))?.target;
+  const has = (path: string | undefined): path is string => Boolean(path && pkg.entry(path));
+  const word = has(main) && main.startsWith("word/") ? main : has("word/document.xml") ? "word/document.xml" : undefined;
+  if (word) {
+    const { text, full } = pkg.parseGrowing(word, pkg.budget.chars, documentText);
+    return pkg.budget.result(text, full);
   }
-
-  const parts: string[] = [];
-  let length = 0;
-  const add = (part: string) => {
-    parts.push(part);
-    length += part.length + 2;
-    return length >= budget.chars;
-  };
-  const slides = entries.filter((e) => /^ppt\/slides\/slide\d+\.xml$/.test(e.name)).sort((a, b) => byNumber(a.name, b.name));
-  if (slides.length) {
-    for (const [i, slide] of slides.entries()) {
-      const text = `--- Slide ${i + 1} ---\n${xmlText(read(slide).replace(/<\/a:p>/g, "\n")).trim()}`;
-      if (add(text)) return budget.result(parts.join("\n\n"), i < slides.length - 1);
-    }
-    return budget.result(parts.join("\n\n"), false);
-  }
-
-  const sheets = entries.filter((e) => /^xl\/worksheets\/sheet\d+\.xml$/.test(e.name)).sort((a, b) => byNumber(a.name, b.name));
-  if (sheets.length) {
-    const sharedEntry = find("xl/sharedStrings.xml");
-    const shared = sharedEntry ? [...read(sharedEntry).matchAll(/<si>([\s\S]*?)<\/si>/g)].map((m) => xmlText(m[1])) : [];
-    const workbookEntry = find("xl/workbook.xml");
-    const names = workbookEntry
-      ? [...read(workbookEntry).matchAll(/<sheet\b[^>]*\bname="([^"]*)"/g)].map((m) => decodeEntities(m[1]))
-      : [];
-    for (const [i, sheet] of sheets.entries()) {
-      const text = readGrowing(bytes, sheet, budget, budget.chars - length, (xml) => {
-        const rows = [...xml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)].map((row) =>
-          [...row[1].matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)]
-            .map(([, attrs, inner = ""]) => {
-              const type = /\bt="([^"]+)"/.exec(attrs)?.[1];
-              const value = /<v>([\s\S]*?)<\/v>/.exec(inner)?.[1];
-              if (type === "s" && value !== undefined) return shared[Number(value)] ?? "";
-              if (type === "inlineStr") return xmlText(inner);
-              return value !== undefined ? decodeEntities(value) : "";
-            })
-            .join("\t"),
-        );
-        return `--- Sheet: ${names[i] ?? i + 1} ---\n${rows.join("\n")}`;
-      });
-      if (add(text)) return budget.result(parts.join("\n\n"), true);
-    }
-    return budget.result(parts.join("\n\n"), false);
-  }
+  const workbook = has(main) && main.startsWith("xl/") ? main : "xl/workbook.xml";
+  if (has(workbook) || pkg.find(/^xl\/worksheets\/sheet\d+\.xml$/).length) return readWorkbook(pkg, workbook);
+  const presentation = has(main) && main.startsWith("ppt/") ? main : "ppt/presentation.xml";
+  if (has(presentation) || pkg.find(/^ppt\/slides\/slide\d+\.xml$/).length) return readPresentation(pkg, presentation);
   throw new Error("not a Word, Excel or PowerPoint file");
 }
 

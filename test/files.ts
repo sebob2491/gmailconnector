@@ -118,3 +118,45 @@ export const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
   "base64",
 );
+
+const REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+/**
+ * An Excel workbook laid out like Excel writes it: workbook relationships, optional shared strings
+ * and styles. Sheets give their <sheetData> content; chart sheets have none.
+ */
+export function xlsxOf(opts: {
+  sheets: { name: string; data?: string; chart?: boolean; state?: string }[];
+  shared?: string[];
+  styles?: string;
+  prefix?: string;
+  date1904?: boolean;
+}): Buffer {
+  const x = opts.prefix ? `${opts.prefix}:` : "";
+  const ns = opts.prefix ? `xmlns:${opts.prefix}` : "xmlns";
+  const files: Record<string, string> = {
+    "_rels/.rels": `<Relationships><Relationship Id="rId1" Type="${REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+  };
+  const rels: string[] = [];
+  const sheets = opts.sheets.map((sheet, i) => {
+    const id = `rId${i + 1}`;
+    const target = sheet.chart ? `chartsheets/sheet${i + 1}.xml` : `worksheets/sheet${i + 1}.xml`;
+    rels.push(`<Relationship Id="${id}" Type="${REL}/${sheet.chart ? "chartsheet" : "worksheet"}" Target="${target}"/>`);
+    files[`xl/${target}`] = sheet.chart
+      ? "<chartsheet/>"
+      : `<${x}worksheet ${ns}="main"><${x}sheetData>${sheet.data ?? ""}</${x}sheetData></${x}worksheet>`;
+    return `<${x}sheet name="${sheet.name}" sheetId="${i + 1}"${sheet.state ? ` state="${sheet.state}"` : ""} r:id="${id}"/>`;
+  });
+  if (opts.shared) {
+    rels.push(`<Relationship Id="rIdS" Type="${REL}/sharedStrings" Target="sharedStrings.xml"/>`);
+    files["xl/sharedStrings.xml"] = `<${x}sst ${ns}="main">${opts.shared.map((s) => (s === "" ? `<${x}si/>` : `<${x}si>${s}</${x}si>`)).join("")}</${x}sst>`;
+  }
+  if (opts.styles) {
+    rels.push(`<Relationship Id="rIdT" Type="${REL}/styles" Target="styles.xml"/>`);
+    files["xl/styles.xml"] = `<styleSheet>${opts.styles}</styleSheet>`;
+  }
+  files["xl/workbook.xml"] =
+    `<${x}workbook ${ns}="main" xmlns:r="${REL}">${opts.date1904 ? `<${x}workbookPr date1904="1"/>` : ""}<${x}sheets>${sheets.join("")}</${x}sheets></${x}workbook>`;
+  files["xl/_rels/workbook.xml.rels"] = `<Relationships>${rels.join("")}</Relationships>`;
+  return zip(files);
+}

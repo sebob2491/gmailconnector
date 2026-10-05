@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, sniffType } from "../src/attachments.js";
-import { docx, docxOf, pdf, pdfOf, png, pptx, xlsx, zipOf } from "./files.js";
+import { docx, docxOf, pdf, pdfOf, png, pptx, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
   const file = pdf([
@@ -151,4 +151,134 @@ test("hostile PDFs are read in linear time", async () => {
     const r = await timed(() => readPdf(file));
     assert.ok(r.ms < 200, `${name}: ${r.ms.toFixed(0)} ms`);
   }
+});
+
+// ---------- spreadsheets ----------
+
+test("spreadsheet cells keep their columns and rows, including gaps", async () => {
+  const file = xlsxOf({
+    shared: ["<t>Name</t>", "<t>Phone</t>", "<t>Email</t>", "<t>Ann</t>", "<t>ann@x.com</t>"],
+    sheets: [
+      {
+        name: "People",
+        // Excel leaves empty cells out: B2 is missing, row 3 is missing, row 4 starts at column B.
+        data:
+          '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>' +
+          '<row r="2"><c r="A2" t="s"><v>3</v></c><c r="C2" t="s"><v>4</v></c></row>' +
+          '<row r="4"><c r="B4" s="2"/><c r="C4"><v>7</v></c></row>' +
+          '<row r="40"><c r="A40" t="inlineStr"><is><t>Total</t></is></c></row>',
+      },
+    ],
+  });
+  assert.equal(
+    await officeText(file),
+    "--- Sheet: People ---\nName\tPhone\tEmail\nAnn\t\tann@x.com\n\n\t\t7\n(rows 5–39 are empty)\nTotal",
+  );
+});
+
+test("spreadsheet values look like they do in Excel", async () => {
+  const file = xlsxOf({
+    styles:
+      '<numFmts><numFmt numFmtId="164" formatCode="yyyy\\-mm\\-dd\\ hh:mm"/><numFmt numFmtId="165" formatCode="&quot;$&quot;#,##0.00"/></numFmts>' +
+      '<cellStyleXfs><xf numFmtId="14"/></cellStyleXfs>' +
+      '<cellXfs><xf numFmtId="0"/><xf numFmtId="14"/><xf numFmtId="164"/><xf numFmtId="165"/><xf numFmtId="20"/><xf numFmtId="46"/></cellXfs>',
+    sheets: [
+      {
+        name: "Values",
+        data:
+          '<row r="1"><c r="A1" s="1"><v>45566</v></c><c r="B1" s="2"><v>45566.5625</v></c><c r="C1" s="3"><v>1234.5</v></c>' +
+          '<c r="D1" s="4"><v>0.75</v></c><c r="E1" s="5"><v>1.5</v></c><c r="F1"><v>0.30000000000000004</v></c>' +
+          '<c r="G1" t="b"><v>1</v></c><c r="H1" t="b"><v>0</v></c><c r="I1" t="e"><v>#DIV/0!</v></c>' +
+          '<c r="J1" t="str"><f>A1&amp;"x"</f><v>a &amp; b</v></c></row>',
+      },
+    ],
+  });
+  assert.equal(
+    await officeText(file),
+    "--- Sheet: Values ---\n2024-10-01\t2024-10-01 13:30\t1234.5\t18:00\t36:00:00\t0.3\tTRUE\tFALSE\t#DIV/0!\ta & b",
+  );
+  // Workbooks using the 1904 date system.
+  const mac = xlsxOf({ date1904: true, styles: '<cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs>', sheets: [{ name: "S", data: '<row r="1"><c r="A1" s="1"><v>0</v></c></row>' }] });
+  assert.equal(await officeText(mac), "--- Sheet: S ---\n1904-01-01");
+});
+
+test("spreadsheet sheets are named through the workbook's relationships", async () => {
+  const file = xlsxOf({
+    shared: ['<t>東京</t><rPh sb="0" eb="2"><t>トウキョウ</t></rPh><phoneticPr fontId="1"/>', "", '<r><rPr><b/></rPr><t>Bold</t></r><r><t xml:space="preserve"> rest</t></r>'],
+    sheets: [
+      { name: "Data", data: '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>' },
+      { name: "Chart1", chart: true },
+      { name: "Summary", data: '<row r="1"><c r="A1" t="inlineStr"><is><t>summary</t></is></c></row>' },
+      { name: "Old &amp; hidden", state: "hidden", data: '<row r="1"><c r="A1"><v>1</v></c></row>' },
+    ],
+  });
+  // Phonetic guides are left out, empty shared strings keep later ones in place, chart sheets are skipped.
+  assert.equal(
+    await officeText(file),
+    "--- Sheet: Data ---\n東京\t\tBold rest\n\n--- Sheet: Summary ---\nsummary\n\n--- Sheet: Old & hidden (hidden) ---\n1",
+  );
+  // Files that put a namespace prefix on every element (e.g. from the Open XML SDK).
+  const prefixed = xlsxOf({
+    prefix: "x",
+    shared: ["<x:t>Total</x:t>"],
+    sheets: [{ name: "Report", data: '<x:row r="1"><x:c r="A1" t="s"><x:v>0</x:v></x:c><x:c r="B1"><x:v>42</x:v></x:c></x:row>' }],
+  });
+  assert.equal(await officeText(prefixed), "--- Sheet: Report ---\nTotal\t42");
+});
+
+test("big spreadsheets stop after maxChars, mid-sheet", async () => {
+  const rows = Array.from({ length: 50_000 }, (_, r) => `<row r="${r + 1}"><c r="A${r + 1}" t="inlineStr"><is><t>Customer ${r}</t></is></c><c r="B${r + 1}"><v>${r * 7.25}</v></c></row>`);
+  const file = xlsxOf({ sheets: [{ name: "Big", data: rows.join("") }, { name: "Next", data: "" }] });
+  const r = await timed(() => readOffice(file, { maxChars: 20_000 }));
+  assert.equal(r.value!.more, true);
+  assert.ok(r.value!.text.length >= 20_000 && r.value!.text.length < 21_000, String(r.value!.text.length));
+  assert.ok(r.ms < 200, `took ${r.ms.toFixed(0)} ms`);
+});
+
+// ---------- Word and PowerPoint ----------
+
+const wp = (text: string) => `<w:p><w:r><w:t xml:space="preserve">${text}</w:t></w:r></w:p>`;
+const wcell = (text: string, span = 1) => `<w:tc><w:tcPr>${span > 1 ? `<w:gridSpan w:val="${span}"/>` : ""}</w:tcPr>${wp(text)}</w:tc>`;
+
+test("Word tables come out as tab-separated rows", async () => {
+  const table =
+    `<w:tbl><w:tr>${wcell("Item")}${wcell("Qty")}${wcell("Price")}</w:tr>` +
+    `<w:tr>${wcell("Tea")}<w:tc>${wp("2")}${wp("boxes")}</w:tc>${wcell("3.50")}</w:tr>` +
+    `<w:tr>${wcell("Total", 2)}${wcell("7.00")}</w:tr></w:tbl>`;
+  assert.equal(await officeText(docxOf(`${wp("Before")}${table}${wp("After")}`)), "Before\nItem\tQty\tPrice\nTea\t2 boxes\t3.50\nTotal\t\t7.00\nAfter");
+});
+
+test("Word text leaves out fallbacks, deletions, field codes and drawing numbers", async () => {
+  const textBox = `<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><wp:positionH><wp:posOffset>1905000</wp:posOffset></wp:positionH><wps:txbx><w:txbxContent>${wp(
+    "Boxed text",
+  )}</w:txbxContent></wps:txbx></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:textbox><w:txbxContent>${wp("Boxed text")}</w:txbxContent></v:textbox></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>`;
+  const edits =
+    '<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr><w:r><w:t xml:space="preserve">Price is </w:t></w:r>' +
+    '<w:del w:id="1" w:author="A"><w:r><w:delText>$100</w:delText></w:r></w:del><w:ins w:id="2" w:author="A"><w:r><w:t>$80</w:t></w:r></w:ins>' +
+    '<w:r><w:tab/><w:t>net</w:t><w:br/><w:t>30 days</w:t></w:r></w:p>' +
+    '<w:p><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> HYPERLINK "https://x.com" </w:instrText></w:r>' +
+    '<w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>our site</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>';
+  assert.equal(await officeText(docxOf(textBox + edits)), "Boxed text\n\nPrice is $80\tnet\n30 days\nour site");
+});
+
+test("Word's main document is found through the package relationships", async () => {
+  const file = zip({
+    "_rels/.rels": '<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="/word/document2.xml"/></Relationships>',
+    "word/document2.xml": `<w:document><w:body>${wp("From document2")}</w:body></w:document>`,
+  });
+  assert.equal(await officeText(file), "From document2");
+});
+
+test("PowerPoint keeps line breaks and follows the presentation's slide order", async () => {
+  const slide = (body: string) => `<p:sld><p:cSld><p:spTree><p:sp><p:txBody>${body}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>`;
+  const rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const file = zip({
+    "_rels/.rels": `<Relationships><Relationship Id="rId1" Type="${rel}/officeDocument" Target="ppt/presentation.xml"/></Relationships>`,
+    // Slides moved around in PowerPoint keep their file names; the order lives in presentation.xml.
+    "ppt/presentation.xml": '<p:presentation><p:sldIdLst><p:sldId id="257" r:id="rId3"/><p:sldId id="256" r:id="rId2"/></p:sldIdLst></p:presentation>',
+    "ppt/_rels/presentation.xml.rels": `<Relationships><Relationship Id="rId2" Type="${rel}/slide" Target="slides/slide1.xml"/><Relationship Id="rId3" Type="${rel}/slide" Target="slides/slide2.xml"/></Relationships>`,
+    "ppt/slides/slide1.xml": slide('<a:p><a:r><a:t>Quarterly</a:t></a:r><a:br><a:rPr lang="en-US"/></a:br><a:r><a:t>Results</a:t></a:r></a:p>'),
+    "ppt/slides/slide2.xml": slide('<a:p><a:pPr><a:tabLst><a:tab pos="914400" algn="l"/></a:tabLst></a:pPr><a:r><a:t>Agenda</a:t></a:r></a:p>'),
+  });
+  assert.equal(await officeText(file), "--- Slide 1 ---\nAgenda\n\n--- Slide 2 ---\nQuarterly\nResults");
 });
