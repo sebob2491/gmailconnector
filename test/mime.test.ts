@@ -87,6 +87,58 @@ test("htmlToText keeps structure, links and entities readable", () => {
   );
 });
 
+test("htmlToText lays text out like a browser", () => {
+  // <br> and <hr> with attributes (Apple Mail's <br class="">, Gmail's <br clear="all">).
+  assert.equal(htmlToText('Line one<br class="">Line two<br clear="all">Three<hr style="x">Four'), "Line one\nLine two\nThree\nFour");
+  // Source line breaks and indentation inside text are just spaces; <pre> keeps them.
+  assert.equal(htmlToText("<p>Thanks for the\n   update, see you\non Monday.</p>"), "Thanks for the update, see you on Monday.");
+  assert.equal(htmlToText("<p>Output:</p><pre>\nname    qty\n  tea     2</pre>Done"), "Output:\n\nname    qty\n  tea     2\n\nDone");
+  // Ordered lists are numbered, nested lists stay together, table cells are tab-separated.
+  assert.equal(htmlToText("<ol><li>One<ul><li>a</li></ul></li><li>Two</li></ol>"), "1. One\n- a\n2. Two");
+  assert.equal(htmlToText("<table><tr><td>Item</td><td>Price</td></tr><tr><td>Tea</td><td>3</td></tr></table>"), "Item\tPrice\nTea\t3");
+  // Hidden content, including unterminated comments and scripts, never shows.
+  assert.equal(htmlToText('<title>T</title><script>var s = "</p>";</script>Shown<style>p{}</style><!-- hidden'), "Shown");
+  // A "<" that doesn't start a tag is text.
+  assert.equal(htmlToText("<p>if a < b and 1<2</p>"), "if a < b and 1<2");
+});
+
+test("htmlToText decodes entities fully and safely", () => {
+  assert.equal(htmlToText("F&uuml;r Sie: Caf&eacute; &Agrave; &rarr; &hearts; &alpha;&Omega; &euro;5 &frac12;"), "Für Sie: Café À → ♥ αΩ €5 ½");
+  // Numeric references in the Windows-1252 range, and legacy references without ";".
+  assert.equal(htmlToText("&#147;Hi&#148; it&#146;s &copy 2024 &amp more"), "“Hi” it’s © 2024 & more");
+  // Unknown names stay as written; object prototype names are not entities.
+  assert.equal(htmlToText("&constructor; &toString; &bogus;"), "&constructor; &toString; &bogus;");
+  // Emoji sequences keep their zero-width joiners.
+  assert.equal(htmlToText("&#x1F468;&zwj;&#x1F469;&zwj;&#x1F467;"), "👨‍👩‍👧");
+});
+
+test("htmlToText keeps link addresses, including unusual ones", () => {
+  assert.equal(htmlToText(`<a href="https://x.com/it's/page">Page</a>`), "Page (https://x.com/it's/page)");
+  assert.equal(htmlToText("<a href=https://x.com/page?a=1&amp;b=2>Page</a>"), "Page (https://x.com/page?a=1&b=2)");
+  assert.equal(htmlToText('<a href="https://shop.example/x"><img src="b.png" alt="Shop now"></a>'), "Shop now (https://shop.example/x)");
+  assert.equal(htmlToText('<a href="https://shop.example/x"><img src="b.png"></a>'), "https://shop.example/x");
+  assert.equal(htmlToText('<a href="https://x.com">https://x.com</a> <a href="#top">Top</a>'), "https://x.com Top");
+});
+
+test("htmlToText stays fast on hostile HTML", () => {
+  const inputs = {
+    "unclosed attributes": '<a href="x" '.repeat(20_000),
+    "unclosed links": '<a href="x">'.repeat(20_000),
+    "unterminated comments": "<!--".repeat(50_000),
+    "unterminated styles": "<style>".repeat(50_000),
+    "stray brackets": "<x ".repeat(50_000),
+    "long space run": `a${" ".repeat(200_000)}b`,
+    "no-break space run": `a${"&nbsp;".repeat(50_000)}b`,
+    "unclosed quotes": '<x a="'.repeat(50_000),
+  };
+  for (const [name, html] of Object.entries(inputs)) {
+    const start = performance.now();
+    htmlToText(html);
+    const ms = performance.now() - start;
+    assert.ok(ms < 200, `${name}: ${ms.toFixed(0)} ms`);
+  }
+});
+
 test("attachment content given as a data: URL is accepted", () => {
   assert.equal(decodeBase64("data:text/plain;base64,aGVsbG8=").toString(), "hello");
 });

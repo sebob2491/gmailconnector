@@ -220,49 +220,79 @@ export function decodeBase64(content: string): Buffer {
   return Buffer.from(normalized, "base64");
 }
 
-const ENTITIES: Record<string, string> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-  ensp: " ",
-  emsp: " ",
-  thinsp: " ",
-  zwnj: "",
-  zwj: "",
-  shy: "",
-  copy: "©",
-  reg: "®",
-  trade: "™",
-  hellip: "…",
-  mdash: "—",
-  ndash: "–",
-  lsquo: "‘",
-  rsquo: "’",
-  ldquo: "“",
-  rdquo: "”",
-  laquo: "«",
-  raquo: "»",
-  bull: "•",
-  middot: "·",
-  times: "×",
-  divide: "÷",
-  deg: "°",
-  euro: "€",
-  pound: "£",
-  yen: "¥",
-  cent: "¢",
+// ---------- HTML entities ----------
+
+/** Names for U+00A0…U+00FF, in order (HTML's Latin-1 entities). */
+const LATIN1_NAMES =
+  "nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn sup2 sup3 acute micro para " +
+  "middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest Agrave Aacute Acirc Atilde Auml Aring AElig Ccedil Egrave Eacute " +
+  "Ecirc Euml Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde Ouml times Oslash Ugrave Uacute Ucirc Uuml Yacute " +
+  "THORN szlig agrave aacute acirc atilde auml aring aelig ccedil egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde " +
+  "ograve oacute ocirc otilde ouml divide oslash ugrave uacute ucirc uuml yacute thorn yuml";
+
+/** Greek letters: capitals from U+0391, small letters from U+03B1 (U+03A2 has no letter). */
+const GREEK_NAMES = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigmaf sigma tau upsilon phi chi psi omega";
+
+/** Every other HTML 4 entity, plus HTML5 names that show up in email. */
+const OTHER_ENTITIES: Record<string, number> = {
+  quot: 34, amp: 38, apos: 39, lt: 60, gt: 62, QUOT: 34, AMP: 38, LT: 60, GT: 62, COPY: 169, REG: 174,
+  Tab: 9, NewLine: 10, excl: 33, num: 35, dollar: 36, percnt: 37, lpar: 40, rpar: 41, ast: 42, plus: 43, comma: 44,
+  period: 46, sol: 47, colon: 58, semi: 59, equals: 61, quest: 63, commat: 64, lsqb: 91, lbrack: 91, bsol: 92,
+  rsqb: 93, rbrack: 93, Hat: 94, lowbar: 95, grave: 96, lcub: 123, lbrace: 123, verbar: 124, vert: 124, rcub: 125,
+  rbrace: 125, half: 189, centerdot: 183,
+  OElig: 338, oelig: 339, Scaron: 352, scaron: 353, Yuml: 376, fnof: 402, circ: 710, tilde: 732,
+  thetasym: 977, upsih: 978, piv: 982,
+  ensp: 8194, emsp: 8195, thinsp: 8201, hairsp: 8202, ZeroWidthSpace: 8203, zwnj: 8204, zwj: 8205, lrm: 8206, rlm: 8207,
+  hyphen: 8208, dash: 8208, ndash: 8211, mdash: 8212, horbar: 8213, lsquo: 8216, rsquo: 8217, rsquor: 8217, sbquo: 8218,
+  lsquor: 8218, ldquo: 8220, rdquo: 8221, rdquor: 8221, bdquo: 8222, ldquor: 8222, dagger: 8224, Dagger: 8225,
+  bull: 8226, bullet: 8226, hellip: 8230, mldr: 8230, permil: 8240, prime: 8242, Prime: 8243, lsaquo: 8249,
+  rsaquo: 8250, oline: 8254, caret: 8257, frasl: 8260, NoBreak: 8288, euro: 8364, image: 8465, numero: 8470,
+  weierp: 8472, real: 8476, trade: 8482, TRADE: 8482, alefsym: 8501, frac13: 8531, frac23: 8532, frac18: 8539,
+  larr: 8592, uarr: 8593, rarr: 8594, darr: 8595, harr: 8596, crarr: 8629, lArr: 8656, uArr: 8657, rArr: 8658,
+  dArr: 8659, hArr: 8660, forall: 8704, part: 8706, exist: 8707, empty: 8709, nabla: 8711, isin: 8712, notin: 8713,
+  ni: 8715, prod: 8719, sum: 8721, minus: 8722, lowast: 8727, radic: 8730, prop: 8733, infin: 8734, ang: 8736,
+  and: 8743, or: 8744, cap: 8745, cup: 8746, int: 8747, there4: 8756, sim: 8764, cong: 8773, asymp: 8776, ne: 8800,
+  equiv: 8801, le: 8804, ge: 8805, sub: 8834, sup: 8835, nsub: 8836, sube: 8838, supe: 8839, oplus: 8853,
+  otimes: 8855, perp: 8869, sdot: 8901, lceil: 8968, rceil: 8969, lfloor: 8970, rfloor: 8971, loz: 9674,
+  starf: 9733, star: 9734, phone: 9742, female: 9792, spades: 9824, clubs: 9827, hearts: 9829, diams: 9830,
+  male: 9794, check: 10003, cross: 10007, lang: 10216, rang: 10217,
 };
 
+/** Named references, case-sensitive like HTML (`&Eacute;` is É, `&eacute;` is é). A Map, so `&constructor;` stays text. */
+const NAMED_ENTITIES = new Map<string, string>([
+  ...LATIN1_NAMES.split(" ").map((name, i): [string, string] => [name, String.fromCharCode(0xa0 + i)]),
+  ...GREEK_NAMES.split(" ").flatMap((name, i): [string, string][] => {
+    const lower: [string, string] = [name, String.fromCharCode(0x3b1 + i)];
+    if (name === "sigmaf") return [lower];
+    return [lower, [name[0].toUpperCase() + name.slice(1), String.fromCharCode(0x391 + i)]];
+  }),
+  ...Object.entries(OTHER_ENTITIES).map(([name, code]): [string, string] => [name, String.fromCodePoint(code)]),
+]);
+
+/** References browsers also accept without the ";" (when no letter, digit or "=" follows). */
+const LEGACY_ENTITIES = new Set(["amp", "lt", "gt", "quot", "nbsp", "copy", "reg", "AMP", "LT", "GT", "QUOT", "COPY", "REG"]);
+
+/** Numeric references to 0x80–0x9F mean Windows-1252 characters (e.g. `&#146;` is ’), as in browsers. */
+const C1_AS_WINDOWS_1252 = "€\x81‚ƒ„…†‡ˆ‰Š‹Œ\x8dŽ\x8f\x90‘’“”•–—˜™š›œ\x9džŸ";
+
+const ENTITY = /&(?:#[xX]([0-9a-fA-F]{1,8})|#([0-9]{1,8})|([A-Za-z][A-Za-z0-9]{0,31}))(;?)/g;
+
+function codePointText(code: number): string {
+  if (code >= 0x80 && code <= 0x9f) return C1_AS_WINDOWS_1252[code - 0x80];
+  if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return "�";
+  return String.fromCodePoint(code);
+}
+
+/** Decodes HTML character references: named (HTML 4 and common HTML5 names) and numeric. */
 export function decodeEntities(text: string): string {
-  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (match, name: string) => {
-    if (name[0] === "#") {
-      const code = name[1].toLowerCase() === "x" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
-      return Number.isFinite(code) && code > 0 && code < 0x110000 ? String.fromCodePoint(code) : match;
-    }
-    return ENTITIES[name.toLowerCase()] ?? match;
+  if (!text.includes("&")) return text;
+  return text.replace(ENTITY, (match: string, hex: string | undefined, dec: string | undefined, name: string | undefined, semi: string, offset: number) => {
+    if (hex) return codePointText(parseInt(hex, 16));
+    if (dec) return codePointText(parseInt(dec, 10));
+    if (semi) return NAMED_ENTITIES.get(name!) ?? match;
+    // "&amp" without ";" is still "&" in HTML, unless it looks like part of a URL parameter (e.g. "&lt=5").
+    const next = text.charAt(offset + match.length);
+    return LEGACY_ENTITIES.has(name!) && !/[A-Za-z0-9=]/.test(next) ? NAMED_ENTITIES.get(name!)! : match;
   });
 }
 
@@ -270,28 +300,290 @@ export function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-/** Small, dependency-free HTML to readable-text conversion for email bodies. */
+// ---------- HTML to text ----------
+
+/** Elements that start and end a paragraph (a blank line around them). */
+const PARAGRAPH_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "figure", "ul", "ol", "dl"]);
+/** Elements that start and end a line. */
+const LINE_TAGS = new Set([
+  "div", "tr", "li", "dd", "dt", "table", "caption", "section", "article", "header", "footer", "nav", "aside", "main",
+  "address", "center", "form", "fieldset", "legend", "details", "summary", "figcaption", "hr", "menu", "dir",
+]);
+/** Elements whose content is never shown. */
+const HIDDEN_TAGS = ["script", "style", "title", "template", "xmp", "iframe", "noembed", "noframes"];
+const HIDDEN_END = new Map(HIDDEN_TAGS.map((tag) => [tag, new RegExp(`</${tag}[\\s/>]`, "gi")]));
+/** HTML's collapsible white space (plus no-break spaces, which emails use as padding). */
+const HTML_SPACE = /[ \t\n\r\f ]+/g;
+
+function isHtmlSpace(c: number): boolean {
+  return c === 32 || c === 9 || c === 10 || c === 13 || c === 12;
+}
+
+function isLetter(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+/**
+ * Reads a tag's attributes from `i` (just after its name) through the closing ">", like a browser:
+ * quotes only matter around attribute values. Returns the index after ">", or -1 if the document ends
+ * inside the tag (browsers then drop the rest). Linear in the tag's length.
+ */
+function scanAttributes(html: string, i: number, attrs?: Map<string, string>): number {
+  const n = html.length;
+  while (i < n) {
+    let c = html.charCodeAt(i);
+    if (c === 62 /* > */) return i + 1;
+    if (isHtmlSpace(c) || c === 47 /* / */) {
+      i++;
+      continue;
+    }
+    const nameStart = i;
+    i++; // the first character always belongs to the name, even "=" or a quote
+    while (i < n && (c = html.charCodeAt(i)) !== 62 && c !== 61 && c !== 47 && !isHtmlSpace(c)) i++;
+    const name = attrs ? html.slice(nameStart, i).toLowerCase() : "";
+    while (i < n && isHtmlSpace(html.charCodeAt(i))) i++;
+    if (html.charCodeAt(i) !== 61 /* = */) {
+      if (attrs && !attrs.has(name)) attrs.set(name, "");
+      continue;
+    }
+    i++;
+    while (i < n && isHtmlSpace(html.charCodeAt(i))) i++;
+    c = html.charCodeAt(i);
+    let value: string;
+    if (c === 34 || c === 39) {
+      const close = html.indexOf(c === 34 ? '"' : "'", i + 1);
+      if (close < 0) return -1;
+      value = attrs ? html.slice(i + 1, close) : "";
+      i = close + 1;
+    } else {
+      const start = i;
+      while (i < n && (c = html.charCodeAt(i)) !== 62 && !isHtmlSpace(c)) i++;
+      value = attrs ? html.slice(start, i) : "";
+    }
+    if (attrs && !attrs.has(name)) attrs.set(name, value);
+  }
+  return -1;
+}
+
+/** Collects output text, collapsing white space and blank lines as a browser lays them out. */
+class TextBuilder {
+  parts: string[] = [];
+  private lineStart = true;
+  private newlines = 0;
+  /** A collapsed space is due before the next word. */
+  space = false;
+  /** A separator due before the next word on this line (a tab between table cells). */
+  sep = "";
+  /** A list marker due before the next word. */
+  marker = "";
+
+  private emit(s: string) {
+    if (this.lineStart) {
+      if (this.marker) this.parts.push(this.marker, " ");
+    } else if (this.sep) this.parts.push(this.sep);
+    else if (this.space) this.parts.push(" ");
+    this.parts.push(s);
+    this.lineStart = false;
+    this.newlines = 0;
+    this.space = false;
+    this.sep = "";
+    this.marker = "";
+  }
+
+  /** Normal text: runs of white space become one space, which is dropped at line starts. */
+  text(raw: string) {
+    const t = decodeEntities(raw).replace(HTML_SPACE, " ");
+    if (!t) return;
+    const lead = t.charCodeAt(0) === 32;
+    const trail = t.length > 1 && t.charCodeAt(t.length - 1) === 32;
+    if (lead) this.space = true;
+    const core = t.slice(lead ? 1 : 0, trail ? -1 : t.length);
+    if (core) this.emit(core);
+    if (trail) this.space = true;
+  }
+
+  /** Preformatted text: spaces and line breaks are kept. */
+  pre(raw: string) {
+    const lines = decodeEntities(raw).replace(/\r\n?/g, "\n").replace(/ /g, " ").split("\n");
+    lines.forEach((line, i) => {
+      if (i) this.newline();
+      if (line) this.emit(line);
+    });
+  }
+
+  word(s: string) {
+    if (s) this.emit(s);
+  }
+
+  /** A line break (<br>); more than one blank line in a row is not kept. */
+  newline() {
+    if (this.newlines < 2) this.parts.push("\n");
+    this.newlines = Math.min(this.newlines + 1, 2);
+    this.lineStart = true;
+    this.space = false;
+    this.sep = "";
+  }
+
+  /** Ends the current line, if anything is on it. */
+  line() {
+    if (!this.lineStart) this.newline();
+  }
+
+  /** Leaves a blank line before what follows (unless at the very start). */
+  blank() {
+    if (!this.parts.length || this.marker) return;
+    this.line();
+    if (this.newlines < 2) this.newline();
+  }
+
+  get length() {
+    return this.parts.length;
+  }
+
+  textSince(index: number): string {
+    return this.parts.slice(index).join("").trim();
+  }
+
+  toString() {
+    return this.parts.join("").trim();
+  }
+}
+
+/**
+ * Converts an email's HTML to readable text, the way a browser would show it: white space collapses,
+ * block elements and <br> make lines, lists get markers, table cells are separated by tabs, and links
+ * keep their address as "label (url)". Runs in linear time on any input, including broken HTML.
+ */
 export function htmlToText(html: string): string {
-  let text = html
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<(head|style|script|title)\b[\s\S]*?<\/\1\s*>/gi, "")
-    .replace(/<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a\s*>/gi, (_m, href: string, inner: string) => {
-      const label = inner.replace(/<[^>]+>/g, "").trim();
-      const url = decodeEntities(href);
-      if (!label) return url;
-      return url.startsWith("mailto:") || decodeEntities(label) === url ? label : `${label} (${url})`;
-    })
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<li\b[^>]*>/gi, "\n- ")
-    .replace(/<\/(p|div|tr|h[1-6]|ul|ol|table|blockquote)\s*>/gi, "\n")
-    .replace(/<(p|div|h[1-6]|tr|blockquote)\b[^>]*>/gi, "\n")
-    .replace(/<\/t[dh]\s*>/gi, "\t")
-    .replace(/<[^>]+>/g, "");
-  text = decodeEntities(text)
-    .replace(/ /g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n[ \t]+/g, "\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n");
-  return text.trim();
+  const b = new TextBuilder();
+  const n = html.length;
+  const lists: { ordered: boolean; next: number }[] = [];
+  let link: { href: string; start: number; alts: string[] } | undefined;
+  let pre = 0;
+  let preStart = false;
+  let pos = 0;
+
+  const closeLink = () => {
+    if (!link) return;
+    const { href, start, alts } = link;
+    link = undefined;
+    const label = b.textSince(start);
+    const url = href.trim();
+    const alt = alts.join(" ").trim();
+    if (!url || url.startsWith("#") || /^javascript:/i.test(url)) {
+      if (!label) b.word(alt);
+      return;
+    }
+    if (/^mailto:/i.test(url)) {
+      if (!label) b.word(alt || decodeURIComponent(url.slice(7).split("?")[0]));
+      return;
+    }
+    if (!label) {
+      if (alt && alt !== url) {
+        b.word(alt);
+        b.space = true;
+        b.word(`(${url})`);
+      } else b.word(url);
+      return;
+    }
+    if (label !== url) {
+      b.space = true;
+      b.word(`(${url})`);
+    }
+  };
+
+  while (pos < n) {
+    const lt = html.indexOf("<", pos);
+    const textEnd = lt < 0 ? n : lt;
+    if (textEnd > pos) {
+      let raw = html.slice(pos, textEnd);
+      if (pre) {
+        if (preStart) raw = raw.replace(/^\r?\n/, "");
+        b.pre(raw);
+      } else b.text(raw);
+      preStart = false;
+    }
+    if (lt < 0) break;
+    const c1 = html.charCodeAt(lt + 1);
+    if (c1 === 33 /* ! */) {
+      // Comments, including unterminated ones (which hide the rest, as in browsers), DOCTYPE and <![…]>.
+      let end: number;
+      if (html.startsWith("<!--", lt)) {
+        if (html.startsWith("<!-->", lt)) end = lt + 5;
+        else if (html.startsWith("<!--->", lt)) end = lt + 6;
+        else {
+          const close = html.indexOf("-->", lt + 4);
+          end = close < 0 ? n : close + 3;
+        }
+      } else {
+        const close = html.indexOf(">", lt + 2);
+        end = close < 0 ? n : close + 1;
+      }
+      pos = end;
+      continue;
+    }
+    if (c1 === 63 /* ? */ || (c1 === 47 /* / */ && !isLetter(html.charCodeAt(lt + 2)))) {
+      const close = html.indexOf(">", lt + 2);
+      pos = close < 0 ? n : close + 1;
+      continue;
+    }
+    const closing = c1 === 47;
+    const nameStart = closing ? lt + 2 : lt + 1;
+    if (!isLetter(html.charCodeAt(nameStart))) {
+      // A "<" that doesn't start a tag is just text.
+      if (pre) b.pre("<");
+      else b.text("<");
+      pos = lt + 1;
+      continue;
+    }
+    let i = nameStart + 1;
+    for (let c = html.charCodeAt(i); i < n && c !== 62 && c !== 47 && !isHtmlSpace(c); c = html.charCodeAt(++i));
+    const tag = html.slice(nameStart, i).toLowerCase();
+    const wantAttrs = !closing && (tag === "a" || tag === "img" || tag === "ol");
+    const attrs = wantAttrs ? new Map<string, string>() : undefined;
+    const end = scanAttributes(html, i, attrs);
+    if (end < 0) break;
+    pos = end;
+
+    if (!closing && HIDDEN_END.has(tag)) {
+      const re = HIDDEN_END.get(tag)!;
+      re.lastIndex = pos;
+      const m = re.exec(html);
+      if (!m) break;
+      const after = scanAttributes(html, m.index + 2 + tag.length);
+      if (after < 0) break;
+      pos = after;
+      continue;
+    }
+
+    if (tag === "br") b.newline();
+    else if (tag === "a") {
+      closeLink();
+      if (!closing) link = { href: decodeEntities(attrs!.get("href") ?? ""), start: b.length, alts: [] };
+    } else if (tag === "img") {
+      const alt = attrs?.get("alt");
+      if (link && alt) link.alts.push(decodeEntities(alt).replace(HTML_SPACE, " ").trim());
+    } else if (tag === "td" || tag === "th") {
+      if (closing) b.sep = "\t";
+    } else if (tag === "li") {
+      b.line();
+      if (!closing) {
+        const list = lists.at(-1);
+        b.marker = list?.ordered ? `${list.next++}.` : "-";
+      }
+    } else if (tag === "ul" || tag === "ol") {
+      if (closing) lists.pop();
+      if (lists.length) b.line();
+      else b.blank();
+      if (!closing) lists.push({ ordered: tag === "ol", next: Number.parseInt(attrs?.get("start") ?? "", 10) || 1 });
+    } else if (PARAGRAPH_TAGS.has(tag)) {
+      b.blank();
+      if (tag === "pre") {
+        pre = Math.max(0, pre + (closing ? -1 : 1));
+        preStart = !closing;
+      }
+    } else if (LINE_TAGS.has(tag)) b.line();
+  }
+  closeLink();
+  return b.toString();
 }
