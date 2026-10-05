@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { attachmentCharset, attachmentText } from "../src/format.js";
-import { decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
+import { attachmentResult, decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
 import { docx, docxOf, pdf, pdfOf, png, pptx, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
@@ -312,6 +312,10 @@ test("long text attachments are decoded only as far as needed", () => {
   assert.equal(some.more, true);
   assert.ok(some.text.length >= 20_000 && some.text.length <= 80_004);
   assert.equal(readTextFile(big, "text/plain", "log.txt", { maxChars: 0 }).more, undefined);
+  // A file decoded in full isn't "more": the caller knows exactly how much it leaves out.
+  const small = readTextFile(Buffer.from("a,b\n1,2"), "text/csv", "notes.csv", { maxChars: 3 });
+  assert.deepEqual(small, { text: "a,b\n1,2" });
+  assert.match(attachmentResult(small, 3).truncated!, /4 more characters not shown/);
 });
 
 test("file types: content signatures win, odd type names are understood", () => {
@@ -341,4 +345,19 @@ test("the charset of an attachment comes from its part's Content-Type", () => {
   };
   assert.equal(attachmentCharset(payload, "1"), "windows-1252");
   assert.equal(attachmentCharset(payload, "2"), undefined);
+});
+
+test("get_attachment's note says whether a larger maxChars would show more", () => {
+  const long = "x".repeat(30_000);
+  // The reader stopped at maxChars: asking for more helps.
+  assert.match(attachmentResult({ text: long, more: true }, 20_000).truncated!, /only the first 20,000 characters.*larger maxChars/);
+  // Everything was read: the count is exact and maxChars: 0 shows all of it.
+  assert.match(attachmentResult({ text: long }, 20_000).truncated!, /10,000 more characters not shown\. Call again with maxChars: 0 for all of it/);
+  // A size limit cut the file: maxChars can't help, so it isn't suggested.
+  const cut = attachmentResult({ text: "beginning", incomplete: "This file is too large to read here in full, so only its beginning is shown." }, 0);
+  assert.equal(cut.text, "beginning");
+  assert.doesNotMatch(cut.truncated!, /maxChars/);
+  assert.match(cut.truncated!, /too large.*viewUrl/);
+  // Nothing missing, nothing said; text keeps its tabs and indentation.
+  assert.deepEqual(attachmentResult({ text: "a\t\tb\n    c" }, 20_000), { text: "a\t\tb\n    c" });
 });

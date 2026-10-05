@@ -9,6 +9,7 @@
  */
 import { Buffer } from "node:buffer";
 import { inflateRawSync, inflateSync } from "node:zlib";
+import { attachmentText, limitLength } from "./format.js";
 import { htmlToText } from "./mime.js";
 
 export type AttachmentKind = "text" | "image" | "pdf" | "office" | "binary";
@@ -131,7 +132,8 @@ export function readTextFile(bytes: Uint8Array, mimeType: string, filename: stri
   const partial = bytes.length > maxBytes;
   const decoded = decodeText(partial ? bytes.subarray(0, maxBytes) : bytes, opts.charset, html, partial);
   const text = html ? htmlToText(decoded) : decoded.replace(/^\ufeff/, "");
-  return budget.result(text, partial || text.length > budget.chars);
+  // When the whole file was decoded, the caller can count what it cuts; only a cut-off read means "more".
+  return budget.result(text, partial || text.length > MAX_TEXT_CHARS);
 }
 
 /** The text of a text attachment as one string (with a note when it is incomplete). */
@@ -207,6 +209,32 @@ class Budget {
     if (this.incomplete) out.incomplete = this.incomplete;
     return out;
   }
+}
+
+/**
+ * What get_attachment shows for a read file: its text (as it is in the file, cut to `maxChars`; 0
+ * means as much as can be read) and, when text is missing, a note saying why and whether calling
+ * again with a larger maxChars would show more.
+ */
+export function attachmentResult(read: ReadResult, maxChars: number): { text: string; truncated?: string } {
+  const callerLimit = maxChars > 0 && maxChars < MAX_TEXT_CHARS;
+  const { text, omitted } = limitLength(attachmentText(read.text), callerLimit ? maxChars : MAX_TEXT_CHARS);
+  const notes: string[] = [];
+  if (callerLimit && read.more) {
+    notes.push(
+      `Shortened: only the first ${maxChars.toLocaleString("en-US")} characters are shown. ` +
+        `Call again with a larger maxChars (or 0, for up to ${MAX_TEXT_CHARS.toLocaleString("en-US")}) to read further.`,
+    );
+  } else if (callerLimit && omitted) {
+    notes.push(
+      `Shortened: ${omitted.toLocaleString("en-US")} more characters not shown. ` +
+        `Call again with maxChars: 0 for ${read.incomplete ? "them" : "all of it"}.`,
+    );
+  } else if (omitted && !read.incomplete) {
+    notes.push(TEXT_TOO_LONG);
+  }
+  if (read.incomplete) notes.push(`${read.incomplete} Open it in Gmail with viewUrl to see the rest.`);
+  return notes.length ? { text, truncated: notes.join(" ") } : { text };
 }
 
 /** Appends a note about missing text, for callers that only take a string. */
