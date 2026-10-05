@@ -298,7 +298,9 @@ function changeFilter(add: ApiLabel[], remove: ApiLabel[], includeSpamTrash: boo
     terms.push(`-${term}`);
   }
   for (const label of removing) {
-    const term = labelSearchTerm(label);
+    // A user label is only ever searched for as "-label:…": if search read its name differently, that
+    // would match everything (still correct), whereas "label:…" would match nothing and change nothing.
+    const term = isSystemLabelId(label.id) ? labelSearchTerm(label) : undefined;
     if (!term) return undefined;
     terms.push(term);
   }

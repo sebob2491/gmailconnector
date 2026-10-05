@@ -1413,8 +1413,11 @@ describe("fixes from the second review", () => {
       assert.equal(again.json.changed, 2, "they still lack Reports");
       const removed = await ctx.call("bulk_update", { account: "work", query: "", action: "remove_labels", labelIds: ["My Label"] });
       assert.equal(removed.json.changed, 2);
-      const removedBoth = await ctx.call("bulk_update", { account: "work", query: "", action: "remove_labels", labelIds: ["Label_9", "Reports"] });
-      assert.equal(removedBoth.json.changed, 2, "only Reports was left");
+      // Two user labels to remove can't be matched by ID, and a name search could miss: the search isn't narrowed.
+      const removedBoth = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "remove_labels", labelIds: ["Label_9", "Reports"] });
+      assert.equal(removedBoth.json.changed, 2);
+      const capped = await ctx.call("bulk_update", { account: "work", query: "", action: "remove_labels", labelIds: ["Label_9", "Reports"], dryRun: true, maxEmails: 1 });
+      assert.match(capped.json.more, /Running it again would pick the same emails, so raise maxEmails or narrow the query/);
       const lists = ctx.fake.requests.filter((r) => r.path === "messages");
       assert.deepEqual(
         lists.map((r) => [r.query.get("q"), r.query.getAll("labelIds").join(",")]),
@@ -1422,7 +1425,8 @@ describe("fixes from the second review", () => {
           ['(category:promotions) -label:"My Label" -in:draft', ""],
           ['(category:promotions) (-label:"My Label" OR -label:"Reports") -in:draft', ""],
           ["-in:draft", "Label_9"],
-          ['(label:"My Label" OR label:"Reports") -in:draft', ""],
+          ["(category:promotions) -in:draft", ""],
+          ["-in:draft", ""],
         ],
       );
       assert.ok(ctx.work.messages.get("promo0")!.labelIds!.every((l) => l !== "Label_9" && l !== "Label_7"));
