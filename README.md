@@ -29,6 +29,12 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 - New `list_accounts` tool, and an `account` argument on every tool.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
+  Results are compact: one-email threads are shown flat, previews are cleaned of the invisible padding
+  and HTML codes that marketing emails contain, and recipients are listed only when an email wasn't
+  addressed to just you. A 50-email search comes back about half the size of the raw Gmail data.
+- `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
+  how much was left out). Pass `maxBodyChars: 0` for the full text. Replies and forwards always use the
+  whole email.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
 - `forward` re-attaches the original message's attachments.

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { htmlToText, isValidAddress, type Mailbox } from "./mime.js";
+import { decodeEntities, htmlToText, isValidAddress, type Mailbox } from "./mime.js";
 
 /** Subset of the Gmail API Message resource we rely on. */
 export interface ApiMessagePart {
@@ -268,6 +268,47 @@ export function viewUrl(email: string, fragment: string): string {
   return `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#${fragment}`;
 }
 
+/**
+ * Invisible characters that marketing emails pad their previews with (combining grapheme joiner,
+ * zero-width spaces/joiners, direction marks, soft hyphens, blank Braille and Hangul fillers, BOM).
+ * U+200D is kept because emoji sequences need it.
+ */
+const INVISIBLE = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200c\u200e\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\u2800\u3164\ufeff\uffa0]/g;
+
+/** Gmail snippets are HTML-escaped and often padded; returns readable text (or undefined if empty). */
+export function cleanSnippet(snippet: string | undefined): string | undefined {
+  if (!snippet) return undefined;
+  const clean = decodeEntities(snippet).replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
+  return clean || undefined;
+}
+
+/** Removes invisible padding and collapses the runs of blank space it leaves behind. */
+export function cleanBody(text: string): string {
+  return text
+    .replace(INVISIBLE, "")
+    .replace(/[ \t\u00a0]{2,}/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** Bodies longer than this are shortened unless the caller asks for more (0 means no limit). */
+export const DEFAULT_MAX_BODY_CHARS = 20_000;
+
+/** Cuts `text` to `max` characters (never splitting an emoji) and says how much was left out. */
+export function limitLength(text: string, max: number): { text: string; omitted: number } {
+  if (!max || text.length <= max) return { text, omitted: 0 };
+  let end = max;
+  const code = text.charCodeAt(end - 1);
+  if (code >= 0xd800 && code <= 0xdbff) end--; // don't split a surrogate pair
+  return { text: text.slice(0, end), omitted: text.length - end };
+}
+
+export interface FormatOptions {
+  /** Maximum characters per body (plain text and HTML separately); 0 for no limit. */
+  maxBodyChars?: number;
+}
+
 export interface FormattedMessage {
   id: string;
   threadId: string;
@@ -283,6 +324,8 @@ export interface FormattedMessage {
   htmlBody?: string;
   attachments?: Omit<AttachmentInfo, "partId">[];
   raw?: string;
+  /** Set when a body was shortened; says how to get the rest. */
+  truncated?: string;
   viewUrl: string;
 }
 
@@ -291,6 +334,7 @@ export async function formatMessage(
   format: MessageFormat,
   email: string,
   loadData: (attachmentId: string) => Promise<string>,
+  opts: FormatOptions = {},
 ): Promise<FormattedMessage> {
   const url = viewUrl(email, `all/${msg.id}`);
   if (format === "RAW") {
@@ -299,8 +343,9 @@ export async function formatMessage(
   const p = msg.payload;
   const out: FormattedMessage = { id: msg.id, threadId: msg.threadId, viewUrl: url };
   if (format !== "METADATA_ONLY") {
-    out.snippet = msg.snippet;
-    out.subject = header(p, "Subject") ?? "";
+    const snippet = cleanSnippet(msg.snippet);
+    if (snippet) out.snippet = snippet;
+    out.subject = (header(p, "Subject") ?? "").replace(INVISIBLE, "").trim();
   }
   out.sender = header(p, "From");
   out.toRecipients = parseAddressList(header(p, "To"));
@@ -313,8 +358,20 @@ export async function formatMessage(
 
   if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {
     const content = await extractContent(p, loadData);
-    out.plaintextBody = bodyText(content);
-    if (format === "FULL_CONTENT" && content.html !== undefined) out.htmlBody = content.html;
+    const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
+    const plain = limitLength(cleanBody(bodyText(content)), max);
+    out.plaintextBody = plain.text;
+    let omitted = plain.omitted;
+    if (format === "FULL_CONTENT" && content.html !== undefined) {
+      const html = limitLength(content.html, max);
+      out.htmlBody = html.text;
+      omitted = Math.max(omitted, html.omitted);
+    }
+    if (omitted) {
+      out.truncated =
+        `Body shortened: ${omitted.toLocaleString("en-US")} more characters not shown. ` +
+        `Fetch it with get_message, get_thread or get_draft and maxBodyChars: 0 for the full text.`;
+    }
     if (content.attachments.length) out.attachments = content.attachments.map(({ partId: _p, ...a }) => a);
   }
   return out;

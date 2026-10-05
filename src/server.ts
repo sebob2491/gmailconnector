@@ -188,6 +188,14 @@ const messageFormatArg = z
   .describe(
     "Optional. Defaults to PLAIN_TEXT. MINIMAL: headers + snippet, no body. PLAIN_TEXT: headers + plain-text body (HTML converted to text) + attachment info. FULL_CONTENT: PLAIN_TEXT plus the HTML body. METADATA_ONLY: senders/recipients/date/labels only. RAW: the raw MIME message.",
   );
+const maxBodyCharsArg = z
+  .number()
+  .int()
+  .min(0)
+  .optional()
+  .describe(
+    "Optional. Bodies longer than this many characters are shortened, with a `truncated` note saying how much was left out. Defaults to 20000; 0 means no limit.",
+  );
 const attachmentArg = z.object({
   content: z.string().describe("Required. The base64-encoded content of the attachment."),
   filename: z.string().optional().describe('Optional. File name shown to recipients, e.g. "invoice.pdf". Also used as the Content-ID of inline attachments.'),
@@ -304,7 +312,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Search email threads",
       description:
-        "Searches email threads in one or all linked Gmail accounts. Without `account`, every linked account is searched and results are grouped by account; pass that account back when opening a thread. Each thread shows its 5 most recent messages (subject, sender, snippet); `totalMessages` says how many it has. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once).",
+        "Searches email threads in one or all linked Gmail accounts. Without `account`, every linked account is searched and results are grouped by account; pass that account back when opening a thread. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once).",
       inputSchema: {
         account: multiAccountArg,
         query: z.string().optional().describe(SEARCH_QUERY_HELP),
@@ -336,13 +344,17 @@ export function createServer(deps: ServerDeps): McpServer {
         account: accountArg,
         threadId: z.string().describe("Required. The thread ID."),
         messageFormat: messageFormatArg,
+        maxBodyChars: maxBodyCharsArg,
       },
       annotations: read,
     },
     async (args) =>
       run(async () => {
         const mb = await router.one(args.account);
-        return { account: mb.email, ...(await mb.getThread(args.threadId, args.messageFormat ?? "PLAIN_TEXT")) };
+        return {
+          account: mb.email,
+          ...(await mb.getThread(args.threadId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars })),
+        };
       }),
   );
 
@@ -356,13 +368,17 @@ export function createServer(deps: ServerDeps): McpServer {
         account: accountArg,
         messageId: z.string().describe("Required. The message ID."),
         messageFormat: messageFormatArg,
+        maxBodyChars: maxBodyCharsArg,
       },
       annotations: read,
     },
     async (args) =>
       run(async () => {
         const mb = await router.one(args.account);
-        return { account: mb.email, ...(await mb.getMessage(args.messageId, args.messageFormat ?? "PLAIN_TEXT")) };
+        return {
+          account: mb.email,
+          ...(await mb.getMessage(args.messageId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars })),
+        };
       }),
   );
 
@@ -401,13 +417,17 @@ export function createServer(deps: ServerDeps): McpServer {
         account: accountArg,
         draftId: z.string().describe("Required. The draft ID."),
         messageFormat: messageFormatArg,
+        maxBodyChars: maxBodyCharsArg,
       },
       annotations: read,
     },
     async (args) =>
       run(async () => {
         const mb = await router.one(args.account);
-        return { account: mb.email, ...(await mb.getDraft(args.draftId, args.messageFormat ?? "PLAIN_TEXT")) };
+        return {
+          account: mb.email,
+          ...(await mb.getDraft(args.draftId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars })),
+        };
       }),
   );
 

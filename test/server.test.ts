@@ -257,9 +257,9 @@ describe("search_threads", () => {
     assert.equal(res.isError, false, res.text);
     const byAccount = Object.fromEntries(res.json.accounts.map((a: any) => [a.account, a]));
     assert.deepEqual(Object.keys(byAccount).sort(), [WORK, PERSONAL].sort());
-    assert.equal(byAccount[PERSONAL].threads[0].messages[0].subject, "Lunch?");
+    assert.equal(byAccount[PERSONAL].threads[0].subject, "Lunch?");
     assert.deepEqual(
-      byAccount[WORK].threads.map((t: any) => t.messages[0].subject),
+      byAccount[WORK].threads.map((t: any) => t.subject),
       ["Benefits", "Q3 report"],
     );
     assert.match(byAccount[WORK].threads[0].viewUrl, /authuser=me%40work\.example#all\/wt2$/);
@@ -273,8 +273,8 @@ describe("search_threads", () => {
     assert.equal(res.json.account, PERSONAL);
     assert.equal(res.json.threads.length, 1);
     assert.equal(res.json.threads[0].totalMessages, 1);
-    assert.equal(res.json.threads[0].messages[0].sender, "Alice <alice@example.com>");
-    assert.deepEqual(res.json.threads[0].messages[0].toRecipients, [PERSONAL, '"Doe, Bob" <bob@example.com>']);
+    assert.equal(res.json.threads[0].sender, "Alice <alice@example.com>");
+    assert.deepEqual(res.json.threads[0].toRecipients, [PERSONAL, '"Doe, Bob" <bob@example.com>']);
   });
 
   test("the combined page token continues only the accounts that have more", async () => {
@@ -735,7 +735,7 @@ describe("fixes from the code review", () => {
     const q = fake.requests.filter((r) => r.path === "threads").at(-1)!.query.get("q");
     assert.equal(q, "(from:alice -in:draft) -in:draft");
     for (const thread of res.json.threads) {
-      for (const m of thread.messages) assert.ok(!m.labelIds.includes("DRAFT"));
+      for (const m of thread.messages ?? [thread]) assert.ok(!m.labelIds.includes("DRAFT"));
     }
   });
 
@@ -888,5 +888,98 @@ describe("fixes from the code review", () => {
     const { store } = await setup();
     await store.setAlias(WORK, "  job ");
     assert.equal((await store.list()).find((a) => a.email === WORK)!.alias, "job");
+  });
+});
+
+describe("cleaner, smaller results", () => {
+  test("previews are decoded and stripped of invisible padding", async () => {
+    const { call, fake, personal } = await setup();
+    const msg = fake.deliver(personal, crlf(["From: shop@example.com", `To: ${PERSONAL}`, "Subject: Sale \u034f\u200c", "", "x"]), {
+      id: "promo",
+    });
+    msg.snippet = "Friends &amp; Family: don&#39;t miss out \u034f \u200c \u034f \u200c \u2800\u2800 &quot;30%&quot; off";
+    const res = await call("search_threads", { account: "personal" });
+    const promo = res.json.threads.find((t: any) => t.id === "promo");
+    assert.equal(promo.snippet, 'Friends & Family: don\'t miss out "30%" off');
+    assert.equal(promo.subject, "Sale");
+  });
+
+  test("single-email threads are flat; recipients only when it wasn't just to you", async () => {
+    const { call, fake, work } = await setup();
+    const res = await call("search_threads", { account: "work" });
+    const single = res.json.threads.find((t: any) => t.id === "wt2");
+    assert.equal(single.messages, undefined);
+    assert.equal(single.subject, "Benefits");
+    assert.equal(single.sender, "hr@work.example");
+    assert.equal(single.toRecipients, undefined, "addressed only to this account");
+    assert.equal(single.threadId, undefined);
+    assert.match(single.viewUrl, /#all\/wt2$/);
+
+    fake.deliver(work, crlf(["From: Boss <boss@work.example>", `To: ${WORK}`, "Subject: Re: Q3 report", "", "Looks good"]), {
+      threadId: "wt1",
+    });
+    const again = await call("search_threads", { account: "work" });
+    const thread = again.json.threads.find((t: any) => t.id === "wt1");
+    assert.equal(thread.subject, "Q3 report");
+    assert.equal(thread.totalMessages, 2);
+    assert.equal(thread.messages.length, 2);
+    for (const m of thread.messages) {
+      assert.equal(m.subject, undefined, "replies don't repeat the thread subject");
+      assert.equal(m.viewUrl, undefined);
+      assert.equal(m.threadId, undefined);
+    }
+  });
+
+  test("very long bodies are shortened unless maxBodyChars says otherwise", async () => {
+    const { call, fake, personal } = await setup();
+    const long = "word ".repeat(10_000); // 50,000 characters
+    fake.deliver(personal, crlf(["From: news@example.com", `To: ${PERSONAL}`, "Subject: Huge", "Content-Type: text/plain", "", long]), {
+      id: "huge",
+    });
+    const short = await call("get_message", { account: "personal", messageId: "huge" });
+    assert.ok(short.json.plaintextBody.length <= 20_000);
+    // 50,000 characters, less the trailing space that cleaning trims, less the 20,000 shown.
+    assert.match(short.json.truncated, /^Body shortened: 29,999 more characters not shown/);
+
+    const custom = await call("get_message", { account: "personal", messageId: "huge", maxBodyChars: 500 });
+    assert.equal(custom.json.plaintextBody.length, 500);
+
+    const full = await call("get_message", { account: "personal", messageId: "huge", maxBodyChars: 0 });
+    assert.equal(full.json.truncated, undefined);
+    assert.equal(full.json.plaintextBody, long.trim());
+
+    const thread = await call("get_thread", { account: "personal", threadId: "huge", maxBodyChars: 1000 });
+    assert.equal(thread.json.messages[0].plaintextBody.length, 1000);
+  });
+
+  test("forwarding and replying still use the whole email, not the shortened one", async () => {
+    const { call, fake, personal } = await setup();
+    const long = "line of text\n".repeat(3000); // ~39,000 characters
+    fake.deliver(
+      personal,
+      crlf(["From: a@example.com", `To: ${PERSONAL}`, "Subject: Long", "Message-ID: <long@example.com>", "Content-Type: text/plain", "", long]),
+      { id: "long" },
+    );
+    await call("forward", { account: "personal", messageId: "long", to: ["x@example.com"] });
+    const plain = inspectMime(fake.sentBy(PERSONAL)[0].raw).parts.find((p) => p.type === "text/plain")!.text;
+    assert.ok(plain.length > 39_000, `forwarded ${plain.length} characters`);
+  });
+
+  test("invisible padding is removed from bodies too", async () => {
+    const { call, fake, personal } = await setup();
+    fake.deliver(
+      personal,
+      crlf([
+        "From: shop@example.com",
+        `To: ${PERSONAL}`,
+        "Subject: Deals",
+        "Content-Type: text/plain; charset=UTF-8",
+        "",
+        "Big sale \u034f \u200c \u034f \u200c \u034f \u200c today\n\n\n\n\nShop now",
+      ]),
+      { id: "pad" },
+    );
+    const res = await call("get_message", { account: "personal", messageId: "pad" });
+    assert.equal(res.json.plaintextBody, "Big sale today\n\nShop now");
   });
 });

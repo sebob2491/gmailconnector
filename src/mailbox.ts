@@ -12,6 +12,7 @@ import {
   recipientsFrom,
   viewUrl,
   type ApiMessage,
+  type FormatOptions,
   type FormattedMessage,
   type MessageFormat,
 } from "./format.js";
@@ -133,6 +134,13 @@ function replySubject(subject: string | undefined): string {
 }
 
 const THREAD_PREVIEW_MESSAGES = 5;
+/** Draft bodies in list_drafts are previews; get_draft has the full text. */
+const LIST_BODY_CHARS = 2_000;
+
+/** "Re: Fwd: Lunch?" → "lunch?" so replies can be matched to their thread's subject. */
+function normalizeSubject(subject: string | undefined): string {
+  return (subject ?? "").replace(/^\s*((re|fwd?|aw|sv|antw)\s*(\[\d+\])?\s*:\s*)+/i, "").trim().toLowerCase();
+}
 
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
@@ -147,8 +155,21 @@ export class Mailbox {
       (await this.client.request("GET", `messages/${messageId}/attachments/${attachmentId}`)).data as string;
   }
 
-  private format(msg: ApiMessage, format: MessageFormat): Promise<FormattedMessage> {
-    return formatMessage(msg, format, this.email, this.loader(msg.id));
+  private format(msg: ApiMessage, format: MessageFormat, opts: FormatOptions = {}): Promise<FormattedMessage> {
+    return formatMessage(msg, format, this.email, this.loader(msg.id), opts);
+  }
+
+  /**
+   * Trims a message for search results: no per-message threadId or link (the thread has them), and
+   * no recipient list when the email went only to this account.
+   */
+  private searchSummary(m: FormattedMessage) {
+    const { threadId: _t, viewUrl: _v, ...rest } = m;
+    const self = this.email.toLowerCase();
+    if (rest.toRecipients?.length === 1 && bareAddress(rest.toRecipients[0]) === self && !rest.ccRecipients) {
+      delete rest.toRecipients;
+    }
+    return rest;
   }
 
   // ---------- threads & messages ----------
@@ -186,22 +207,32 @@ export class Mailbox {
       throw r.error;
     });
     const threads = await mapLimit(found, 8, async ({ id, thread }) => {
-      const t = { id };
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
       const recent = messages.slice(-THREAD_PREVIEW_MESSAGES);
+      const summaries = (await Promise.all(recent.map((m) => this.format(m, format)))).map((m) => this.searchSummary(m));
+      const link = viewUrl(this.email, `all/${id}`);
+      // Most threads hold one email: show it flat instead of a thread wrapping a one-item list.
+      if (summaries.length === 1) {
+        const { id: messageId, ...message } = summaries[0];
+        return { id, ...(messageId !== id ? { messageId } : {}), totalMessages: 1, ...message, viewUrl: link };
+      }
+      // Replies repeat the subject with "Re:"; list it once for the thread.
+      const subject = summaries[0]?.subject;
+      const base = normalizeSubject(subject);
       return {
-        id: t.id,
-        viewUrl: viewUrl(this.email, `all/${t.id}`),
+        id,
+        ...(subject !== undefined ? { subject } : {}),
         totalMessages: messages.length,
         ...(messages.length > recent.length ? { omittedOlderMessages: messages.length - recent.length } : {}),
-        messages: await Promise.all(recent.map((m) => this.format(m, format))),
+        viewUrl: link,
+        messages: summaries.map(({ subject: s, ...m }) => (s !== undefined && normalizeSubject(s) !== base ? { subject: s, ...m } : m)),
       };
     });
     return { threads, ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}) };
   }
 
-  async getThread(threadId: string, format: MessageFormat) {
+  async getThread(threadId: string, format: MessageFormat, opts: FormatOptions = {}) {
     if (format === "RAW") throw new MimeError("RAW format is not supported for threads; use get_message instead.");
     const thread = await this.client.request("GET", `threads/${threadId}`, {
       query: { format: apiFormat(format), metadataHeaders: format === "MINIMAL" || format === "METADATA_ONLY" ? METADATA_HEADERS : undefined },
@@ -210,7 +241,7 @@ export class Mailbox {
     return {
       id: thread.id as string,
       viewUrl: viewUrl(this.email, `all/${thread.id}`),
-      messages: await Promise.all(messages.map((m) => this.format(m, format))),
+      messages: await Promise.all(messages.map((m) => this.format(m, format, opts))),
     };
   }
 
@@ -220,11 +251,11 @@ export class Mailbox {
     });
   }
 
-  async getMessage(messageId: string, format: MessageFormat) {
+  async getMessage(messageId: string, format: MessageFormat, opts: FormatOptions = {}) {
     const msg: ApiMessage = await this.client.request("GET", `messages/${messageId}`, {
       query: { format: apiFormat(format), metadataHeaders: apiFormat(format) === "metadata" ? METADATA_HEADERS : undefined },
     });
-    return this.format(msg, format);
+    return this.format(msg, format, opts);
   }
 
   /** Downloads every attachment of a message so it can be re-attached (forwarding, draft edits). */
@@ -440,8 +471,8 @@ export class Mailbox {
     };
   }
 
-  private async formatDraft(draft: { id: string; message: ApiMessage }, format: MessageFormat) {
-    const { id: messageId, viewUrl: _v, ...rest } = await this.format(draft.message, format);
+  private async formatDraft(draft: { id: string; message: ApiMessage }, format: MessageFormat, opts: FormatOptions = {}) {
+    const { id: messageId, viewUrl: _v, ...rest } = await this.format(draft.message, format, opts);
     return { id: draft.id, messageId, ...rest, viewUrl: this.draftUrl(messageId) };
   }
 
@@ -461,7 +492,8 @@ export class Mailbox {
       throw r.error;
     });
     const drafts = await mapLimit(found, 8, async (draft) => {
-      const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY");
+      // A list shows a preview of each draft; get_draft returns the whole thing.
+      const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY", { maxBodyChars: LIST_BODY_CHARS });
       if (full) {
         const { htmlBody: _h, snippet: _s, attachments: _a, labelIds: _l, ...rest } = formatted as FormattedMessage;
         return rest;
@@ -472,10 +504,10 @@ export class Mailbox {
     return { drafts, ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}) };
   }
 
-  async getDraft(draftId: string, format: MessageFormat) {
+  async getDraft(draftId: string, format: MessageFormat, opts: FormatOptions = {}) {
     // drafts.get has no metadataHeaders parameter; metadata format returns every header.
     const draft = await this.client.request("GET", `drafts/${draftId}`, { query: { format: apiFormat(format) } });
-    return this.formatDraft(draft, format);
+    return this.formatDraft(draft, format, opts);
   }
 
   async createDraft(input: ComposeInput & { replyToMessageId?: string }) {

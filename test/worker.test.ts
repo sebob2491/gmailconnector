@@ -310,7 +310,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const search = await callTool("search_threads", {});
     assert.equal(search.isError, false, search.text);
     const subjects = Object.fromEntries(
-      search.json.accounts.map((a: any) => [a.account, a.threads.map((t: any) => t.messages[0].subject)]),
+      search.json.accounts.map((a: any) => [a.account, a.threads.map((t: any) => t.subject)]),
     );
     assert.deepEqual(subjects, { [PERSONAL]: ["Lunch?"], [WORK]: ["Q3 report"] });
 
