@@ -513,7 +513,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(wordResult.content[1].text, "Offer letter\nSalary: $80,000");
   });
 
-  test("forwarding re-attaches files inside the Worker runtime", async () => {
+  test("forwarding re-attaches files inside the Worker runtime, and explains its size limit", async () => {
     const personal = fake.mailboxes.find((m) => m.email === PERSONAL)!;
     const big = randomBytes(300_001); // fetched on its own
     const note = Buffer.from("notes\r\n"); // fetched in a batch
@@ -543,6 +543,24 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.ok(Buffer.from(body("big.bin").replace(/\r\n/g, ""), "base64").equals(big), "the large file arrives unchanged");
     assert.ok(Buffer.from(body("notes.txt").replace(/\r\n/g, ""), "base64").equals(note));
     assert.match(raw, /Subject: Fwd: Files/);
+
+    // Over the hosted default (2 MB, MAX_FORWARD_MB isn't set here) it is refused before downloading.
+    personal.messages.set("bigdeck", {
+      id: "bigdeck",
+      threadId: "bigdeck",
+      labelIds: ["INBOX"],
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Deck" }, { name: "From", value: "a@example.com" }],
+        body: { size: 0 },
+        parts: [{ partId: "0", mimeType: "application/pdf", filename: "deck.pdf", headers: [], body: { attachmentId: "NOPE", size: 3 * 1048576 } }],
+      },
+    });
+    const refused = await callTool("forward", { account: PERSONAL, messageId: "bigdeck", to: ["x@example.com"] });
+    assert.equal(refused.isError, true);
+    assert.match(refused.text, /add up to 3\.0 MB, more than the 2 MB this connector re-attaches.*MAX_FORWARD_MB/);
   });
 
   test("GET on the MCP endpoint is rejected (stateless server)", async () => {

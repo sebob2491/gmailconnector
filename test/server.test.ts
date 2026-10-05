@@ -34,7 +34,9 @@ interface Ctx {
   call: (name: string, args?: Record<string, unknown>) => Promise<{ isError: boolean; text: string; json: any }>;
 }
 
-async function setup(opts: { accounts?: "both" | "personal"; defaultAccount?: string } = {}): Promise<Ctx> {
+async function setup(
+  opts: { accounts?: "both" | "personal"; defaultAccount?: string; maxAttachmentBytes?: number; maxAttachmentNote?: string } = {},
+): Promise<Ctx> {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-test-"));
   tmpDirs.push(dir);
   const store = new AccountStore(dir);
@@ -105,6 +107,8 @@ async function setup(opts: { accounts?: "both" | "personal"; defaultAccount?: st
     tokens: new TokenProvider(async () => ({ clientId: "cid", clientSecret: "secret" }), fake.fetch),
     webFetch: web.fetch,
     resolveHost: web.resolve,
+    maxAttachmentBytes: opts.maxAttachmentBytes,
+    maxAttachmentNote: opts.maxAttachmentNote,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -1942,5 +1946,40 @@ describe("cheaper forwarding", () => {
     assert.ok(fake.largestBody > 400_000, "the upload went out as bytes");
   });
 
+  test("the hosted connector's lower limit is explained before anything is downloaded", async () => {
+    const note = "The connector's owner can raise this limit with MAX_FORWARD_MB.";
+    const { call, fake, work } = await setup({ maxAttachmentBytes: 2 * 1048576, maxAttachmentNote: note });
+    const payload = (size: number) => ({
+      partId: "",
+      mimeType: "multipart/mixed",
+      filename: "",
+      headers: [{ name: "Subject", value: "Slides" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+      body: { size: 0 },
+      parts: [
+        { partId: "0", mimeType: "text/plain", filename: "", headers: [], body: { data: Buffer.from("see").toString("base64url"), size: 3 } },
+        { partId: "1", mimeType: "application/pdf", filename: "deck.pdf", headers: [], body: { attachmentId: "ATT1", size } },
+      ],
+    });
+    work.messages.set("s1", { id: "s1", threadId: "s1", labelIds: ["INBOX"], payload: payload(3.4 * 1048576) });
+    fake.batchCalls = 0;
+    const fwd = await call("forward", { account: "work", messageId: "s1", to: ["x@example.com"] });
+    assert.equal(fwd.isError, true);
+    assert.equal(
+      fwd.text,
+      "This email's attachments add up to 3.4 MB, more than the 2 MB this connector re-attaches, so it can't be forwarded with them from here. " +
+        `Forward it in Gmail instead (https://mail.google.com/mail/?authuser=me%40work.example#all/s1), which sends large files as Google Drive links. ${note}`,
+    );
+    work.messages.set("d1", { id: "d1", threadId: "d1", labelIds: ["DRAFT"], payload: payload(3.4 * 1048576) });
+    work.drafts.set("r-slides", "d1");
+    const upd = await call("update_draft", { account: "work", draftId: "r-slides", subject: "Deck" });
+    assert.equal(upd.text, `This draft's attachments add up to 3.4 MB, more than the 2 MB this connector re-attaches. Pass \`attachments\` to replace them, or edit the draft in Gmail. ${note}`);
+    assert.equal(fake.batchCalls, 0);
+    assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")), "nothing was downloaded");
+    // Under the limit it goes through, and over 25 MB Gmail's own limit is what's explained.
+    work.messages.set("s2", { id: "s2", threadId: "s2", labelIds: ["INBOX"], payload: payload(30 * 1048576) });
+    const huge = await call("forward", { account: "work", messageId: "s2", to: ["x@example.com"] });
+    assert.match(huge.text, /30\.0 MB, more than the 25 MB Gmail allows in one email/);
+    assert.doesNotMatch(huge.text, /MAX_FORWARD_MB/);
+  });
 });
 

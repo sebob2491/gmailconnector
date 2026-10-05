@@ -36,6 +36,24 @@ function tokenProviderFor(env: Env, origin: string): TokenProvider {
   return provider;
 }
 
+/**
+ * How many MB of attachments forward and update_draft re-attach. Re-attaching costs roughly 3 ms of
+ * CPU per MB, and Cloudflare's free plan allows 10 ms per request, so the default is 2 MB; on the
+ * paid plan MAX_FORWARD_MB can go up to Gmail's 25 MB.
+ */
+const DEFAULT_MAX_FORWARD_MB = 2;
+
+function forwardLimit(env: Env): { maxAttachmentBytes: number; maxAttachmentNote: string } {
+  const configured = Number((env as Env & { MAX_FORWARD_MB?: string }).MAX_FORWARD_MB);
+  const mb = Number.isFinite(configured) && configured > 0 ? Math.min(configured, 25) : DEFAULT_MAX_FORWARD_MB;
+  return {
+    maxAttachmentBytes: Math.floor(mb * 1048576),
+    maxAttachmentNote:
+      "The connector's owner can raise this limit with the MAX_FORWARD_MB variable in the Cloudflare Worker's settings " +
+      "(above about 2 MB that needs Cloudflare's paid Workers plan, because of the free plan's CPU limit).",
+  };
+}
+
 const jsonRpcError = (message: string, status: number, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message }, id: null }), {
     status,
@@ -78,6 +96,7 @@ const mcpHandler = {
       tokens: tokenProviderFor(env, origin),
       manageHint: `To link or remove Gmail accounts, open ${origin}/accounts`,
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
+      ...forwardLimit(env),
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

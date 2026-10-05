@@ -416,6 +416,15 @@ export function isPrivateAddress(ip: string): boolean {
   return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6) || v6.startsWith("ff") || v6.startsWith("::ffff:");
 }
 
+export interface MailboxOptions {
+  /**
+   * Most attachment bytes forward and update_draft will re-attach (below Gmail's 25 MB when the
+   * hosted connector's CPU and memory limits are tighter). A message for the user goes with it.
+   */
+  maxAttachmentBytes?: number;
+  maxAttachmentNote?: string;
+}
+
 /** Attachments at least this large are fetched on their own, as bytes, instead of in a batch. */
 const DIRECT_FETCH_BYTES = 64 * 1024;
 /** At most this many are fetched on their own (the largest); the rest share a batch call. */
@@ -439,7 +448,10 @@ export function attachmentDataOf(json: Uint8Array): Uint8Array {
 
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
-  constructor(readonly client: GmailClient) {}
+  constructor(
+    readonly client: GmailClient,
+    private readonly options: MailboxOptions = {},
+  ) {}
 
   get email(): string {
     return this.client.email;
@@ -581,6 +593,11 @@ export class Mailbox {
     const total = content.attachments.reduce((sum, a) => sum + a.size, 0);
     const size = `${(total / 1048576).toFixed(1)} MB`;
     if (total > MAX_ATTACHMENT_BYTES) throw new MimeError(tooBig(size, "25 MB Gmail allows in one email"));
+    const limit = this.options.maxAttachmentBytes;
+    if (limit !== undefined && total > limit) {
+      const limitMb = Math.round((limit / 1048576) * 10) / 10;
+      throw new MimeError(tooBig(size, `${limitMb} MB this connector re-attaches`, this.options.maxAttachmentNote));
+    }
     const withIds = content.attachments.filter((a) => a.id);
     const direct = new Set(
       [...withIds]

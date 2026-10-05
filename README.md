@@ -71,8 +71,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   it changes), and messages don't repeat their preview snippet or the thread ID.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
-- `forward` re-attaches the original message's attachments, up to Gmail's 25 MB limit (larger ones are
-  refused before anything is downloaded; forward those in Gmail, which sends them as Drive links).
+- `forward` re-attaches the original message's attachments, up to Gmail's 25 MB limit (2 MB on the
+  free hosted plan, see `MAX_FORWARD_MB` below). Larger ones are refused before anything is downloaded;
+  forward those in Gmail, which sends them as Drive links.
 - If sending fails with a server or network error, the error says the email may have gone out anyway,
   so Claude checks your Sent folder instead of sending it twice.
 - The two legacy `apply_sensitive_*_label` tools are left out. `trash_*` and `mark_*_spam` cover them.
@@ -161,9 +162,14 @@ dashboard are kept when the Worker redeploys.
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
 batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, archiving
 2,000 emails in each of five inboxes about 35, and unsubscribing from 20 senders across five inboxes
-about 35. If Claude ever reports errors like "exceeded
-CPU" or "too many subrequests", switch the Worker to the Workers Paid plan ($5/month), which raises
-both limits.
+about 35. If Claude ever reports errors like "exceeded CPU" or "too many subrequests", switch the
+Worker to the Workers Paid plan ($5/month), which raises both limits.
+
+**Forwarding attachments** costs about 3 ms of CPU per MB of attachments, so on the free plan the
+hosted connector forwards (and keeps in edited drafts) up to 2 MB of attachments per email; for
+anything larger, Claude gives you a link to forward it in Gmail. On the paid plan, raise the limit
+with a variable `MAX_FORWARD_MB` (e.g. `25`, Gmail's own limit) under the Worker's **Settings →
+Variables and Secrets**. The local version always allows Gmail's 25 MB.
 
 **If the first deploy fails to create storage:** in Cloudflare, go to **Storage & Databases → KV →
 Create** and make a namespace. Then under your Worker's **Settings → Bindings → Add → KV

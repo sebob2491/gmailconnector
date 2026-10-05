@@ -13,6 +13,7 @@ import {
   Mailbox,
   mapLimit,
   unsafeUnsubscribeHost,
+  type MailboxOptions,
   unsubscribeOptions,
   type SenderGroup,
   type UnsubscribeOptions,
@@ -36,13 +37,14 @@ export class AccountRouter {
     private tokens: TokenProvider,
     private fetchImpl: FetchLike = defaultFetch,
     private manageHint = LOCAL_MANAGE_HINT,
+    private mailboxOptions: MailboxOptions = {},
   ) {}
 
   private mailbox(account: LinkedAccount): Mailbox {
     const key = `${account.email}\n${account.refreshToken}`;
     let mb = this.mailboxes.get(key);
     if (!mb) {
-      mb = new Mailbox(new GmailClient(account, this.tokens, this.fetchImpl));
+      mb = new Mailbox(new GmailClient(account, this.tokens, this.fetchImpl), this.mailboxOptions);
       this.mailboxes.set(key, mb);
     }
     return mb;
@@ -337,6 +339,12 @@ export interface ServerDeps {
   webFetch?: FetchLike;
   /** Looks up a host's IP addresses so private ones can be refused. Defaults to systemResolveHost. */
   resolveHost?: (hostname: string) => Promise<string[]>;
+  /**
+   * Most attachment bytes forward and update_draft re-attach, when lower than Gmail's 25 MB (the
+   * hosted connector's CPU and memory limits), with a note telling the user how it can be raised.
+   */
+  maxAttachmentBytes?: number;
+  maxAttachmentNote?: string;
 }
 
 /**
@@ -370,7 +378,10 @@ export function createServer(deps: ServerDeps): McpServer {
   const fetchImpl = deps.fetchImpl ?? defaultFetch;
   const { store, tokens } = deps;
   const manageHint = deps.manageHint ?? LOCAL_MANAGE_HINT;
-  const router = new AccountRouter(store, tokens, fetchImpl, manageHint);
+  const router = new AccountRouter(store, tokens, fetchImpl, manageHint, {
+    maxAttachmentBytes: deps.maxAttachmentBytes,
+    maxAttachmentNote: deps.maxAttachmentNote,
+  });
 
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
@@ -682,7 +693,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Forward email",
       description:
-        "Forwards a message (with its attachments) from the Gmail account that holds it (`account` is required when several are linked). Optional comments go above the forwarded content via `forwardText` (plain text) or `htmlBody`.",
+        "Forwards a message (with its attachments) from the Gmail account that holds it (`account` is required when several are linked). If its attachments are too large to re-attach here, the error says so and links to the email so the user can forward it in Gmail. Optional comments go above the forwarded content via `forwardText` (plain text) or `htmlBody`.",
       inputSchema: {
         account: sendAccountArg,
         messageId: z.string().describe("Required. ID of the message to forward."),
