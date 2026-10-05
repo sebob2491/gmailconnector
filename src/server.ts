@@ -173,7 +173,7 @@ async function runContent(fn: () => Promise<CallToolResult["content"]>): Promise
 
 /** Images up to this size are returned for Claude to look at. */
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-/** PDFs up to this size are also returned as files, for clients that can read PDFs directly. */
+/** PDFs without extractable text are returned as files up to this size, for clients that can read PDFs directly. */
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
 
 /** Label changes behind each bulk action. */
@@ -760,7 +760,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Read attachment",
       description:
-        "Reads an email attachment from one Gmail account. Text files, CSV, HTML, calendar invites, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images come back as images you can see; PDFs come back as text when it can be extracted (and as the PDF file, for clients that read PDFs). Identify the attachment by `partId` or `filename` from get_message/get_thread (with neither, a message's only attachment is used).",
+        "Reads an email attachment from one Gmail account. Text files, CSV, HTML, calendar invites, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images come back as images you can see; PDFs come back as text when it can be extracted, otherwise as the PDF file (for clients that read PDFs). Identify the attachment by `partId` or `filename` from get_message/get_thread (with neither, a message's only attachment is used).",
       inputSchema: {
         account: accountArg,
         messageId: z.string().describe("Required. ID of the message the attachment is on."),
@@ -821,22 +821,27 @@ export function createServer(deps: ServerDeps): McpServer {
         }
         if (kind === "pdf") {
           const text = await pdfText(bytes);
-          const blocks: CallToolResult["content"] = text
-            ? asText(text, { extracted: "Text extracted from the PDF; layout, images and tables may be simplified." })
-            : withNote(
-                "No readable text could be extracted from this PDF (it may be scanned or use special fonts). Open it in Gmail with viewUrl.",
-              );
-          if (bytes.length <= MAX_PDF_BYTES) {
-            blocks.push({
+          if (text) return asText(text, { extracted: "Text extracted from the PDF; layout, images and tables may be simplified." });
+          // Scanned PDFs (or ones with custom font encodings) have no usable text layer: send the file itself,
+          // which clients that read PDFs can show to Claude.
+          if (bytes.length > MAX_PDF_BYTES) {
+            return withNote(
+              "No readable text could be extracted from this PDF (it may be scanned or use special fonts), and it is too large to send as a file. Open it in Gmail with viewUrl.",
+            );
+          }
+          return [
+            ...withNote(
+              "No readable text could be extracted from this PDF (it may be scanned or use special fonts). The PDF file is attached; if you can't see it, open it in Gmail with viewUrl.",
+            ),
+            {
               type: "resource",
               resource: {
                 uri: `gmail://${encodeURIComponent(mb.email)}/messages/${args.messageId}/attachments/${encodeURIComponent(info.filename)}`,
                 mimeType: "application/pdf",
                 blob: Buffer.from(bytes).toString("base64"),
               },
-            });
-          }
-          return blocks;
+            },
+          ];
         }
         return withNote(`This type of file (${mimeType}) can't be read as text. Open it in Gmail with viewUrl.`);
       }),

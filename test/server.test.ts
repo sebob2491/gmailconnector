@@ -1020,6 +1020,7 @@ describe("reading attachments", () => {
     { name: "budget.xlsx", type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", data: xlsx([["Item", "Cost"], ["Rent", 1200]]) },
     { name: "notes.csv", type: "text/csv", data: Buffer.from("a,b\n1,2") },
     { name: "archive.zip", type: "application/zip", data: Buffer.from("PK\x03\x04junk") },
+    { name: "scan.pdf", type: "application/pdf", data: pdf(["BT /F1 12 Tf 72 720 Td <000300040005000600070008000900> Tj ET"]) },
   ];
 
   async function setupWithFiles() {
@@ -1039,7 +1040,7 @@ describe("reading attachments", () => {
     );
   });
 
-  test("a PDF comes back as extracted text plus the file itself", async () => {
+  test("a PDF comes back as extracted text only", async () => {
     const { raw } = await setupWithFiles();
     const res = await raw({ filename: "statement.pdf" });
     assert.equal(res.isError, undefined, res.content[0].text);
@@ -1047,9 +1048,16 @@ describe("reading attachments", () => {
     assert.equal(meta.mimeType, "application/pdf");
     assert.match(meta.extracted, /extracted/);
     assert.equal(res.content[1].text, "Net pay: $1,234.56 for Sebastian");
-    assert.equal(res.content[2].type, "resource");
-    assert.equal(res.content[2].resource.mimeType, "application/pdf");
-    assert.ok(Buffer.from(res.content[2].resource.blob, "base64").subarray(0, 4).equals(Buffer.from("%PDF")));
+    assert.equal(res.content.length, 2);
+  });
+
+  test("a PDF without readable text comes back as the file itself", async () => {
+    const { raw } = await setupWithFiles();
+    const res = await raw({ filename: "scan.pdf" });
+    assert.match(JSON.parse(res.content[0].text).note, /No readable text.*The PDF file is attached/);
+    assert.equal(res.content[1].type, "resource");
+    assert.equal(res.content[1].resource.mimeType, "application/pdf");
+    assert.ok(Buffer.from(res.content[1].resource.blob, "base64").subarray(0, 4).equals(Buffer.from("%PDF")));
   });
 
   test("an image comes back as an image", async () => {

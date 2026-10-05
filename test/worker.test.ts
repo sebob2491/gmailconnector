@@ -357,7 +357,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
       (await mcp("tools/call", { name: "get_attachment", arguments: { account: PERSONAL, messageId: "paperwork", filename } })).result;
     const pdfResult = await read("pay.pdf");
     assert.equal(pdfResult.content[1].text, "Net pay this period: $2,000.00");
-    assert.equal(pdfResult.content[2].type, "resource");
+    assert.equal(pdfResult.content.length, 2);
     const wordResult = await read("offer.docx");
     assert.equal(wordResult.content[1].text, "Offer letter\nSalary: $80,000");
   });

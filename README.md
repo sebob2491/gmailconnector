@@ -29,7 +29,8 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 - New `list_accounts` tool, and an `account` argument on every tool.
 - New `get_attachment` tool: Claude can read attachments. Text, CSV, HTML, calendar invites, Word
   (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images as images; PDFs as extracted
-  text (when the PDF has a text layer with standard fonts) plus the PDF itself for clients that read PDFs.
+  text (when the PDF has a text layer with standard fonts), otherwise as the PDF file itself for clients
+  that read PDFs.
 - New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
   promotions older than a week"). They support a dry run that previews what would change, and Claude
