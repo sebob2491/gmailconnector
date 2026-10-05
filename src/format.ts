@@ -290,15 +290,27 @@ export function viewUrl(email: string, fragment: string): string {
 
 /**
  * Invisible characters that marketing emails pad their previews with (combining grapheme joiner,
- * zero-width spaces/joiners, direction marks, soft hyphens, blank Braille and Hangul fillers, BOM).
- * U+200D is kept because emoji sequences need it.
+ * zero-width spaces, direction marks, soft hyphens, blank Braille and Hangul fillers, BOM).
+ * U+200D (zero-width joiner) is kept because emoji sequences need it.
  */
-const INVISIBLE = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180e\u200b\u200c\u200e\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\u2800\u3164\ufeff\uffa0]/g;
+const INVISIBLE = /[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\u2800\u3164\ufeff\uffa0]/g;
+
+/**
+ * The zero-width non-joiner (U+200C) and Mongolian vowel separator (U+180E) are part of words in
+ * Persian, Indic scripts and Mongolian ("می‌خواهم"), where they sit between letters (after any
+ * combining marks). Anywhere else they are padding, like the "&zwnj;&nbsp;" runs in email previews.
+ */
+const STRAY_JOINER = /(?<!\p{L}\p{M}*)[\u200c\u180e]|[\u200c\u180e](?!\p{L})/gu;
+
+/** Removes invisible padding characters, keeping joiners that are part of words. */
+export function stripInvisible(text: string): string {
+  return text.replace(INVISIBLE, "").replace(STRAY_JOINER, "");
+}
 
 /** Gmail snippets are HTML-escaped and often padded; returns readable text (or undefined if empty). */
 export function cleanSnippet(snippet: string | undefined): string | undefined {
   if (!snippet) return undefined;
-  const clean = decodeEntities(snippet).replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
+  const clean = stripInvisible(decodeEntities(snippet)).replace(/\s+/g, " ").trim();
   return clean || undefined;
 }
 
@@ -307,11 +319,11 @@ export function cleanSnippet(snippet: string | undefined): string | undefined {
  * and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate cells, including empty ones.
  */
 export function cleanBody(text: string): string {
-  return text
-    .replace(/\r\n?/g, "\n")
-    .replace(INVISIBLE, "")
+  return stripInvisible(text.replace(/\r\n?/g, "\n"))
     .replace(/[^\S\n\t]{2,}/g, " ")
-    .replace(/[^\S\n]+\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd()) // not /[^\S\n]+\n/, which is quadratic on long runs of tabs
+    .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -431,7 +443,7 @@ export async function formatMessage(
   if (format !== "METADATA_ONLY") {
     const snippet = cleanSnippet(msg.snippet);
     if (snippet) out.snippet = snippet;
-    out.subject = (header(p, "Subject") ?? "").replace(INVISIBLE, "").trim();
+    out.subject = stripInvisible(header(p, "Subject") ?? "").trim();
   }
   out.sender = header(p, "From");
   out.toRecipients = parseAddressList(header(p, "To"));

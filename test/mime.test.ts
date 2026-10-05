@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
-import { bareAddress, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
+import { bareAddress, cleanBody, cleanSnippet, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
 import { buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
 
@@ -183,4 +183,19 @@ test("group syntax and comments parse into real mailboxes", () => {
     { address: '"john doe"@example.com' },
     { address: "a@x.com" },
   ]);
+});
+
+test("invisible padding is removed, but joiners that are part of words are kept", () => {
+  // Preview padding: combining grapheme joiner, no-break space and zero-width non-joiner runs.
+  assert.equal(cleanSnippet("Sale ͏ ‌͏ ‌͏ ‌ ends &zwnj;&nbsp;now"), "Sale ends now");
+  // Persian and Hindi need U+200C between letters (after combining marks); Mongolian needs U+180E.
+  for (const word of ["می‌خواهم", "क्‌ष", "ᠮᠣᠷᠢ᠎ᠨ", "👨‍👩‍👧"]) assert.equal(cleanBody(`a ${word} b`), `a ${word} b`);
+  assert.equal(cleanBody("Blank⠀⠀ Braille​"), "Blank Braille");
+});
+
+test("cleanBody stays fast on long runs of tabs and spaces", () => {
+  const start = process.cpuUsage();
+  cleanBody(`a${"\t".repeat(200_000)}b\n${" \t".repeat(100_000)}c`);
+  const used = process.cpuUsage(start);
+  assert.ok((used.user + used.system) / 1000 < 200);
 });
