@@ -171,7 +171,7 @@ export function accountsPage(opts: {
   owner?: string;
   csrf: string;
   connecting?: { clientName: string; redirectHost: string };
-  notice?: { kind: "ok" | "bad"; text: string };
+  notice?: { kind: "ok" | "bad" | "warn"; text: string; link?: { href: string; label: string } };
 }): string {
   const rows = opts.accounts
     .map(
@@ -183,7 +183,13 @@ export function accountsPage(opts: {
   const csrf = `<input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">`;
   const title = opts.connecting ? `Choose the Gmail accounts for ${opts.connecting.clientName}` : "Linked Gmail accounts";
   const body = `<div class="card"><h1>${escapeHtml(title)}</h1>
-${opts.notice ? `<div class="notice ${opts.notice.kind}">${escapeHtml(opts.notice.text)}</div>` : ""}
+${
+  opts.notice
+    ? `<div class="notice ${opts.notice.kind}">${escapeHtml(opts.notice.text)}${
+        opts.notice.link ? ` <a href="${escapeHtml(opts.notice.link.href)}">${escapeHtml(opts.notice.link.label)}</a>` : ""
+      }</div>`
+    : ""
+}
 ${opts.accounts.length ? `<ul class="accounts">${rows}</ul>` : `<p class="muted">No accounts linked yet.</p>`}
 <div class="actions">
 <form method="post" action="/accounts/link">${csrf}<button${opts.connecting ? "" : ` class="primary"`}>＋ Link ${opts.accounts.length ? "another" : "a"} Gmail account</button></form>

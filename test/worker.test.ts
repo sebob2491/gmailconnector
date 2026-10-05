@@ -79,6 +79,9 @@ async function kvSnapshot(instance: Miniflare): Promise<Map<string, string | nul
 
 const COMPAT = { compatibilityDate: "2026-09-01", compatibilityFlags: ["nodejs_compat", "global_fetch_strictly_public"] };
 
+/** Google's revoke endpoint fails while this is set (tests a revoke Google doesn't confirm). */
+let failRevoke = false;
+
 async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, string>): Promise<Miniflare> {
   const instance = new Miniflare(
     convertV4MiniflareOptions({
@@ -88,6 +91,7 @@ async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, strin
       kvNamespaces: ["OAUTH_KV"],
       bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
       outboundService: async (req: MfRequest) => {
+        if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
         const res = await fakeGoogle.fetch(req.url, {
           method: req.method,
           headers: Object.fromEntries(req.headers),
@@ -561,6 +565,25 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.ok(fake.revokeCalls.includes("rt-work"));
     const accounts = await callTool("list_accounts");
     assert.deepEqual(accounts.json.accounts.map((a: any) => a.email), [PERSONAL]);
+  });
+
+  test("removing an account says so when Google doesn't confirm the revoke", async () => {
+    const browser = new Browser(mf);
+    await browser.googleSignIn((await browser.fetch("/accounts")).location, fake, PERSONAL);
+    const csrf = field((await browser.fetch("/accounts")).text, "csrf");
+    const toGoogle = await browser.fetch("/accounts/link", { form: { csrf } });
+    assert.equal((await browser.googleSignIn(toGoogle.location, fake, "extra3@example.com")).status, 303);
+    failRevoke = true;
+    try {
+      const removed = await browser.fetch("/accounts/remove", { form: { csrf, email: "extra3@example.com" } });
+      assert.equal(removed.status, 303);
+      const page = await browser.fetch(removed.location);
+      assert.match(page.text, /class="notice warn">Removed extra3@example\.com, but Google didn(&#39;|')t confirm/);
+      assert.match(page.text, /href="https:\/\/myaccount\.google\.com\/permissions"/);
+    } finally {
+      failRevoke = false;
+    }
+    assert.ok(!(await callTool("list_accounts")).json.accounts.some((a: any) => a.email === "extra3@example.com"));
   });
 
   test("a revoked Google authorization tells Claude where to re-link", async () => {

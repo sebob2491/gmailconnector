@@ -48,6 +48,8 @@ const SIGNIN_TTL = 10 * 60;
 const MAX_COOKIE_BYTES = 3800;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32}$/;
 
+const PERMISSIONS_URL = "https://myaccount.google.com/permissions";
+
 interface SessionData {
   /** The pending authorization from Claude; absent when managing accounts directly. */
   request?: AuthRequest;
@@ -349,6 +351,13 @@ function accountsNotice(url: URL) {
   const removed = q.get("removed");
   if (linked) return { kind: "ok" as const, text: `Linked ${linked}.` };
   if (signedIn) return { kind: "ok" as const, text: `Signed in as ${signedIn}. That account isn't linked; use "Link" below to add it.` };
+  if (removed && q.get("revoked") === "0") {
+    return {
+      kind: "warn" as const,
+      text: `Removed ${removed}, but Google didn't confirm that its access was revoked. To be sure, sign in to Google as ${removed}, open myaccount.google.com/permissions and remove this connector there.`,
+      link: { href: PERMISSIONS_URL, label: "Open myaccount.google.com/permissions" },
+    };
+  }
   if (removed) return { kind: "ok" as const, text: `Removed ${removed}.` };
   if (q.get("error") === "none") return { kind: "bad" as const, text: "Link at least one Gmail account first." };
   return undefined;
@@ -389,13 +398,14 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
       const email = String(form.get("email") ?? "");
       const rec = await loadOwner(env.OAUTH_KV);
       const account = rec.accounts.find((a) => sameEmail(a.email, email));
+      let revoked = true;
       if (account) {
         rec.accounts = rec.accounts.filter((a) => a !== account);
         if (rec.defaultAccount && sameEmail(rec.defaultAccount, email)) delete rec.defaultAccount;
         await saveOwner(env.OAUTH_KV, rec);
-        await revokeToken(account.refreshToken);
+        revoked = await revokeToken(account.refreshToken);
       }
-      return redirect(`${origin}/accounts?removed=${encodeURIComponent(email)}`, undefined, 303);
+      return redirect(`${origin}/accounts?removed=${encodeURIComponent(email)}${revoked ? "" : "&revoked=0"}`, undefined, 303);
     }
     case "cancel": {
       const headers = new Headers();
