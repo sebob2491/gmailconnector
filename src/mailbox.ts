@@ -13,6 +13,7 @@ import {
   recipientsFrom,
   viewUrl,
   type ApiMessage,
+  type AttachmentInfo,
   type ExtractedContent,
   type FormatOptions,
   type FormattedMessage,
@@ -902,8 +903,9 @@ export class Mailbox {
       const bytes = Buffer.from((await this.loader(msg.id)(ref.attachmentId)) as string, "base64url");
       const sameSize = attachments.filter((a) => a.size === bytes.length);
       const match = sameSize.length === 1 ? sameSize[0] : attachments.length === 1 ? attachments[0] : undefined;
+      const fallback: AttachmentInfo = { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: bytes.length, inline: false };
       return {
-        info: match ?? { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: bytes.length, inline: false },
+        info: match ?? fallback,
         bytes,
         message: msg,
       };
