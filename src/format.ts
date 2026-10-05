@@ -182,14 +182,47 @@ export function attachmentCharset(payload: ApiMessagePart | undefined, partId: s
   return undefined;
 }
 
-export function decodeBody(data: string, contentType?: string): string {
-  const buf = Buffer.from(data, "base64url");
-  const charset = charsetOf(contentType) ?? "utf-8";
-  try {
-    return new TextDecoder(charset).decode(buf);
-  } catch {
-    return new TextDecoder("utf-8").decode(buf);
+/** Charsets that mean "UTF-8 if it is valid": senders often label Windows-1252 text as one of these. */
+const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-utf-8"]);
+
+/**
+ * Decodes text in its declared charset, except that non-ASCII bytes forming valid UTF-8 are read as
+ * UTF-8 whatever the label says. Gmail hands out message bodies already converted to UTF-8 while the
+ * part still declares its original charset (e.g. ISO-8859-1), and decoding those as declared turns
+ * "—" into "â€”"; text really written in a single-byte or East Asian charset is almost never valid
+ * UTF-8. Undeclared, unknown or wrongly declared UTF-8 falls back to Windows-1252. `partial` says the
+ * bytes are cut off, so a split last character doesn't count against UTF-8.
+ */
+export function decodeCharset(bytes: Uint8Array, declared?: string, partial = false): string {
+  const charset = declared?.trim().replace(/^["']|["']$/g, "").toLowerCase();
+  const utf8 = () => new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes, { stream: partial });
+  // UTF-16/32 text is full of bytes that could pass as UTF-8 only by accident: trust the label.
+  if (charset && /^utf-?(16|32)/.test(charset)) {
+    try {
+      return new TextDecoder(charset).decode(bytes);
+    } catch {
+      // fall through
+    }
   }
+  if (!charset || UTF8_LIKE.has(charset) || bytes.some((b) => b >= 0x80)) {
+    try {
+      return utf8();
+    } catch {
+      // Not UTF-8: decode as declared below.
+    }
+  }
+  if (charset && !UTF8_LIKE.has(charset)) {
+    try {
+      return new TextDecoder(charset).decode(bytes);
+    } catch {
+      // Unknown charset name.
+    }
+  }
+  return new TextDecoder("windows-1252").decode(bytes);
+}
+
+export function decodeBody(data: string, contentType?: string): string {
+  return decodeCharset(Buffer.from(data, "base64url"), charsetOf(contentType));
 }
 
 export interface AttachmentInfo {

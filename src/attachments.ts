@@ -9,7 +9,7 @@
  */
 import { Buffer } from "node:buffer";
 import { inflateRawSync, inflateSync } from "node:zlib";
-import { attachmentText, limitLength } from "./format.js";
+import { attachmentText, decodeCharset, limitLength } from "./format.js";
 import { htmlToText, latin1 } from "./mime.js";
 
 export type AttachmentKind = "text" | "image" | "pdf" | "office" | "binary";
@@ -87,35 +87,21 @@ export function kindOf(mimeType: string, filename: string): AttachmentKind {
   return "binary";
 }
 
-/** Charsets that mean "UTF-8 if it is valid": senders often label Windows-1252 text as one of these. */
-const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-utf-8"]);
-
 /**
- * Decodes text bytes: a byte-order mark wins, then a declared charset (the attachment's Content-Type,
- * or an HTML <meta>), then UTF-8 if the bytes are valid UTF-8, else Windows-1252 (what Excel and
- * Windows programs write). `partial` says the bytes are cut off, so a split last character is fine.
+ * Decodes text bytes: a byte-order mark wins; then decodeCharset with the declared charset (the
+ * attachment's Content-Type, or an HTML <meta>), which reads valid non-ASCII UTF-8 as UTF-8 and
+ * otherwise the declared charset, else Windows-1252 (what Excel and Windows programs write).
+ * `partial` says the bytes are cut off, so a split last character is fine.
  */
 function decodeText(bytes: Uint8Array, declared: string | undefined, html: boolean, partial: boolean): string {
   if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return new TextDecoder("utf-8").decode(bytes);
   if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes.subarray(2));
   if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes.subarray(2));
-  let charset = declared?.trim().replace(/^["']|["']$/g, "").toLowerCase();
-  if (!charset && html) {
-    const head = Buffer.from(bytes.subarray(0, 1024)).toString("latin1");
-    charset = /<meta[^>]{0,200}?charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(head)?.[1]?.toLowerCase();
+  let charset = declared;
+  if (!charset?.trim() && html) {
+    charset = /<meta[^>]{0,200}?charset\s*=\s*["']?\s*([\w.:-]+)/i.exec(latin1(bytes.subarray(0, 1024)))?.[1];
   }
-  if (charset && !UTF8_LIKE.has(charset)) {
-    try {
-      return new TextDecoder(charset).decode(bytes);
-    } catch {
-      // Unknown charset name: guess below.
-    }
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes, { stream: partial });
-  } catch {
-    return new TextDecoder("windows-1252").decode(bytes);
-  }
+  return decodeCharset(bytes, charset, partial);
 }
 
 export interface TextReadOptions extends ReadOptions {

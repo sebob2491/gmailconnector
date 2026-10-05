@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
-import { bareAddress, cleanBody, cleanSnippet, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
+import { bareAddress, cleanBody, cleanSnippet, decodeBody, decodeCharset, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
 import { buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
 
@@ -276,4 +276,21 @@ test("attached emails are sent as 7-bit text when they are plain ASCII", () => {
   const latin = Buffer.from("Subject: Caf\xe9\r\n\r\nx", "latin1");
   const raw8 = buildMime({ to: ["a@example.com"], text: "fwd", attachments: [{ content: latin, filename: "x.eml", mimeType: "message/rfc822" }] });
   assert.match(raw8, /message\/rfc822[^]*Content-Transfer-Encoding: base64/);
+});
+
+test("bodies Gmail already converted to UTF-8 aren't decoded twice; real legacy charsets still work", () => {
+  // Gmail hands out the ASU-style body as UTF-8 while the part still says ISO-8859-1.
+  const converted = Buffer.from("admission — prior notations (2017–2026)", "utf8");
+  assert.equal(decodeCharset(converted, "ISO-8859-1"), "admission — prior notations (2017–2026)");
+  // The same text really in Windows-1252 bytes (0x97 is an em dash there).
+  const legacy = Buffer.from([0x61, 0x20, 0x97, 0x20, 0x62, 0x20, 0xe9]);
+  assert.equal(decodeCharset(legacy, "ISO-8859-1"), "a — b é");
+  // 7-bit charsets (ISO-2022-JP) are decoded as declared, not taken for ASCII UTF-8.
+  const jis = Buffer.from([0x1b, 0x24, 0x42, 0x46, 0x7c, 0x4b, 0x5c, 0x1b, 0x28, 0x42]);
+  assert.equal(decodeCharset(jis, "ISO-2022-JP"), "日本");
+  // Shift_JIS bytes aren't valid UTF-8, so the label is used.
+  assert.equal(decodeCharset(Buffer.from([0x93, 0xfa, 0x96, 0x7b]), "Shift_JIS"), "日本");
+  // Mislabelled "UTF-8" that is really Windows-1252 doesn't turn into replacement characters.
+  assert.equal(decodeCharset(Buffer.from([0x4a, 0xfc, 0x72, 0x67, 0x65, 0x6e]), "utf-8"), "Jürgen");
+  assert.equal(decodeBody(Buffer.from("café", "utf8").toString("base64url"), "text/plain; charset=windows-1252"), "café");
 });
