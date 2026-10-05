@@ -58,6 +58,24 @@ class Browser {
 }
 
 const field = (html: string, name: string) => new RegExp(`name="${name}" value="([^"]+)"`).exec(html)?.[1] ?? "";
+const unescape = (html: string) => html.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+/** The href of the link labelled `label` (e.g. a "Back to Claude" button). */
+const linkTo = (html: string, label: string) => unescape(new RegExp(`href="([^"]+)">${label}<`).exec(html)?.[1] ?? "");
+
+/** Answers the consent page the way a browser would: posts its form, CSRF token included, to its action URL. */
+function answerConsent(browser: Browser, consentHtml: string, decision: "approve" | "deny" = "approve") {
+  const action = unescape(/<form method="post" action="([^"]+)"/.exec(consentHtml)?.[1] ?? "/authorize");
+  return browser.fetch(action, { form: { csrf: field(consentHtml, "csrf"), decision } });
+}
+
+/** Every KV entry, to check that a request wrote nothing. */
+async function kvSnapshot(instance: Miniflare): Promise<Map<string, string | null>> {
+  const kv = await instance.getKVNamespace("OAUTH_KV");
+  const snapshot = new Map<string, string | null>();
+  for (const key of (await kv.list()).keys) snapshot.set(key.name, (await kv.get(key.name, "text")) as string | null);
+  return snapshot;
+}
+
 
 let mf: Miniflare;
 let fake: FakeGmail;
@@ -178,7 +196,7 @@ async function connectAsOwner(clientId: string): Promise<string> {
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const browser = new Browser(mf);
   const consent = await browser.fetch(authorizeUrl(clientId, challenge));
-  const toGoogle = await browser.fetch("/authorize", { form: { handle: field(consent.text, "handle"), decision: "approve" } });
+  const toGoogle = await answerConsent(browser, consent.text);
   const back = await browser.googleSignIn(toGoogle.location, fake, PERSONAL);
   assert.equal(back.status, 303, back.text);
   const page = await browser.fetch("/accounts");
@@ -242,7 +260,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(consent.text, /Connect your Gmail to Claude/);
     assert.match(consent.text, /Access will be sent to <b>claude\.ai<\/b>/);
 
-    const toGoogle = await browser.fetch("/authorize", { form: { handle: field(consent.text, "handle"), decision: "approve" } });
+    const toGoogle = await answerConsent(browser, consent.text);
     assert.equal(toGoogle.status, 302, toGoogle.text);
     const google = new URL(toGoogle.location);
     assert.equal(google.searchParams.get("redirect_uri"), `${ORIGIN}/google/callback`);
@@ -265,6 +283,10 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(toGoogle2.status, 302);
     const back2 = await browser.googleSignIn(toGoogle2.location, fake, WORK);
     assert.equal(back2.status, 303, back2.text);
+    assert.ok(
+      back2.headers.getSetCookie().some((c) => c.startsWith("__Host-gmail-connector=") && /Max-Age=1800/.test(c)),
+      "saving the session extends its cookie too",
+    );
     page = await browser.fetch("/accounts");
     assert.ok(page.text.includes(PERSONAL) && page.text.includes(WORK));
     assert.match(page.text, /me\.personal@gmail\.com<span class="tag">owner<\/span>/);
@@ -392,15 +414,13 @@ describe("hosted connector (Cloudflare Worker)", () => {
   test("a refused sign-in while connecting can go back to Claude", async () => {
     const browser = new Browser(mf);
     const consent = await browser.fetch(authorizeUrl(firstClientId, "y".repeat(43)));
-    const toGoogle = await browser.fetch("/authorize", { form: { handle: field(consent.text, "handle"), decision: "approve" } });
+    const toGoogle = await answerConsent(browser, consent.text);
     const refused = await browser.googleSignIn(toGoogle.location, fake, STRANGER);
     assert.equal(refused.status, 403);
-    assert.match(refused.text, /Back to Claude/);
-    const back = await browser.fetch("/accounts/cancel", { form: { csrf: field(refused.text, "csrf") } });
-    assert.equal(back.status, 302);
-    const url = new URL(back.location);
+    const url = new URL(linkTo(refused.text, "Back to Claude"));
     assert.equal(url.origin + url.pathname, CLAUDE_CALLBACK);
     assert.equal(url.searchParams.get("error"), "access_denied");
+    assert.equal(url.searchParams.get("state"), "claude-state-123");
   });
 
   test("connecting again doesn't disconnect an earlier connection", async () => {
@@ -446,6 +466,39 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const res = await new Browser(mf).fetch(authorizeUrl(evilClient, "x".repeat(43), "https://evil.example/callback"));
     assert.equal(res.status, 403);
     assert.match(res.text, /only works with Claude/);
+  });
+
+  test("visitors who haven't signed in write nothing to storage", async () => {
+    const before = await kvSnapshot(mf);
+    const visitor = new Browser(mf);
+    await visitor.fetch("/");
+    for (let i = 0; i < 3; i++) assert.equal((await visitor.fetch("/accounts")).status, 302);
+    // Starting to connect from Claude, up to Google's sign-in page.
+    const consent = await visitor.fetch(authorizeUrl(firstClientId, "z".repeat(43)));
+    assert.equal(consent.status, 200);
+    const toGoogle = await answerConsent(visitor, consent.text);
+    assert.equal(toGoogle.status, 302);
+    // Cancelling on the consent page.
+    const declined = await answerConsent(visitor, (await visitor.fetch(authorizeUrl(firstClientId, "z".repeat(43)))).text, "deny");
+    assert.equal(new URL(declined.location).searchParams.get("error"), "access_denied");
+    // A stranger who signs in with Google is turned away without storing anything.
+    assert.equal((await visitor.googleSignIn(toGoogle.location, fake, STRANGER)).status, 403);
+    // Made-up callbacks.
+    assert.equal((await visitor.fetch(`/google/callback?state=${"a".repeat(32)}&code=x`)).status, 400);
+    assert.equal((await visitor.fetch("/google/callback")).status, 400);
+    assert.deepEqual(await kvSnapshot(mf), before);
+  });
+
+  test("the consent form can't be submitted from another site", async () => {
+    const browser = new Browser(mf);
+    const consent = await browser.fetch(authorizeUrl(firstClientId, "z".repeat(43)));
+    const action = unescape(/<form method="post" action="([^"]+)"/.exec(consent.text)![1]);
+    // Another site's form can't read the token or send this site's (SameSite) cookie.
+    const forged = await new Browser(mf).fetch(action, { form: { csrf: field(consent.text, "csrf"), decision: "approve" } });
+    assert.equal(forged.status, 400);
+    assert.match(forged.text, /This page expired/);
+    const wrongToken = await browser.fetch(action, { form: { csrf: "b".repeat(32), decision: "approve" } });
+    assert.equal(wrongToken.status, 400);
   });
 
   test("request errors are never redirected to a site that isn't Claude", async () => {

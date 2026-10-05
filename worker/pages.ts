@@ -75,14 +75,14 @@ export function messagePage(
     status?: number;
     kind?: "ok" | "bad" | "warn";
     action?: { href: string; label: string };
-    form?: { action: string; csrf: string; label: string };
+    /** Extra response headers, e.g. cookies to set or clear. */
+    headers?: Headers;
   } = {},
 ): Response {
   const body = `<div class="card"><h1>${escapeHtml(title)}</h1>
 <div class="notice ${opts.kind ?? "bad"}">${escapeHtml(message)}</div>
-${opts.action ? `<div class="actions"><a class="button primary" href="${escapeHtml(opts.action.href)}">${escapeHtml(opts.action.label)}</a></div>` : ""}
-${opts.form ? `<form method="post" action="${escapeHtml(opts.form.action)}" class="actions"><input type="hidden" name="csrf" value="${escapeHtml(opts.form.csrf)}"><button class="primary">${escapeHtml(opts.form.label)}</button></form>` : ""}</div>`;
-  return htmlResponse(layout(title, body), { status: opts.status ?? 400 });
+${opts.action ? `<div class="actions"><a class="button primary" href="${escapeHtml(opts.action.href)}">${escapeHtml(opts.action.label)}</a></div>` : ""}</div>`;
+  return htmlResponse(layout(title, body), { status: opts.status ?? 400, headers: opts.headers });
 }
 
 function copyRow(value: string): string {
@@ -136,13 +136,20 @@ export function privacyPage(origin: string): string {
   return layout("Privacy policy", body);
 }
 
-export function consentPage(opts: { clientName: string; redirectHost: string; handle: string; local: boolean }): string {
+export function consentPage(opts: {
+  clientName: string;
+  redirectHost: string;
+  /** Where the form posts: the authorization URL itself, so the request is parsed again on POST. */
+  action: string;
+  csrf: string;
+  local: boolean;
+}): string {
   const body = `<div class="card"><h1>Connect your Gmail to ${escapeHtml(opts.clientName)}</h1>
 <p><b>${escapeHtml(opts.clientName)}</b> is asking to read, send and organize email in the Gmail accounts you link here.</p>
 <p class="muted">Access will be sent to <b>${escapeHtml(opts.redirectHost)}</b>. Next you'll sign in with Google; you can link more accounts after that.</p>
 ${opts.local ? `<div class="notice warn">This sends access to an app on your computer. Continue only if you just started connecting from it.</div>` : ""}
-<form method="post" class="actions">
-<input type="hidden" name="handle" value="${escapeHtml(opts.handle)}">
+<form method="post" action="${escapeHtml(opts.action)}" class="actions">
+<input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">
 <button class="primary" name="decision" value="approve">Continue with Google</button>
 <button name="decision" value="deny">Cancel</button>
 </form></div>`;
