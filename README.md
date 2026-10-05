@@ -44,6 +44,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 - `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
   how much was left out). Pass `maxBodyChars: 0` for the full text. Replies and forwards always use the
   whole email.
+- `get_message` and `get_thread` cut links longer than 200 characters (almost always marketing tracking
+  redirects) to their website, e.g. `https://click.shop.com/…`, with a note saying so. A typical store
+  email shrinks from tens of thousands of characters to a few thousand. `messageFormat: "FULL_CONTENT"`
+  returns the full links. Drafts are never shortened, so editing one can't break its links.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
 - `forward` re-attaches the original message's attachments.

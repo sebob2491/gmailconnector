@@ -216,7 +216,7 @@ const messageFormatArg = z
   .enum(["MINIMAL", "PLAIN_TEXT", "FULL_CONTENT", "METADATA_ONLY", "RAW"])
   .optional()
   .describe(
-    "Optional. Defaults to PLAIN_TEXT. MINIMAL: headers + snippet, no body. PLAIN_TEXT: headers + plain-text body (HTML converted to text) + attachment info. FULL_CONTENT: PLAIN_TEXT plus the HTML body. METADATA_ONLY: senders/recipients/date/labels only. RAW: the raw MIME message.",
+    "Optional. Defaults to PLAIN_TEXT. MINIMAL: headers + snippet, no body. PLAIN_TEXT: headers + plain-text body (HTML converted to text; in get_message/get_thread, links over 200 characters are cut to their website) + attachment info. FULL_CONTENT: PLAIN_TEXT with full links, plus the HTML body. METADATA_ONLY: senders/recipients/date/labels only. RAW: the raw MIME message.",
   );
 const maxBodyCharsArg = z
   .number()
@@ -383,7 +383,7 @@ export function createServer(deps: ServerDeps): McpServer {
         const mb = await router.one(args.account);
         return {
           account: mb.email,
-          ...(await mb.getThread(args.threadId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars })),
+          ...(await mb.getThread(args.threadId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars, shortenLinks: true })),
         };
       }),
   );
@@ -407,7 +407,7 @@ export function createServer(deps: ServerDeps): McpServer {
         const mb = await router.one(args.account);
         return {
           account: mb.email,
-          ...(await mb.getMessage(args.messageId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars })),
+          ...(await mb.getMessage(args.messageId, args.messageFormat ?? "PLAIN_TEXT", { maxBodyChars: args.maxBodyChars, shortenLinks: true })),
         };
       }),
   );

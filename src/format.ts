@@ -282,14 +282,32 @@ export function cleanSnippet(snippet: string | undefined): string | undefined {
   return clean || undefined;
 }
 
-/** Removes invisible padding and collapses the runs of blank space it leaves behind. */
+/**
+ * Removes invisible padding and collapses the runs of blank space it leaves behind (any Unicode space,
+ * and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate cells, including empty ones.
+ */
 export function cleanBody(text: string): string {
   return text
+    .replace(/\r\n?/g, "\n")
     .replace(INVISIBLE, "")
-    .replace(/[ \t\u00a0]{2,}/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
+    .replace(/[^\S\n\t]{2,}/g, " ")
+    .replace(/[^\S\n]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+/** Links longer than this are nearly always tracking redirects; reading views cut them to their site. */
+const LONG_LINK = 200;
+
+/** Replaces each link longer than LONG_LINK characters with `https://site/…`, and counts them. */
+export function shortenLinks(text: string): { text: string; shortened: number } {
+  let shortened = 0;
+  const out = text.replace(/\bhttps?:\/\/[^\s<>()"']+/gi, (url) => {
+    if (url.length <= LONG_LINK) return url;
+    shortened++;
+    return `${/^https?:\/\/[^/?#]*/i.exec(url)![0]}/…`;
+  });
+  return { text: out, shortened };
 }
 
 /** Bodies longer than this are shortened unless the caller asks for more (0 means no limit). */
@@ -307,6 +325,11 @@ export function limitLength(text: string, max: number): { text: string; omitted:
 export interface FormatOptions {
   /** Maximum characters per body (plain text and HTML separately); 0 for no limit. */
   maxBodyChars?: number;
+  /**
+   * In PLAIN_TEXT, cut links over 200 characters to their site. Only for reading: never for text that
+   * may be edited and saved again (drafts), since the cut links would replace the real ones.
+   */
+  shortenLinks?: boolean;
 }
 
 export interface FormattedMessage {
@@ -326,6 +349,8 @@ export interface FormattedMessage {
   raw?: string;
   /** Set when a body was shortened; says how to get the rest. */
   truncated?: string;
+  /** Set when long links were cut; says how to get them. */
+  linksShortened?: string;
   viewUrl: string;
 }
 
@@ -359,7 +384,10 @@ export async function formatMessage(
   if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {
     const content = await extractContent(p, loadData);
     const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
-    const plain = limitLength(cleanBody(bodyText(content)), max);
+    let body = cleanBody(bodyText(content));
+    let shortenedLinks = 0;
+    if (opts.shortenLinks && format === "PLAIN_TEXT") ({ text: body, shortened: shortenedLinks } = shortenLinks(body));
+    const plain = limitLength(body, max);
     out.plaintextBody = plain.text;
     let omitted = plain.omitted;
     if (format === "FULL_CONTENT" && content.html !== undefined) {
@@ -371,6 +399,11 @@ export async function formatMessage(
       out.truncated =
         `Body shortened: ${omitted.toLocaleString("en-US")} more characters not shown. ` +
         `Fetch it with get_message, get_thread or get_draft and maxBodyChars: 0 for the full text.`;
+    }
+    if (shortenedLinks) {
+      out.linksShortened =
+        `${shortenedLinks} long link${shortenedLinks === 1 ? " was" : "s were"} cut to ${shortenedLinks === 1 ? "its" : "their"} website (https://site/…). ` +
+        `For the full links, call again with messageFormat FULL_CONTENT (and maxBodyChars: 0 if the body was also shortened).`;
     }
     if (content.attachments.length) out.attachments = content.attachments;
   }

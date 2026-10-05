@@ -986,6 +986,52 @@ describe("cleaner, smaller results", () => {
     const res = await call("get_message", { account: "personal", messageId: "pad" });
     assert.equal(res.json.plaintextBody, "Big sale today\n\nShop now");
   });
+
+  test("blank padding made of other spaces and CRLF line ends is collapsed; tabs are kept", async () => {
+    const { call, fake, personal } = await setup();
+    const figureSpaces = "\u2007".repeat(200);
+    fake.deliver(
+      personal,
+      crlf(["From: shop@example.com", `To: ${PERSONAL}`, "Subject: Deals", "Content-Type: text/plain; charset=UTF-8", "", "Ends tonight.", "", figureSpaces, "", "", "", "Item\t\tPrice"]),
+      { id: "spaces" },
+    );
+    const res = await call("get_message", { account: "personal", messageId: "spaces" });
+    assert.equal(res.json.plaintextBody, "Ends tonight.\n\nItem\t\tPrice");
+  });
+
+  test("long tracking links are cut to their site when reading, but kept in drafts and FULL_CONTENT", async () => {
+    const { call, fake, personal } = await setup();
+    const tracking = `https://click.mail.shop.example/c2/abc?jwt=${"x".repeat(1500)}`;
+    const meeting = "https://meet.example.com/j/123456789?pwd=abcdef";
+    fake.deliver(
+      personal,
+      crlf([
+        "From: shop@example.com",
+        `To: ${PERSONAL}`,
+        "Subject: Sale",
+        "Content-Type: text/html",
+        "",
+        `<p>Sale ends tonight</p><p><a href="${tracking}">SHOP JEANS</a></p><p>Join: <a href="${meeting}">${meeting}</a></p>`,
+      ]),
+      { id: "sale" },
+    );
+    for (const res of [
+      await call("get_message", { account: "personal", messageId: "sale" }),
+      { json: (await call("get_thread", { account: "personal", threadId: "sale" })).json.messages[0] },
+    ]) {
+      assert.equal(res.json.plaintextBody, `Sale ends tonight\n\nSHOP JEANS (https://click.mail.shop.example/…)\n\nJoin: ${meeting}`);
+      assert.match(res.json.linksShortened, /^1 long link was cut to its website.*FULL_CONTENT/);
+    }
+    const full = await call("get_message", { account: "personal", messageId: "sale", messageFormat: "FULL_CONTENT" });
+    assert.ok(full.json.plaintextBody.includes(tracking));
+    assert.equal(full.json.linksShortened, undefined);
+
+    const draft = await call("create_draft", { account: "personal", to: ["a@example.com"], subject: "Link", body: `See ${tracking}` });
+    const got = await call("get_draft", { account: "personal", draftId: draft.json.id });
+    assert.equal(got.json.plaintextBody, `See ${tracking}`, "drafts keep their links, so editing one can't break them");
+    const listed = await call("list_drafts", { account: "personal", view: "DRAFT_VIEW_FULL" });
+    assert.ok(listed.json.drafts.some((d: any) => d.plaintextBody?.includes(tracking)));
+  });
 });
 
 /** An email with the given attachments (each base64-encoded, like real mail). */
