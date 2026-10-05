@@ -46,14 +46,18 @@ function isAscii(value: string): boolean {
   return /^[\x20-\x7e]*$/.test(value);
 }
 
-/** Encodes a header value as RFC 2047 encoded-words when it contains non-ASCII text. */
-export function encodeHeaderValue(value: string): string {
+/**
+ * Encodes a header value as RFC 2047 encoded-words when it contains non-ASCII text (or when `force`
+ * is set, e.g. for an ASCII value too long to fold). Each word is at most 64 characters, so even
+ * `filename="` or "Subject: " plus the first word stays within 78.
+ */
+export function encodeHeaderValue(value: string, force = false): string {
   const clean = oneLine(value);
-  if (isAscii(clean)) return clean;
+  if (isAscii(clean) && !force) return clean;
   const words: string[] = [];
   let chunk = "";
   for (const ch of clean) {
-    if (Buffer.byteLength(chunk + ch, "utf8") > 45) {
+    if (Buffer.byteLength(chunk + ch, "utf8") > 39) {
       words.push(chunk);
       chunk = "";
     }
@@ -63,8 +67,9 @@ export function encodeHeaderValue(value: string): string {
   return words.map((w) => `=?UTF-8?B?${Buffer.from(w, "utf8").toString("base64")}?=`).join(`${CRLF} `);
 }
 
-/** An addr-spec: a dot-atom or quoted local part, then a domain. */
-const ADDRESS_RE = /^(?:[^\s@<>(),;:"\[\]\\]+|"(?:[^"\\\r\n]|\\.)+")@[^\s@<>(),;:"\[\]\\]+$/;
+/** An addr-spec: a dot-atom or quoted local part, then a domain; no control or invisible (format) characters. */
+const ADDRESS_RE = /^(?:[^\s@<>(),;:"\[\]\\\p{Cc}\p{Cf}]+|"(?:[^"\\\p{Cc}\p{Cf}]|\\[^\p{Cc}\p{Cf}])+")@[^\s@<>(),;:"\[\]\\\p{Cc}\p{Cf}]+$/u;
+const HIDDEN_CHARACTER = /[\p{Cc}\p{Cf}]/u;
 
 export function isValidAddress(address: string): boolean {
   return ADDRESS_RE.test(address);
@@ -74,6 +79,11 @@ function toMailbox(field: string, recipient: Recipient): Mailbox {
   const mailbox = typeof recipient === "string" ? { address: recipient } : recipient;
   const address = mailbox.address.trim();
   if (!isValidAddress(address)) {
+    if (HIDDEN_CHARACTER.test(address)) {
+      throw new MimeError(
+        `Invalid email address in "${field}": ${JSON.stringify(address)} contains an invisible or control character (often from copying). Retype it as plain text, like user@example.com.`,
+      );
+    }
     throw new MimeError(`Invalid email address in "${field}": "${address}". Use plain addresses like user@example.com.`);
   }
   return { name: mailbox.name?.trim() || undefined, address };
@@ -131,16 +141,57 @@ function quoteParam(value: string): string {
   return `"${value.replace(/[\\"]/g, "\\$&")}"`;
 }
 
-/** filename parameter with an RFC 2231 extended form for non-ASCII names. */
+/** Splits `text` into pieces of at most `size` characters without splitting a %XX escape. */
+function segments(text: string, size: number): string[] {
+  const out: string[] = [];
+  let current = "";
+  for (const token of text.match(/%[0-9A-F]{2}|[^]/g) ?? []) {
+    if (current.length + token.length > size) {
+      out.push(current);
+      current = "";
+    }
+    current += token;
+  }
+  if (current || !out.length) out.push(current);
+  return out;
+}
+
+/**
+ * A name/filename parameter. Non-ASCII names get encoded-words (read by most clients) plus the
+ * standard RFC 2231 form; long values are split into RFC 2231 continuations (`filename*0*=…`) on
+ * their own folded lines, so no header line gets near the 998-character limit.
+ */
 function filenameParams(param: "name" | "filename", filename: string): string {
   const clean = oneLine(filename);
-  if (isAscii(clean)) return `${param}=${quoteParam(clean)}`;
+  if (isAscii(clean)) {
+    if (clean.length <= 200) return `${param}=${quoteParam(clean)}`;
+    return segments(clean, 54)
+      .map((piece, i) => `${param}*${i}=${quoteParam(piece)}`)
+      .join(`;${CRLF} `);
+  }
   const ext = encodeURIComponent(clean).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
-  return `${param}=${quoteParam(encodeHeaderValue(clean))}; ${param}*=UTF-8''${ext}`;
+  const extended =
+    ext.length <= 54
+      ? `${param}*=UTF-8''${ext}`
+      : segments(ext, 54)
+          .map((piece, i) => `${param}*${i}*=${i ? "" : "UTF-8''"}${piece}`)
+          .join(`;${CRLF} `);
+  return `${param}=${quoteParam(encodeHeaderValue(clean))};${CRLF} ${extended}`;
 }
 
 function leafPart(headers: string[], content: Buffer): string {
   return [...headers, "Content-Transfer-Encoding: base64", "", wrapBase64(content)].join(CRLF);
+}
+
+/**
+ * An attached email (message/rfc822) as 7-bit text when it is plain ASCII with lines of at most 998
+ * characters (RFC 2046 does not allow base64 there); undefined otherwise, to be sent as base64.
+ */
+function sevenBitMessage(content: Buffer): string | undefined {
+  for (const byte of content) if (byte > 0x7e || byte === 0) return undefined;
+  const text = content.toString("latin1").replace(/\r?\n/g, CRLF);
+  if (text.split(CRLF).some((line) => line.length > 998 || line.includes("\r"))) return undefined;
+  return text.endsWith(CRLF) ? text.slice(0, -2) : text;
 }
 
 function textPart(subtype: "plain" | "html", text: string): string {
@@ -157,20 +208,66 @@ function multipart(subtype: string, parts: string[]): string {
   ].join(CRLF);
 }
 
+/** A header with parameters; long or multi-line parameters start on their own folded line. */
+function withParams(header: string, params: string): string {
+  return params.includes(CRLF) || header.length + params.length > 76 ? `${header};${CRLF} ${params}` : `${header}; ${params}`;
+}
+
 function attachmentPart(att: OutgoingAttachment, index: number): string {
   const filename = att.filename ?? `attachment-${index + 1}`;
   const mimeType = oneLine(att.mimeType || "application/octet-stream");
-  const headers = [`Content-Type: ${mimeType}; ${filenameParams("name", filename)}`];
-  if (att.inline) {
-    // Content-ID must be ASCII without spaces; filenames that aren't are percent-encoded.
-    const cid = oneLine(att.contentId ?? filename)
-      .replace(/^<|>$/g, "")
-      .replace(/[^\x21-\x7e]|[<>"\\]/g, (ch) => encodeURIComponent(ch));
-    headers.push(`Content-Disposition: inline; ${filenameParams("filename", filename)}`, `Content-ID: <${cid}>`);
+  const headers = [withParams(`Content-Type: ${mimeType}`, filenameParams("name", filename))];
+  if (att.inline && att.contentId) {
+    headers.push(withParams("Content-Disposition: inline", filenameParams("filename", filename)), `Content-ID: <${att.contentId}>`);
   } else {
-    headers.push(`Content-Disposition: attachment; ${filenameParams("filename", filename)}`);
+    headers.push(withParams("Content-Disposition: attachment", filenameParams("filename", filename)));
+  }
+  if (/^message\/rfc822$/i.test(mimeType)) {
+    const message = sevenBitMessage(att.content);
+    if (message !== undefined) return [...headers, "Content-Transfer-Encoding: 7bit", "", message].join(CRLF);
   }
   return leafPart(headers, att.content);
+}
+
+/** A Content-ID can be used as is when it is printable ASCII without spaces or <>"\\ (and not already taken). */
+const PLAIN_CONTENT_ID = /^[\x21-\x7e]+$/;
+const UNSAFE_IN_CONTENT_ID = /[<>"\\]/;
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Gives every inline attachment a unique, plain-ASCII Content-ID and points the HTML's `cid:`
+ * references at it. HTML refers to an attachment by its Content-ID if it came with one (forwarded
+ * or saved images), otherwise by its filename (as the tools describe: `cid:<filename>`), written
+ * as is or URL-encoded. When several attachments share a name, the n-th reference gets the n-th one.
+ */
+function assignContentIds(html: string, inline: OutgoingAttachment[]): { html: string; inline: OutgoingAttachment[] } {
+  const used = new Set<string>();
+  const renames = new Map<string, string[]>();
+  const assigned = inline.map((att, i) => {
+    const ref = oneLine(att.contentId ?? att.filename ?? `attachment-${i + 1}`).replace(/^<|>$/g, "");
+    let cid = ref;
+    if (!PLAIN_CONTENT_ID.test(cid) || UNSAFE_IN_CONTENT_ID.test(cid) || used.has(cid)) {
+      const stem = ref.replace(/[^\w.-]+/g, "_").slice(0, 40) || "image";
+      const random = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) => b.toString(16).padStart(2, "0")).join("");
+      cid = `${stem}.${random}`;
+    }
+    used.add(cid);
+    renames.set(ref, [...(renames.get(ref) ?? []), cid]);
+    return { ...att, contentId: cid };
+  });
+  let out = html;
+  // Longer names first, so "a.png" never matches inside "a.png.png".
+  for (const [ref, cids] of [...renames].sort(([a], [b]) => b.length - a.length)) {
+    if (cids.length === 1 && cids[0] === ref) continue;
+    const forms = [...new Set([ref, encodeURI(ref), encodeURIComponent(ref), escapeHtml(ref)])].sort((a, b) => b.length - a.length);
+    const re = new RegExp(`cid:(?:${forms.map(escapeRegExp).join("|")})(?=["'\\s)>]|&quot;|$)`, "gi");
+    let n = 0;
+    out = out.replace(re, () => `cid:${cids[Math.min(n++, cids.length - 1)]}`);
+  }
+  return { html: out, inline: assigned };
 }
 
 /** Builds a complete RFC 822 message. Gmail fills in From, Date and Message-ID on send. */
@@ -182,12 +279,13 @@ export function buildMime(msg: OutgoingMessage): string {
   }
 
   let body: string;
-  const inline = msg.html ? attachments.filter((a) => a.inline) : [];
-  const regular = attachments.filter((a) => !inline.includes(a));
+  const requested = msg.html ? attachments.filter((a) => a.inline) : [];
+  const regular = attachments.filter((a) => !requested.includes(a));
   if (msg.html) {
-    const plain = msg.text ?? htmlToText(msg.html);
-    body = multipart("alternative", [textPart("plain", plain), textPart("html", msg.html)]);
-    if (inline.length) body = multipart("related", [body, ...inline.map(attachmentPart)]);
+    const { html, inline } = assignContentIds(msg.html, requested);
+    const plain = msg.text ?? htmlToText(html);
+    body = multipart("alternative", [textPart("plain", plain), textPart("html", html)]);
+    if (inline.length) body = multipart("related", [body, ...inline.map((a, i) => attachmentPart({ ...a, inline: true }, i))]);
   } else {
     body = textPart("plain", msg.text ?? "");
   }
@@ -196,12 +294,14 @@ export function buildMime(msg: OutgoingMessage): string {
   }
 
   const subject = oneLine(msg.subject ?? "");
+  // RFC 5322 folds only at spaces: a word too long for one line (e.g. a long URL) needs encoded-words.
+  const foldable = isAscii(subject) && !subject.split(" ").some((word) => word.length > 900);
   const headers = [
     msg.from ? `From: ${formatMailbox(toMailbox("from", msg.from))}` : undefined,
     addressHeader("To", validateAddresses("to", msg.to)),
     addressHeader("Cc", validateAddresses("cc", msg.cc)),
     addressHeader("Bcc", validateAddresses("bcc", msg.bcc)),
-    isAscii(subject) ? foldHeader("Subject", subject) : `Subject: ${encodeHeaderValue(subject)}`,
+    foldable ? foldHeader("Subject", subject) : `Subject: ${encodeHeaderValue(subject, true)}`,
     msg.inReplyTo ? `In-Reply-To: ${oneLine(msg.inReplyTo)}` : undefined,
     msg.references ? foldHeader("References", msg.references) : undefined,
     "MIME-Version: 1.0",

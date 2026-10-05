@@ -156,7 +156,10 @@ test("long References and Subject headers are folded; Content-IDs stay ASCII", (
   const headerBlock = raw.slice(0, raw.indexOf("\r\n\r\n"));
   for (const line of headerBlock.split("\r\n")) assert.ok(line.length <= 78, `header line too long: ${line.length}`);
   assert.equal(parseHeaders(headerBlock).find((h) => h.name === "References")!.value, ids);
-  assert.match(raw, /Content-ID: <caf%C3%A9%20photo\.png>/);
+  // The Content-ID is plain ASCII, and the HTML's reference was pointed at it.
+  const cid = /Content-ID: <([^>]+)>/.exec(raw)![1];
+  assert.match(cid, /^caf_photo\.png\.[0-9a-f]{8}$/);
+  assert.ok(raw.includes(Buffer.from(`<img src="cid:${cid}">`).toString("base64")), "HTML refers to the new Content-ID");
   assert.ok(!/[^\x00-\x7f]/.test(raw), "message is 7-bit clean");
 });
 
@@ -198,4 +201,79 @@ test("cleanBody stays fast on long runs of tabs and spaces", () => {
   cleanBody(`a${"\t".repeat(200_000)}b\n${" \t".repeat(100_000)}c`);
   const used = process.cpuUsage(start);
   assert.ok((used.user + used.system) / 1000 < 200);
+});
+
+/** The decoded body of each leaf part, by Content-Type, from a message built by buildMime. */
+function leafBodies(raw: string): { type: string; headers: { name: string; value: string }[]; body: string }[] {
+  const out: { type: string; headers: { name: string; value: string }[]; body: string }[] = [];
+  const atts = new Map<string, string>();
+  const walk = (part: ReturnType<typeof parseMime>) => {
+    if (part.parts?.length) return part.parts.forEach(walk);
+    const data = part.body?.data ?? atts.get(part.body?.attachmentId ?? "") ?? "";
+    out.push({ type: part.mimeType!, headers: part.headers ?? [], body: Buffer.from(data, "base64url").toString() });
+  };
+  walk(
+    parseMime(raw, (data) => {
+      const id = `att${atts.size}`;
+      atts.set(id, data);
+      return id;
+    }),
+  );
+  return out;
+}
+
+test("inline images get plain ASCII Content-IDs that the HTML points at, even with odd or repeated names", () => {
+  const raw = buildMime({
+    to: ["a@example.com"],
+    html: '<p><img src="cid:my logo.png"> <img src="cid:caf%C3%A9.png"> <img src="cid:chart.png"><img src="cid:chart.png"></p>',
+    attachments: [
+      { content: Buffer.from("logo"), filename: "my logo.png", mimeType: "image/png", inline: true },
+      { content: Buffer.from("cafe"), filename: "café.png", mimeType: "image/png", inline: true },
+      { content: Buffer.from("one"), filename: "chart.png", mimeType: "image/png", inline: true },
+      { content: Buffer.from("two"), filename: "chart.png", mimeType: "image/png", inline: true },
+    ],
+  });
+  const leaves = leafBodies(raw);
+  const html = leaves.find((l) => l.type === "text/html")!.body;
+  const images = leaves.filter((l) => l.type === "image/png");
+  const ids = images.map((l) => l.headers.find((h) => h.name === "Content-ID")!.value.replace(/^<|>$/g, ""));
+  assert.equal(new Set(ids).size, 4, "Content-IDs are unique");
+  for (const id of ids) assert.match(id, /^[\x21-\x7e]+$/);
+  assert.equal(ids[2], "chart.png", "plain names are kept as they are");
+  assert.equal(html, `<p><img src="cid:${ids[0]}"> <img src="cid:${ids[1]}"> <img src="cid:${ids[2]}"><img src="cid:${ids[3]}"></p>`);
+  assert.deepEqual(images.map((l) => l.body), ["logo", "cafe", "one", "two"]);
+});
+
+test("long filenames use RFC 2231 continuations and long subjects stay within line limits", () => {
+  const filename = `${"見積書_株式会社サンプル_2024年度第3四半期_最終版".repeat(6)}.pdf`;
+  const raw = buildMime({
+    to: ["a@example.com"],
+    subject: `https://example.com/${"a".repeat(1200)}`,
+    text: "hi",
+    attachments: [{ content: Buffer.from("x"), filename, mimeType: "application/pdf" }],
+  });
+  for (const line of raw.split("\r\n")) assert.ok(line.length <= 78, `line of ${line.length}: ${line.slice(0, 40)}`);
+  assert.match(raw, /filename\*0\*=UTF-8''%E8%A6%8B/);
+  assert.match(raw, /filename\*1\*=%/);
+  const headers = parseHeaders(raw.slice(0, raw.indexOf("\r\n\r\n")));
+  assert.equal(headers.find((h) => h.name === "Subject")!.value, `https://example.com/${"a".repeat(1200)}`);
+});
+
+test("addresses with control or invisible characters are refused", () => {
+  for (const address of ["a\u0000@x.com", "a@x\u200b.com", "\u202ea@x.com", "a\t@x.com"]) {
+    assert.throws(() => buildMime({ to: [address], text: "hi" }), /Invalid email address/, JSON.stringify(address));
+  }
+  assert.throws(() => buildMime({ to: ["bob@exam\u200bple.com"], text: "hi" }), /invisible or control character/);
+  // Internationalized addresses are fine.
+  assert.doesNotThrow(() => buildMime({ to: ["jörg@bücher.de"], text: "hi" }));
+});
+
+test("attached emails are sent as 7-bit text when they are plain ASCII", () => {
+  const eml = Buffer.from("From: a@x.com\nSubject: Hi\n\nHello there.\n");
+  const raw = buildMime({ to: ["a@example.com"], text: "fwd", attachments: [{ content: eml, filename: "hi.eml", mimeType: "message/rfc822" }] });
+  assert.match(raw, /Content-Type: message\/rfc822; name="hi\.eml"\r\nContent-Disposition: attachment; filename="hi\.eml"\r\nContent-Transfer-Encoding: 7bit\r\n\r\nFrom: a@x\.com\r\nSubject: Hi\r\n\r\nHello there\.\r\n--/);
+  // 8-bit content can't be sent as 7-bit text: it stays base64.
+  const latin = Buffer.from("Subject: Caf\xe9\r\n\r\nx", "latin1");
+  const raw8 = buildMime({ to: ["a@example.com"], text: "fwd", attachments: [{ content: latin, filename: "x.eml", mimeType: "message/rfc822" }] });
+  assert.match(raw8, /message\/rfc822[^]*Content-Transfer-Encoding: base64/);
 });
