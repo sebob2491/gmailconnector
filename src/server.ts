@@ -6,6 +6,8 @@ import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/t
 import { AccountError, describeAccount, findAccount, type AccountSource, type LinkedAccount } from "./accounts.js";
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { defaultFetch, type FetchLike } from "./google.js";
+import { decodeTextFile, kindOf, officeText, pdfText, sniffType } from "./attachments.js";
+import { cleanBody, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
 import { Mailbox } from "./mailbox.js";
 
 export const SERVER_NAME = "gmail-multi";
@@ -159,6 +161,34 @@ async function run(fn: () => Promise<unknown>): Promise<CallToolResult> {
     return fail(err);
   }
 }
+
+/** Like run(), for tools that return their own content blocks (e.g. text plus an image). */
+async function runContent(fn: () => Promise<CallToolResult["content"]>): Promise<CallToolResult> {
+  try {
+    return { content: await fn() };
+  } catch (err) {
+    return fail(err);
+  }
+}
+
+/** Images up to this size are returned for Claude to look at. */
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+/** PDFs up to this size are also returned as files, for clients that can read PDFs directly. */
+const MAX_PDF_BYTES = 5 * 1024 * 1024;
+
+/** Label changes behind each bulk action. */
+const BULK_ACTIONS: Record<string, { add: string[]; remove: string[]; needsLabels?: "add" | "remove" }> = {
+  archive: { add: [], remove: ["INBOX"] },
+  move_to_inbox: { add: ["INBOX"], remove: ["TRASH", "SPAM"] },
+  mark_read: { add: [], remove: ["UNREAD"] },
+  mark_unread: { add: ["UNREAD"], remove: [] },
+  star: { add: ["STARRED"], remove: [] },
+  unstar: { add: [], remove: ["STARRED"] },
+  add_labels: { add: [], remove: [], needsLabels: "add" },
+  remove_labels: { add: [], remove: [], needsLabels: "remove" },
+  trash: { add: ["TRASH"], remove: [] },
+  spam: { add: ["SPAM"], remove: ["INBOX"] },
+};
 
 // ---------- shared schemas ----------
 
@@ -721,6 +751,200 @@ export function createServer(deps: ServerDeps): McpServer {
         const mb = await router.one(args.account);
         return { account: mb.email, ...(await mb.modify("messages", args.messageId, args.addLabelIds, args.removeLabelIds)) };
       }),
+  );
+
+  // ---------- attachments ----------
+
+  server.registerTool(
+    "get_attachment",
+    {
+      title: "Read attachment",
+      description:
+        "Reads an email attachment from one Gmail account. Text files, CSV, HTML, calendar invites, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images come back as images you can see; PDFs come back as text when it can be extracted (and as the PDF file, for clients that read PDFs). Identify the attachment by `partId` or `filename` from get_message/get_thread (with neither, a message's only attachment is used).",
+      inputSchema: {
+        account: accountArg,
+        messageId: z.string().describe("Required. ID of the message the attachment is on."),
+        partId: z.string().optional().describe("Optional. The attachment's partId from get_message/get_thread (preferred)."),
+        filename: z.string().optional().describe("Optional. The attachment's file name."),
+        attachmentId: z.string().optional().describe("Optional. The attachment's id from get_message/get_thread."),
+        maxChars: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Optional. Longest text to return (default 20000; 0 for no limit)."),
+      },
+      annotations: read,
+    },
+    async (args) =>
+      runContent(async () => {
+        const mb = await router.one(args.account);
+        const { info, bytes } = await mb.getAttachment(args.messageId, args);
+        const mimeType = sniffType(bytes, info.mimeType, info.filename);
+        const kind = kindOf(mimeType, info.filename);
+        const meta = {
+          account: mb.email,
+          messageId: args.messageId,
+          filename: info.filename,
+          mimeType,
+          size: bytes.length,
+          ...(info.partId !== undefined ? { partId: info.partId } : {}),
+          viewUrl: viewUrl(mb.email, `all/${args.messageId}`),
+        };
+        const max = args.maxChars ?? DEFAULT_MAX_BODY_CHARS;
+        const asText = (text: string, extra: Record<string, unknown> = {}): CallToolResult["content"] => {
+          const limited = limitLength(cleanBody(text), max);
+          const truncated = limited.omitted
+            ? { truncated: `Shortened: ${limited.omitted.toLocaleString("en-US")} more characters not shown. Call again with maxChars: 0 for all of it.` }
+            : {};
+          return [
+            { type: "text", text: JSON.stringify({ ...meta, ...extra, ...truncated }) },
+            { type: "text", text: limited.text || "(The file contains no text.)" },
+          ];
+        };
+        const withNote = (note: string): CallToolResult["content"] => [{ type: "text", text: JSON.stringify({ ...meta, note }) }];
+
+        if (kind === "text") return asText(decodeTextFile(bytes, mimeType, info.filename));
+        if (kind === "office") {
+          try {
+            return asText(await officeText(bytes));
+          } catch {
+            return withNote("This Office file couldn't be read. Open it in Gmail with viewUrl.");
+          }
+        }
+        if (kind === "image") {
+          if (bytes.length > MAX_IMAGE_BYTES) return withNote("This image is too large to show here. Open it in Gmail with viewUrl.");
+          return [
+            { type: "text", text: JSON.stringify(meta) },
+            { type: "image", data: Buffer.from(bytes).toString("base64"), mimeType },
+          ];
+        }
+        if (kind === "pdf") {
+          const text = await pdfText(bytes);
+          const blocks: CallToolResult["content"] = text
+            ? asText(text, { extracted: "Text extracted from the PDF; layout, images and tables may be simplified." })
+            : withNote(
+                "No readable text could be extracted from this PDF (it may be scanned or use special fonts). Open it in Gmail with viewUrl.",
+              );
+          if (bytes.length <= MAX_PDF_BYTES) {
+            blocks.push({
+              type: "resource",
+              resource: {
+                uri: `gmail://${encodeURIComponent(mb.email)}/messages/${args.messageId}/attachments/${encodeURIComponent(info.filename)}`,
+                mimeType: "application/pdf",
+                blob: Buffer.from(bytes).toString("base64"),
+              },
+            });
+          }
+          return blocks;
+        }
+        return withNote(`This type of file (${mimeType}) can't be read as text. Open it in Gmail with viewUrl.`);
+      }),
+  );
+
+  // ---------- bulk changes ----------
+
+  const bulkSelection = {
+    account: z
+      .string()
+      .optional()
+      .describe(
+        'With `query`: one account (email or alias) or "all"; defaults to every linked account. With threadIds/messageIds: the one account those IDs belong to.',
+      ),
+    query: z
+      .string()
+      .optional()
+      .describe(
+        'Gmail search selecting the emails, e.g. "category:promotions older_than:7d", "from:news@shop.com is:unread". Drafts are never included.',
+      ),
+    threadIds: z.array(z.string()).max(500).optional().describe("Optional. Change every email in these threads."),
+    messageIds: z.array(z.string()).max(1000).optional().describe("Optional. Change exactly these emails."),
+    maxEmails: z
+      .number()
+      .int()
+      .min(1)
+      .max(2000)
+      .optional()
+      .describe("Optional. Most emails to change per account (default 500). If more match, the result says so."),
+    dryRun: z
+      .boolean()
+      .optional()
+      .describe("Optional. Count the matching emails and preview the first 10, without changing anything."),
+  };
+
+  const runBulk = (args: {
+    account?: string;
+    query?: string;
+    threadIds?: string[];
+    messageIds?: string[];
+    maxEmails?: number;
+    dryRun?: boolean;
+    action: string;
+    labelIds?: string[];
+  }) =>
+    run(async () => {
+      const selectors = [args.query !== undefined, Boolean(args.threadIds?.length), Boolean(args.messageIds?.length)];
+      if (selectors.filter(Boolean).length !== 1) {
+        throw new AccountError("Give exactly one of `query`, `threadIds` or `messageIds`.");
+      }
+      const action = BULK_ACTIONS[args.action];
+      const add = [...action.add];
+      const remove = [...action.remove];
+      if (action.needsLabels) {
+        if (!args.labelIds?.length) throw new AccountError(`The ${args.action} action needs \`labelIds\`.`);
+        (action.needsLabels === "add" ? add : remove).push(...args.labelIds);
+      }
+      const opts = { max: args.maxEmails ?? 500, dryRun: Boolean(args.dryRun) };
+      const sel = { query: args.query, threadIds: args.threadIds, messageIds: args.messageIds };
+      const mailboxes = args.query !== undefined ? await router.many(args.account) : [await router.one(args.account)];
+      if (mailboxes.length === 1) {
+        return { account: mailboxes[0].email, action: args.action, ...(await mailboxes[0].bulkModify(sel, { add, remove }, opts)) };
+      }
+      return {
+        action: args.action,
+        accounts: await Promise.all(
+          mailboxes.map(async (mb) => {
+            try {
+              return { account: mb.email, ...(await mb.bulkModify(sel, { add, remove }, opts)) };
+            } catch (err) {
+              return { account: mb.email, error: (err as Error).message };
+            }
+          }),
+        ),
+      };
+    });
+
+  server.registerTool(
+    "bulk_update",
+    {
+      title: "Change many emails at once",
+      description:
+        "Archives, moves to the inbox, marks read/unread, stars/unstars, or adds/removes labels on many emails at once, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. Run with dryRun: true first, tell the user how many emails will change (with the preview), and only then run it for real.",
+      inputSchema: {
+        ...bulkSelection,
+        action: z
+          .enum(["archive", "move_to_inbox", "mark_read", "mark_unread", "star", "unstar", "add_labels", "remove_labels"])
+          .describe("Required. What to do to the selected emails."),
+        labelIds: labelIdsArg.optional().describe("Label IDs or names, for add_labels/remove_labels. Labels are per account."),
+      },
+      annotations: write,
+    },
+    async (args) => runBulk(args),
+  );
+
+  server.registerTool(
+    "bulk_trash",
+    {
+      title: "Trash or report many emails",
+      description:
+        "Moves many emails to Trash, or marks them as spam, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. Always run with dryRun: true first, show the user how many emails (and which) will be affected, and get their confirmation before running it for real. Trashed emails can be restored from Trash for 30 days.",
+      inputSchema: {
+        ...bulkSelection,
+        action: z.enum(["trash", "spam"]).describe("Required. trash moves emails to Trash; spam reports them as spam."),
+      },
+      annotations: destructive,
+    },
+    async (args) => runBulk(args),
   );
 
   // ---------- trash & spam ----------

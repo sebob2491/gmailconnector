@@ -27,6 +27,14 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 ### Differences from the built-in Gmail connector
 
 - New `list_accounts` tool, and an `account` argument on every tool.
+- New `get_attachment` tool: Claude can read attachments. Text, CSV, HTML, calendar invites, Word
+  (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images as images; PDFs as extracted
+  text (when the PDF has a text layer with standard fonts) plus the PDF itself for clients that read PDFs.
+- New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
+  spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
+  promotions older than a week"). They support a dry run that previews what would change, and Claude
+  is told to show you that preview first. Up to 500 emails per account per run by default (`maxEmails`
+  raises it to 2,000).
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
   Results are compact: one-email threads are shown flat, previews are cleaned of the invisible padding

@@ -113,6 +113,7 @@ export class FakeGmail {
   /** Every HTTP call the code under test made (a batch counts once), like Cloudflare's subrequest count. */
   outboundCalls = 0;
   batchCalls = 0;
+  batchModifyCalls: any[] = [];
   /** Paths (prefix match) that answer with this status once, to exercise retries. */
   failOnce = new Map<string, number>();
 
@@ -289,6 +290,27 @@ export class FakeGmail {
     }
 
     // messages
+    if (method === "GET" && path === "messages") {
+      const q = url.searchParams.get("q") ?? "";
+      const all = [...mb.messages.values()].reverse().filter((m) => this.matches(mb, m, q, url.searchParams.get("includeSpamTrash") === "true"));
+      const start = Number(url.searchParams.get("pageToken") ?? 0);
+      const size = Number(url.searchParams.get("maxResults") ?? 100);
+      const page = all.slice(start, start + size);
+      const next = start + size < all.length ? String(start + size) : undefined;
+      return json(200, {
+        messages: page.map((m) => ({ id: m.id, threadId: m.threadId })),
+        resultSizeEstimate: all.length,
+        ...(next ? { nextPageToken: next } : {}),
+      });
+    }
+    if (method === "POST" && path === "messages/batchModify") {
+      this.batchModifyCalls.push(body);
+      for (const id of body.ids) {
+        const msg = mb.messages.get(id);
+        if (msg) this.applyModify(msg, "modify", body);
+      }
+      return json(204, undefined);
+    }
     if (method === "POST" && path === "messages/send") {
       const { metadata, raw } = body;
       const message = this.deliver(mb, raw, { threadId: metadata.threadId, labelIds: ["SENT"] });
@@ -373,6 +395,27 @@ export class FakeGmail {
     if (path === "profile") return json(200, { emailAddress: mb.email });
     return json(400, { error: { message: `fake: unhandled ${method} ${path}` } });
   };
+
+  /** A small subset of Gmail search: category:, from:, is:, in:, label:, and the "-in:draft" exclusion. */
+  private matches(mb: FakeMailbox, msg: ApiMessage, q: string, includeSpamTrash: boolean): boolean {
+    const labels = msg.labelIds ?? [];
+    const tokens = q.replace(/[()]/g, " ").split(/\s+/).filter(Boolean);
+    const wantsTrashOrSpam = tokens.some((t) => /^in:(trash|spam|anywhere)$/i.test(t));
+    if (!includeSpamTrash && !wantsTrashOrSpam && (labels.includes("TRASH") || labels.includes("SPAM"))) return false;
+    for (const token of tokens) {
+      const negate = token.startsWith("-");
+      const [key, value = ""] = token.replace(/^-/, "").split(":");
+      let hit: boolean;
+      if (key === "category") hit = labels.includes(`CATEGORY_${value.toUpperCase()}`);
+      else if (key === "from") hit = (msg.payload?.headers?.find((h) => h.name === "From")?.value ?? "").toLowerCase().includes(value.toLowerCase());
+      else if (key === "is") hit = labels.includes(value.toUpperCase());
+      else if (key === "in") hit = value === "anywhere" || labels.includes(value.toUpperCase());
+      else if (key === "label") hit = labels.some((l) => l === value || mb.labels.find((x) => x.id === l)?.name.toLowerCase() === value.toLowerCase());
+      else continue;
+      if (hit === negate) return false;
+    }
+    return true;
+  }
 
   private applyModify(msg: ApiMessage, action: string, body: any) {
     let labels = new Set(msg.labelIds ?? []);

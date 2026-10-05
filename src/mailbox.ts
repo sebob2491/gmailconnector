@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { GmailClient } from "./gmailClient.js";
+import { GmailApiError, GmailClient } from "./gmailClient.js";
 import {
   METADATA_HEADERS,
   apiFormat,
@@ -134,6 +134,8 @@ function replySubject(subject: string | undefined): string {
 }
 
 const THREAD_PREVIEW_MESSAGES = 5;
+/** How many matching emails a bulk dry run lists. */
+const BULK_PREVIEW = 10;
 /** Draft bodies in list_drafts are previews; get_draft has the full text. */
 const LIST_BODY_CHARS = 2_000;
 
@@ -666,6 +668,124 @@ export class Mailbox {
   async modifyIds(kind: "messages" | "threads", id: string, addLabelIds: string[], removeLabelIds: string[]) {
     const res = await this.client.request("POST", `${kind}/${id}/modify`, { json: { addLabelIds, removeLabelIds } });
     return this.modifyResult(kind, res);
+  }
+
+  // ---------- attachments ----------
+
+  /**
+   * Downloads one attachment. Identify it by `partId` (stable), `filename`, or `attachmentId`;
+   * with none of these, a message's only attachment is used.
+   */
+  async getAttachment(messageId: string, ref: { partId?: string; filename?: string; attachmentId?: string }) {
+    const msg = await this.getRawMessage(messageId, "full");
+    const { attachments } = await extractContent(msg.payload, this.loader(msg.id));
+    const byName = ref.filename?.trim().toLowerCase();
+    const attachment =
+      (ref.partId !== undefined && attachments.find((a) => a.partId === ref.partId)) ||
+      (byName && attachments.find((a) => a.filename.toLowerCase() === byName)) ||
+      (ref.attachmentId && attachments.find((a) => a.id === ref.attachmentId)) ||
+      (!ref.partId && !byName && !ref.attachmentId && attachments.length === 1 ? attachments[0] : undefined);
+    // Gmail issues new attachment IDs on every read, but old ones keep working, so a stale ID is still usable.
+    if (!attachment && ref.attachmentId) {
+      const data = (await this.loader(msg.id)(ref.attachmentId)) as string;
+      return {
+        info: { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: 0, inline: false },
+        bytes: Buffer.from(data, "base64url"),
+        message: msg,
+      };
+    }
+    if (!attachment) {
+      const list = attachments.map((a) => `${a.filename} (partId ${a.partId})`).join(", ") || "none";
+      throw new MimeError(`No matching attachment on message ${messageId}. Its attachments: ${list}.`);
+    }
+    const data = attachment.id
+      ? await this.loader(msg.id)(attachment.id)
+      : (findPart(msg, attachment.partId)?.body?.data ?? "");
+    return { info: attachment, bytes: Buffer.from(data, "base64url"), message: msg };
+  }
+
+  // ---------- bulk changes ----------
+
+  /**
+   * Finds the messages a bulk change applies to: everything matching a Gmail search, the messages
+   * of the given threads, or the given messages. Drafts are never included. Returns at most `max`.
+   */
+  async selectMessages(sel: { query?: string; threadIds?: string[]; messageIds?: string[] }, max: number) {
+    if (sel.query !== undefined) {
+      const ids: string[] = [];
+      let pageToken: string | undefined;
+      const includeSpamTrash = /\bin:(spam|trash|anywhere)\b/i.test(sel.query) || undefined;
+      do {
+        const page = await this.client.request("GET", "messages", {
+          query: {
+            q: sel.query.trim() ? `(${sel.query}) -in:draft` : "-in:draft",
+            maxResults: Math.min(500, max + 1 - ids.length),
+            pageToken,
+            includeSpamTrash,
+          },
+        });
+        ids.push(...((page.messages ?? []) as { id: string }[]).map((m) => m.id));
+        pageToken = page.nextPageToken;
+      } while (pageToken && ids.length <= max);
+      return { ids: ids.slice(0, max), more: ids.length > max || Boolean(pageToken) };
+    }
+    if (sel.threadIds?.length) {
+      const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
+        sel.threadIds.map((id) => ({ path: `threads/${id}`, query: { format: "minimal" } })),
+      );
+      const ids: string[] = [];
+      fetched.forEach((r, i) => {
+        if (!r.ok) {
+          if (r.error.status === 404) return;
+          throw new GmailApiError(r.error.status, `Thread ${sel.threadIds![i]}: ${r.error.message}`);
+        }
+        for (const m of r.value.messages ?? []) if (!m.labelIds?.includes("DRAFT")) ids.push(m.id);
+      });
+      return { ids: ids.slice(0, max), more: ids.length > max };
+    }
+    const ids = [...new Set(sel.messageIds ?? [])];
+    return { ids: ids.slice(0, max), more: ids.length > max };
+  }
+
+  /** Adds and removes labels on many messages using Gmail's batchModify (1,000 messages per call). */
+  async bulkModify(
+    sel: { query?: string; threadIds?: string[]; messageIds?: string[] },
+    change: { add: string[]; remove: string[] },
+    opts: { max: number; dryRun: boolean },
+  ) {
+    const labels = change.add.length || change.remove.length
+      ? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[])
+      : [];
+    const addLabelIds = await this.resolveLabelIds(change.add, labels);
+    const removeLabelIds = await this.resolveLabelIds(change.remove, labels);
+    const { ids, more } = await this.selectMessages(sel, opts.max);
+    const moreNote = more
+      ? { more: `More emails match than the limit of ${opts.max}. Run it again to continue, or raise maxEmails.` }
+      : {};
+    if (opts.dryRun) {
+      const sample = ids.slice(0, BULK_PREVIEW);
+      const fetched = await this.client.batchGet<ApiMessage>(
+        sample.map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: ["Subject", "From", "Date"] } })),
+      );
+      const preview = fetched.flatMap((r) =>
+        r.ok
+          ? [
+              {
+                subject: (header(r.value.payload, "Subject") ?? "").trim(),
+                sender: header(r.value.payload, "From"),
+                date: r.value.internalDate ? new Date(Number(r.value.internalDate)).toISOString() : undefined,
+              },
+            ]
+          : [],
+      );
+      return { dryRun: true, wouldChange: ids.length, ...moreNote, preview };
+    }
+    for (let i = 0; i < ids.length; i += 1000) {
+      await this.client.request("POST", "messages/batchModify", {
+        json: { ids: ids.slice(i, i + 1000), addLabelIds, removeLabelIds },
+      });
+    }
+    return { changed: ids.length, ...moreNote };
   }
 
   async trash(kind: "messages" | "threads", id: string, untrash = false) {

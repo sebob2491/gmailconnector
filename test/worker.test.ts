@@ -8,6 +8,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { after, before, describe, test } from "node:test";
 import { convertV4MiniflareOptions, Miniflare, Request as MfRequest, Response as MfResponse } from "miniflare";
 import { FakeGmail } from "./fakeGmail.js";
+import { docx, pdf } from "./files.js";
 
 const ORIGIN = "https://gmail-multi-mcp.tester.workers.dev";
 const CLAUDE_CALLBACK = "https://claude.ai/api/mcp/auth_callback";
@@ -301,7 +302,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     });
     assert.equal(init.result.serverInfo.name, "gmail-multi");
     const tools = await mcp("tools/list");
-    assert.equal(tools.result.tools.length, 29);
+    assert.equal(tools.result.tools.length, 32);
 
     const accounts = await callTool("list_accounts");
     assert.deepEqual(accounts.json.accounts.map((a: any) => a.email), [PERSONAL, WORK]);
@@ -322,6 +323,43 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const refused = await callTool("send_message", { to: ["x@example.com"], body: "hi" });
     assert.equal(refused.isError, true);
     assert.match(refused.text, /`account` is required when sending/);
+  });
+
+  test("attachments are read inside the Worker runtime (PDF and Word)", async () => {
+    const personal = fake.mailboxes.find((m) => m.email === PERSONAL)!;
+    const attachment = (name: string, type: string, data: Buffer) => [
+      "--A",
+      `Content-Type: ${type}; name="${name}"`,
+      `Content-Disposition: attachment; filename="${name}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      data.toString("base64"),
+    ];
+    fake.deliver(
+      personal,
+      crlf([
+        "From: hr@example.com",
+        `To: ${PERSONAL}`,
+        "Subject: Paperwork",
+        'Content-Type: multipart/mixed; boundary="A"',
+        "",
+        "--A",
+        "Content-Type: text/plain",
+        "",
+        "Attached.",
+        ...attachment("pay.pdf", "application/pdf", pdf(["BT 72 720 Td (Net pay this period: $2,000.00) Tj ET"])),
+        ...attachment("offer.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", docx(["Offer letter", "Salary: $80,000"])),
+        "--A--",
+      ]),
+      { id: "paperwork" },
+    );
+    const read = async (filename: string) =>
+      (await mcp("tools/call", { name: "get_attachment", arguments: { account: PERSONAL, messageId: "paperwork", filename } })).result;
+    const pdfResult = await read("pay.pdf");
+    assert.equal(pdfResult.content[1].text, "Net pay this period: $2,000.00");
+    assert.equal(pdfResult.content[2].type, "resource");
+    const wordResult = await read("offer.docx");
+    assert.equal(wordResult.content[1].text, "Offer letter\nSalary: $80,000");
   });
 
   test("GET on the MCP endpoint is rejected (stateless server)", async () => {
@@ -368,8 +406,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
   test("connecting again doesn't disconnect an earlier connection", async () => {
     const second = await connectAsOwner(firstClientId);
     assert.notEqual(second, accessToken);
-    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 29, "first connection still works");
-    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 29);
+    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 32, "first connection still works");
+    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 32);
   });
 
   test("searching five linked accounts stays under Cloudflare's 50-call limit", async () => {

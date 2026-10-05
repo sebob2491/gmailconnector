@@ -201,7 +201,7 @@ export class GmailClient {
       contentType = "application/json";
     }
     // Sending mail and creating things aren't safe to repeat after a server error.
-    const idempotent = method !== "POST" || /\/(modify|trash|untrash)$/.test(path);
+    const idempotent = method !== "POST" || /\/(modify|trash|untrash|batchModify)$/.test(path);
     const { res, text } = await this.send(method, url, body, contentType, idempotent);
     if (!res.ok) throw apiError(method, path, res.status, text);
     return (text ? JSON.parse(text) : undefined) as T;

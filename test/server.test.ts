@@ -10,6 +10,7 @@ import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
+import { docx, pdf, png, xlsx } from "./files.js";
 
 const PERSONAL = "me.personal@gmail.com";
 const WORK = "me@work.example";
@@ -139,16 +140,19 @@ function inspectMime(raw: string) {
 }
 
 describe("tool catalogue", () => {
-  test("mirrors the Gmail connector's tools plus list_accounts", async () => {
+  test("mirrors the Gmail connector's tools, plus accounts, attachments and bulk changes", async () => {
     const { client } = await setup();
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      "bulk_trash",
+      "bulk_update",
       "create_draft",
       "create_label",
       "delete_draft",
       "delete_label",
       "forward",
+      "get_attachment",
       "get_draft",
       "get_message",
       "get_thread",
@@ -981,5 +985,203 @@ describe("cleaner, smaller results", () => {
     );
     const res = await call("get_message", { account: "personal", messageId: "pad" });
     assert.equal(res.json.plaintextBody, "Big sale today\n\nShop now");
+  });
+});
+
+/** An email with the given attachments (each base64-encoded, like real mail). */
+function withAttachments(from: string, to: string, subject: string, files: { name: string; type: string; data: Buffer }[]) {
+  return crlf([
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    'Content-Type: multipart/mixed; boundary="ATT"',
+    "",
+    "--ATT",
+    "Content-Type: text/plain",
+    "",
+    "See attached.",
+    ...files.flatMap((f) => [
+      "--ATT",
+      `Content-Type: ${f.type}; name="${f.name}"`,
+      `Content-Disposition: attachment; filename="${f.name}"`,
+      "Content-Transfer-Encoding: base64",
+      "",
+      f.data.toString("base64"),
+    ]),
+    "--ATT--",
+  ]);
+}
+
+describe("reading attachments", () => {
+  const files = [
+    { name: "statement.pdf", type: "application/pdf", data: pdf(["BT 72 720 Td (Net pay: $1,234.56 for Sebastian) Tj ET"]) },
+    { name: "photo.png", type: "image/png", data: png },
+    { name: "letter.docx", type: "application/octet-stream", data: docx(["Welcome aboard!", "Start date: Monday"]) },
+    { name: "budget.xlsx", type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", data: xlsx([["Item", "Cost"], ["Rent", 1200]]) },
+    { name: "notes.csv", type: "text/csv", data: Buffer.from("a,b\n1,2") },
+    { name: "archive.zip", type: "application/zip", data: Buffer.from("PK\x03\x04junk") },
+  ];
+
+  async function setupWithFiles() {
+    const ctx = await setup();
+    ctx.fake.deliver(ctx.personal, withAttachments("hr@example.com", PERSONAL, "Documents", files), { id: "docs" });
+    const raw = async (args: Record<string, unknown>) =>
+      (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "personal", messageId: "docs", ...args } })) as any;
+    return { ...ctx, raw };
+  }
+
+  test("get_message lists attachments with a stable partId", async () => {
+    const { call } = await setupWithFiles();
+    const res = await call("get_message", { account: "personal", messageId: "docs" });
+    assert.deepEqual(
+      res.json.attachments.map((a: any) => [a.filename, typeof a.partId]),
+      files.map((f) => [f.name, "string"]),
+    );
+  });
+
+  test("a PDF comes back as extracted text plus the file itself", async () => {
+    const { raw } = await setupWithFiles();
+    const res = await raw({ filename: "statement.pdf" });
+    assert.equal(res.isError, undefined, res.content[0].text);
+    const meta = JSON.parse(res.content[0].text);
+    assert.equal(meta.mimeType, "application/pdf");
+    assert.match(meta.extracted, /extracted/);
+    assert.equal(res.content[1].text, "Net pay: $1,234.56 for Sebastian");
+    assert.equal(res.content[2].type, "resource");
+    assert.equal(res.content[2].resource.mimeType, "application/pdf");
+    assert.ok(Buffer.from(res.content[2].resource.blob, "base64").subarray(0, 4).equals(Buffer.from("%PDF")));
+  });
+
+  test("an image comes back as an image", async () => {
+    const { raw } = await setupWithFiles();
+    const res = await raw({ filename: "photo.png" });
+    assert.equal(res.content[1].type, "image");
+    assert.equal(res.content[1].mimeType, "image/png");
+    assert.ok(Buffer.from(res.content[1].data, "base64").equals(png));
+  });
+
+  test("Word and Excel files come back as text, even when Gmail labels them octet-stream", async () => {
+    const { raw, call } = await setupWithFiles();
+    const word = await raw({ filename: "LETTER.DOCX" });
+    assert.equal(JSON.parse(word.content[0].text).mimeType, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    assert.equal(word.content[1].text, "Welcome aboard!\nStart date: Monday");
+    const parts = (await call("get_message", { account: "personal", messageId: "docs" })).json.attachments;
+    const sheet = await raw({ partId: parts.find((a: any) => a.filename === "budget.xlsx").partId });
+    assert.match(sheet.content[1].text, /Item\tCost\nRent\t1200/);
+    const csv = await raw({ filename: "notes.csv", maxChars: 3 });
+    assert.equal(csv.content[1].text, "a,b");
+    assert.match(JSON.parse(csv.content[0].text).truncated, /more characters not shown/);
+  });
+
+  test("unsupported files and unknown names are explained", async () => {
+    const { raw } = await setupWithFiles();
+    const zipFile = await raw({ filename: "archive.zip" });
+    assert.match(JSON.parse(zipFile.content[0].text).note, /can't be read as text/);
+    const missing = await raw({ filename: "nope.pdf" });
+    assert.equal(missing.isError, true);
+    assert.match(missing.content[0].text, /Its attachments: statement\.pdf \(partId \d+\), photo\.png/);
+  });
+});
+
+describe("bulk changes", () => {
+  async function setupInbox() {
+    const ctx = await setup();
+    // Two promotions in each account, plus the regular mail from setup().
+    for (const [mb, email] of [
+      [ctx.personal, PERSONAL],
+      [ctx.work, WORK],
+    ] as const) {
+      for (let i = 1; i <= 2; i++) {
+        fake(ctx).deliver(mb, crlf([`From: deals${i}@shop.example`, `To: ${email}`, `Subject: Sale ${i}`, "", "50% off"]), {
+          id: `${email.split("@")[0]}-promo${i}`,
+          labelIds: ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"],
+        });
+      }
+    }
+    return ctx;
+  }
+  const fake = (ctx: { fake: FakeGmail }) => ctx.fake;
+  const labelsOf = (mb: FakeMailbox, id: string) => mb.messages.get(id)!.labelIds!;
+
+  test("a dry run counts and previews matches in every account without changing anything", async () => {
+    const { call, fake: f, personal } = await setupInbox();
+    const res = await call("bulk_update", { query: "category:promotions", action: "archive", dryRun: true });
+    assert.equal(res.isError, false, res.text);
+    const byAccount = Object.fromEntries(res.json.accounts.map((a: any) => [a.account, a]));
+    assert.equal(byAccount[PERSONAL].wouldChange, 2);
+    assert.equal(byAccount[WORK].wouldChange, 2);
+    assert.deepEqual(byAccount[PERSONAL].preview.map((p: any) => p.subject).sort(), ["Sale 1", "Sale 2"]);
+    assert.equal(f.batchModifyCalls.length, 0);
+    assert.ok(labelsOf(personal, "me.personal-promo1").includes("INBOX"));
+  });
+
+  test("archive and mark read apply to just the matching emails, in one call per account", async () => {
+    const { call, fake: f, personal, work } = await setupInbox();
+    const res = await call("bulk_update", { query: "category:promotions", action: "archive" });
+    assert.deepEqual(res.json.accounts.map((a: any) => a.changed), [2, 2]);
+    assert.equal(f.batchModifyCalls.length, 2);
+    assert.ok(!labelsOf(personal, "me.personal-promo1").includes("INBOX"));
+    assert.ok(!labelsOf(work, "me-promo2").includes("INBOX"));
+    assert.ok(labelsOf(personal, "p1").includes("INBOX"), "non-promotions stay in the inbox");
+
+    await call("bulk_update", { account: "work", threadIds: ["wt1"], action: "mark_read" });
+    assert.ok(!labelsOf(work, "w1").includes("UNREAD"));
+    assert.ok(labelsOf(work, "w2").includes("UNREAD"));
+  });
+
+  test("labels are looked up by name in each account; a missing one is reported per account", async () => {
+    const { call, work } = await setupInbox();
+    const res = await call("bulk_update", { query: "category:promotions", action: "add_labels", labelIds: ["reports"] });
+    const byAccount = Object.fromEntries(res.json.accounts.map((a: any) => [a.account, a]));
+    assert.equal(byAccount[WORK].changed, 2);
+    assert.ok(labelsOf(work, "me-promo1").includes("Label_7"));
+    assert.match(byAccount[PERSONAL].error, /Label "reports" not found in me\.personal@gmail\.com/);
+  });
+
+  test("bulk_trash moves matches to Trash; drafts are never touched", async () => {
+    const { call, personal } = await setupInbox();
+    await call("create_draft", { account: "personal", to: ["x@example.com"], subject: "Sale draft", body: "d" });
+    const res = await call("bulk_trash", { account: "personal", query: "", action: "trash" });
+    assert.equal(res.isError, false, res.text);
+    for (const [id, msg] of personal.messages) {
+      if (msg.labelIds!.includes("DRAFT")) assert.ok(!msg.labelIds!.includes("TRASH"), `draft ${id} untouched`);
+      else assert.ok(msg.labelIds!.includes("TRASH"), `${id} trashed`);
+    }
+  });
+
+  test("maxEmails caps the change and says more are left", async () => {
+    const { call } = await setupInbox();
+    const res = await call("bulk_update", { account: "work", query: "category:promotions", action: "mark_read", maxEmails: 1 });
+    assert.equal(res.json.changed, 1);
+    assert.match(res.json.more, /More emails match than the limit of 1/);
+  });
+
+  test("exactly one way of choosing emails is required, and IDs need their account", async () => {
+    const { call } = await setupInbox();
+    const none = await call("bulk_update", { action: "archive" });
+    assert.match(none.text, /exactly one of `query`, `threadIds` or `messageIds`/);
+    const noLabels = await call("bulk_update", { query: "x", action: "add_labels" });
+    assert.match(noLabels.text, /needs `labelIds`/);
+    const idsWithoutAccount = await call("bulk_update", { messageIds: ["p1"], action: "star" });
+    assert.match(idsWithoutAccount.text, /pass `account`/);
+  });
+
+  test("a bulk change across five accounts stays well under Cloudflare's 50-call limit", async () => {
+    const ctx = await setupInbox();
+    for (let i = 3; i <= 5; i++) {
+      const email = `extra${i}@example.com`;
+      const mb = ctx.fake.addMailbox(email, `rt-${i}`);
+      await ctx.store.upsert({ email, refreshToken: `rt-${i}`, scopes: [], addedAt: "" });
+      for (let t = 0; t < 30; t++) {
+        ctx.fake.deliver(mb, crlf([`From: s${t}@shop.example`, `To: ${email}`, `Subject: Deal ${t}`, "", "x"]), {
+          labelIds: ["INBOX", "CATEGORY_PROMOTIONS"],
+        });
+      }
+    }
+    ctx.fake.outboundCalls = 0;
+    const res = await ctx.call("bulk_update", { query: "category:promotions", action: "archive" });
+    assert.equal(res.json.accounts.length, 5);
+    assert.ok(res.json.accounts.every((a: any) => a.changed > 0), res.text);
+    assert.ok(ctx.fake.outboundCalls <= 20, `made ${ctx.fake.outboundCalls} calls`);
   });
 });

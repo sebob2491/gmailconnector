@@ -322,7 +322,7 @@ export interface FormattedMessage {
   labelIds?: string[];
   plaintextBody?: string;
   htmlBody?: string;
-  attachments?: Omit<AttachmentInfo, "partId">[];
+  attachments?: AttachmentInfo[];
   raw?: string;
   /** Set when a body was shortened; says how to get the rest. */
   truncated?: string;
@@ -372,7 +372,7 @@ export async function formatMessage(
         `Body shortened: ${omitted.toLocaleString("en-US")} more characters not shown. ` +
         `Fetch it with get_message, get_thread or get_draft and maxBodyChars: 0 for the full text.`;
     }
-    if (content.attachments.length) out.attachments = content.attachments.map(({ partId: _p, ...a }) => a);
+    if (content.attachments.length) out.attachments = content.attachments;
   }
   return out;
 }
