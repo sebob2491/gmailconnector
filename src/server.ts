@@ -932,7 +932,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Change many emails at once",
       description:
-        "Archives, moves to the inbox, marks read/unread, stars/unstars, or adds/removes labels on many emails at once, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. With a query or threads, only emails that don't already have the change are counted and changed. Run with dryRun: true first, tell the user how many emails will change (with the preview), and only then run it for real.",
+        "Archives, moves to the inbox, marks read/unread, stars/unstars, or adds/removes labels on many emails at once, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. With a query or threads, only emails that don't already have the change are counted and changed. If a run stops partway, the result has `changed` (what went through) and `error`; tell the user both. Run with dryRun: true first, tell the user how many emails will change (with the preview), and only then run it for real.",
       inputSchema: {
         ...bulkSelection,
         action: z
@@ -950,7 +950,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Trash or report many emails",
       description:
-        "Moves many emails to Trash, or marks them as spam, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. With a query or threads, only emails that don't already have the change are counted and changed. Always run with dryRun: true first, show the user how many emails (and which) will be affected, and get their confirmation before running it for real. Trashed emails can be restored from Trash for 30 days.",
+        "Moves many emails to Trash, or marks them as spam, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. With a query or threads, only emails that don't already have the change are counted and changed. If a run stops partway, the result has `changed` (what went through) and `error`; tell the user both. Always run with dryRun: true first, show the user how many emails (and which) will be affected, and get their confirmation before running it for real. Trashed emails can be restored from Trash for 30 days.",
       inputSchema: {
         ...bulkSelection,
         action: z.enum(["trash", "spam"]).describe("Required. trash moves emails to Trash; spam reports them as spam."),

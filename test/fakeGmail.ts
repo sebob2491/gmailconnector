@@ -118,6 +118,8 @@ export class FakeGmail {
   failOnce = new Map<string, number>();
   /** Paths (prefix match) that keep answering with this status, like a stuck rate limit. */
   failAlways = new Map<string, number>();
+  /** Called before each API request; returning a status makes that request fail with it. */
+  intercept?: (method: string, path: string) => number | undefined;
 
   addMailbox(email: string, refreshToken: string): FakeMailbox {
     const mb: FakeMailbox = {
@@ -261,6 +263,8 @@ export class FakeGmail {
         return json(status, { error: { code: status, message: "Rate Limit Exceeded", errors: [{ reason: "rateLimitExceeded" }] } });
       }
     }
+    const intercepted = this.intercept?.(method, path);
+    if (intercepted) return json(intercepted, { error: { code: intercepted, message: "Backend Error" } });
     for (const [failPath, status] of this.failAlways) {
       if (path.startsWith(failPath)) {
         return json(status, { error: { code: status, message: "Rate Limit Exceeded", errors: [{ reason: "rateLimitExceeded" }] } });

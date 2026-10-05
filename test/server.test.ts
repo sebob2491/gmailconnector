@@ -1455,6 +1455,44 @@ describe("fixes from the second review", () => {
       assert.deepEqual(ctx.fake.batchModifyCalls.slice(-2).map((c) => c.ids), [["t-a", "t-c"], ["u-a"]]);
     });
 
+    test("a change that fails partway reports what was changed, as a normal result", async () => {
+      const ctx = await setup();
+      promos(ctx, 1500);
+      let calls = 0;
+      ctx.fake.intercept = (method, path) => (path === "messages/batchModify" && ++calls > 1 ? 500 : undefined);
+      const res = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "archive", maxEmails: 2000 });
+      assert.equal(res.isError, false, res.text);
+      assert.equal(res.json.changed, 1000);
+      assert.equal(res.json.notChanged, 500);
+      assert.match(res.json.error, /Stopped after changing 1000 of 1500 emails: .*\(500\).* Run the same change again to finish\./);
+      const archived = [...ctx.work.messages.values()].filter((m) => m.id.startsWith("promo") && !m.labelIds!.includes("INBOX"));
+      assert.equal(archived.length, 1000);
+      ctx.fake.intercept = undefined;
+      const rest = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "archive", maxEmails: 2000 });
+      assert.equal(rest.json.changed, 500);
+
+      // By thread, the threads not finished are handed back, and running them again does the rest.
+      for (let i = 0; i < 1200; i++) {
+        ctx.fake.deliver(ctx.work, crlf(["From: list@example.com", `To: ${WORK}`, "Subject: Digest", "", "x"]), { id: `big${i}`, threadId: "BIG" });
+      }
+      calls = 0;
+      ctx.fake.intercept = (method, path) => (path === "messages/batchModify" && ++calls > 1 ? 500 : undefined);
+      const byThread = await ctx.call("bulk_update", { account: "work", threadIds: ["BIG"], action: "mark_read", maxEmails: 2000 });
+      assert.equal(byThread.isError, false, byThread.text);
+      assert.equal(byThread.json.changed, 1000);
+      assert.deepEqual(byThread.json.remainingThreadIds, ["BIG"]);
+      assert.match(byThread.json.error, /threadIds set to remainingThreadIds to finish/);
+      ctx.fake.intercept = undefined;
+      const finish = await ctx.call("bulk_update", { account: "work", threadIds: byThread.json.remainingThreadIds, action: "mark_read", maxEmails: 2000 });
+      assert.equal(finish.json.changed, 200);
+
+      // If the very first call fails, nothing changed and it's a plain error.
+      ctx.fake.intercept = (method, path) => (path === "messages/batchModify" ? 500 : undefined);
+      const failed = await ctx.call("bulk_update", { account: "work", messageIds: ["promo0"], action: "star" });
+      assert.equal(failed.isError, true);
+      assert.match(failed.text, /batchModify failed \(500\)/);
+    });
+
     test("2,000 emails in each of five accounts fit Cloudflare's 50-call limit with room for retries", async () => {
       const ctx = await setup();
       for (let i = 3; i <= 5; i++) {

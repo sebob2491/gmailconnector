@@ -968,10 +968,30 @@ export class Mailbox {
     }
     const addLabelIds = add.map((l) => l.id);
     const removeLabelIds = remove.map((l) => l.id);
+    let changed = 0;
     for (let i = 0; i < ids.length; i += 1000) {
-      await this.client.request("POST", "messages/batchModify", { json: { ids: ids.slice(i, i + 1000), addLabelIds, removeLabelIds } });
+      const chunk = ids.slice(i, i + 1000);
+      try {
+        await this.client.request("POST", "messages/batchModify", { json: { ids: chunk, addLabelIds, removeLabelIds } });
+      } catch (err) {
+        if (!changed) throw err;
+        // Part of the change went through: say exactly how much, and how to finish.
+        const left = ids.slice(i);
+        const finish =
+          selection.kind === "query"
+            ? "Run the same change again to finish."
+            : `Run it again with ${selection.kind === "threads" ? "threadIds set to remainingThreadIds" : "messageIds set to remainingMessageIds"} to finish.`;
+        return {
+          changed,
+          notChanged: left.length,
+          error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${finish}`,
+          ...extra,
+          ...bulkLeftOver(selection, opts.max, left),
+        };
+      }
+      changed += chunk.length;
     }
-    return { changed: ids.length, ...extra };
+    return { changed, ...extra };
   }
 
   async trash(kind: "messages" | "threads", id: string, untrash = false) {
