@@ -192,6 +192,118 @@ function normalizeSubject(subject: string | undefined): string {
   return (subject ?? "").replace(/^\s*(((re|fwd?|aw|sv|antw)\s*(\[\d+\])?\s*:|\[[^\]]{1,20}\])\s*)+/i, "").trim().toLowerCase();
 }
 
+export interface BulkSelector {
+  query?: string;
+  threadIds?: string[];
+  messageIds?: string[];
+}
+
+/** The emails a bulk change will touch, plus what's left over beyond maxEmails. */
+type Selection = {
+  ids: string[];
+  /** More emails need the change than `max`. */
+  more: boolean;
+  unavailable?: Record<string, unknown>;
+} & (
+  | { kind: "query"; /** Changed emails stop matching, so running the change again continues. */ resumable: boolean }
+  | { kind: "threads"; remainingThreadIds: string[]; threadOf: Map<string, string> }
+  | { kind: "messages"; remainingMessageIds: string[] }
+);
+
+/**
+ * Says how to continue a bulk change that didn't cover everything: emails beyond maxEmails, and
+ * `notDone` emails a failed run didn't get to. ID selections get the IDs to pass next time.
+ */
+function bulkLeftOver(selection: Selection, max: number, notDone: string[] = []) {
+  const limit = `maxEmails can go up to 2,000.`;
+  if (selection.kind === "query") {
+    if (!selection.more) return {};
+    return {
+      more: selection.resumable
+        ? `More emails match than the limit of ${max}; each run changes the newest ${max}. Run the same change again to continue (emails already changed no longer match). ${limit}`
+        : `More emails match than the limit of ${max}; each run changes the newest ${max}. Running it again would pick the same emails, so raise maxEmails or narrow the query. ${limit}`,
+    };
+  }
+  if (selection.kind === "threads") {
+    const remainingThreadIds = [...new Set([...notDone.map((id) => selection.threadOf.get(id)!), ...selection.remainingThreadIds])];
+    if (!remainingThreadIds.length) return {};
+    return {
+      ...(selection.more
+        ? { more: `These threads hold more than ${max} emails to change; each run changes ${max}. To continue, run it again with threadIds set to remainingThreadIds. ${limit}` }
+        : {}),
+      remainingThreadIds,
+    };
+  }
+  const remainingMessageIds = [...notDone, ...selection.remainingMessageIds];
+  if (!remainingMessageIds.length) return {};
+  return {
+    ...(selection.more
+      ? { more: `Only ${max} of the given emails are changed per run (maxEmails). To continue, run it again with messageIds set to remainingMessageIds. ${limit}` }
+      : {}),
+    remainingMessageIds,
+  };
+}
+
+/** Label IDs Gmail defines itself. Bulk actions that only use these don't need the label list. */
+const SYSTEM_LABEL_IDS = new Set(["INBOX", "UNREAD", "STARRED", "IMPORTANT", "TRASH", "SPAM", "SENT", "DRAFT", "CHAT"]);
+
+function isSystemLabelId(ref: string): boolean {
+  return SYSTEM_LABEL_IDS.has(ref) || /^CATEGORY_[A-Z]+$/.test(ref);
+}
+
+/** Gmail search operators for system labels (search doesn't take their IDs). */
+const SYSTEM_LABEL_SEARCH: Record<string, string> = {
+  INBOX: "in:inbox",
+  UNREAD: "is:unread",
+  STARRED: "is:starred",
+  IMPORTANT: "is:important",
+  TRASH: "in:trash",
+  SPAM: "in:spam",
+  SENT: "in:sent",
+  CATEGORY_PERSONAL: "category:primary",
+  CATEGORY_SOCIAL: "category:social",
+  CATEGORY_PROMOTIONS: "category:promotions",
+  CATEGORY_UPDATES: "category:updates",
+  CATEGORY_FORUMS: "category:forums",
+};
+
+/** A Gmail search term for emails carrying `label`, or undefined if search can't express it. */
+function labelSearchTerm(label: ApiLabel): string | undefined {
+  if (SYSTEM_LABEL_SEARCH[label.id]) return SYSTEM_LABEL_SEARCH[label.id];
+  if (label.type === "system" || isSystemLabelId(label.id) || label.name.includes('"')) return undefined;
+  // Search finds a user label by its full name ("Projects/Alpha"); the quotes keep spaces in it.
+  return `label:"${label.name}"`;
+}
+
+/**
+ * Narrows a bulk search to the emails a label change would alter: those missing a label to add or
+ * carrying a label to remove. Returns undefined when a label can't be expressed in a search, and
+ * the search is then left as it is (it still finds every email that needs the change).
+ */
+function changeFilter(add: ApiLabel[], remove: ApiLabel[], includeSpamTrash: boolean): { q?: string; labelIds?: string[] } | undefined {
+  // Without in:spam/in:trash in the query, Spam and Trash aren't searched, so there's nothing to take
+  // them off. (Kept when they're all there is, so the filter still says what the change does.)
+  let removing = remove;
+  const outside = remove.filter((l) => l.id !== "SPAM" && l.id !== "TRASH");
+  if (!includeSpamTrash && (add.length || outside.length)) removing = outside;
+  // One user label to remove is matched by its ID, which doesn't depend on how search reads its name.
+  if (!add.length && removing.length === 1 && !isSystemLabelId(removing[0].id)) return { labelIds: [removing[0].id] };
+  const terms: string[] = [];
+  for (const label of add) {
+    const term = labelSearchTerm(label);
+    if (!term) return undefined;
+    terms.push(`-${term}`);
+  }
+  for (const label of removing) {
+    const term = labelSearchTerm(label);
+    if (!term) return undefined;
+    terms.push(term);
+  }
+  if (!terms.length) return undefined;
+  // In parentheses so the OR can't pair up with the user's own search terms.
+  return { q: terms.length === 1 ? terms[0] : `(${terms.join(" OR ")})` };
+}
+
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
   constructor(readonly client: GmailClient) {}
@@ -694,13 +806,18 @@ export class Mailbox {
 
   /** Accepts label IDs or display names (case-insensitive) and returns IDs for this account. */
   async resolveLabelIds(refs: string[] | undefined, known?: ApiLabel[]): Promise<string[]> {
+    return (await this.resolveLabels(refs, known)).map((l) => l.id);
+  }
+
+  /** Like resolveLabelIds, returning the labels themselves. */
+  async resolveLabels(refs: string[] | undefined, known?: ApiLabel[]): Promise<ApiLabel[]> {
     if (!refs?.length) return [];
     const labels = known ?? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[]);
     return refs.map((ref) => {
       const byId = labels.find((l) => l.id === ref);
-      if (byId) return byId.id;
+      if (byId) return byId;
       const byName = labels.find((l) => l.name.toLowerCase() === ref.trim().toLowerCase());
-      if (byName) return byName.id;
+      if (byName) return byName;
       throw new MimeError(`Label "${ref}" not found in ${this.email}. Use list_labels to see this account's labels.`);
     });
   }
@@ -758,59 +875,79 @@ export class Mailbox {
   // ---------- bulk changes ----------
 
   /**
-   * Finds the messages a bulk change applies to: everything matching a Gmail search, the messages
-   * of the given threads, or the given messages. Drafts are never included. Returns at most `max`.
+   * Finds the emails a bulk change applies to: those matching a Gmail search, the emails of the
+   * given threads, or the given emails. Drafts are never included, and at most `max` are returned.
+   * Searches and threads only yield emails the change would alter (see changeFilter), so counts are
+   * real and, for a search, running the change again continues where the last run stopped.
    */
-  async selectMessages(sel: { query?: string; threadIds?: string[]; messageIds?: string[] }, max: number) {
+  async selectMessages(sel: BulkSelector, change: { add: ApiLabel[]; remove: ApiLabel[] }, max: number): Promise<Selection> {
     if (sel.query !== undefined) {
+      const includeSpamTrash = mentionsSpamTrash(sel.query);
+      const filter = changeFilter(change.add, change.remove, includeSpamTrash);
+      const q = [sel.query.trim() ? `(${sel.query})` : "", filter?.q, "-in:draft"].filter(Boolean).join(" ");
       const ids: string[] = [];
       let pageToken: string | undefined;
-      const includeSpamTrash = mentionsSpamTrash(sel.query) || undefined;
       do {
         const page = await this.client.request("GET", "messages", {
           query: {
-            q: sel.query.trim() ? `(${sel.query}) -in:draft` : "-in:draft",
-            maxResults: Math.min(500, max + 1 - ids.length),
+            q,
+            labelIds: filter?.labelIds,
+            maxResults: Math.min(500, max - ids.length),
             pageToken,
-            includeSpamTrash,
+            includeSpamTrash: includeSpamTrash || undefined,
           },
         });
         ids.push(...((page.messages ?? []) as { id: string }[]).map((m) => m.id));
         pageToken = page.nextPageToken;
-      } while (pageToken && ids.length <= max);
-      return { ids: ids.slice(0, max), more: ids.length > max || Boolean(pageToken) };
+      } while (pageToken && ids.length < max);
+      // A next page means more match; no need to fetch it just to be sure.
+      return { kind: "query", ids, more: Boolean(pageToken), resumable: filter !== undefined };
     }
     if (sel.threadIds?.length) {
+      const threadIds = [...new Set(sel.threadIds.map((id) => checkId(id, "thread")))];
       const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
-        sel.threadIds.map((id) => ({ path: `threads/${checkId(id, "thread")}`, query: { format: "minimal" } })),
+        threadIds.map((id) => ({ path: `threads/${id}`, query: { format: "minimal" } })),
       );
-      const { found, failed } = settle(sel.threadIds, fetched);
+      const { found, failed } = settle(threadIds, fetched);
+      const add = change.add.map((l) => l.id);
+      const remove = change.remove.map((l) => l.id);
+      const needsChange = (m: ApiMessage) => {
+        const has = new Set(m.labelIds ?? []);
+        return !has.has("DRAFT") && (add.some((id) => !has.has(id)) || remove.some((id) => has.has(id)));
+      };
       const ids: string[] = [];
-      for (const { value } of found) for (const m of value.messages ?? []) if (!m.labelIds?.includes("DRAFT")) ids.push(m.id);
-      return { ids: ids.slice(0, max), more: ids.length > max, ...unavailable("threadIds", failed) };
+      const threadOf = new Map<string, string>();
+      const remainingThreadIds: string[] = [];
+      for (const { id: threadId, value } of found) {
+        const pending = (value.messages ?? []).filter(needsChange).map((m) => m.id);
+        const room = max - ids.length;
+        for (const id of pending.slice(0, room)) {
+          ids.push(id);
+          threadOf.set(id, threadId);
+        }
+        if (pending.length > room) remainingThreadIds.push(threadId);
+      }
+      return { kind: "threads", ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, ...unavailable("threadIds", failed) };
     }
     const ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))];
-    return { ids: ids.slice(0, max), more: ids.length > max };
+    return { kind: "messages", ids: ids.slice(0, max), more: ids.length > max, remainingMessageIds: ids.slice(max) };
   }
 
   /** Adds and removes labels on many messages using Gmail's batchModify (1,000 messages per call). */
-  async bulkModify(
-    sel: { query?: string; threadIds?: string[]; messageIds?: string[] },
-    change: { add: string[]; remove: string[] },
-    opts: { max: number; dryRun: boolean },
-  ) {
+  async bulkModify(sel: BulkSelector, change: { add: string[]; remove: string[] }, opts: { max: number; dryRun: boolean }) {
     // Check IDs before any call, so a bad one doesn't leave the change half done.
     sel.threadIds?.forEach((id) => checkId(id, "thread"));
     sel.messageIds?.forEach((id) => checkId(id, "message"));
-    const labels = change.add.length || change.remove.length
-      ? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[])
-      : [];
-    const addLabelIds = await this.resolveLabelIds(change.add, labels);
-    const removeLabelIds = await this.resolveLabelIds(change.remove, labels);
-    const { ids, more, ...skipped } = await this.selectMessages(sel, opts.max);
-    const moreNote = more
-      ? { more: `More emails match than the limit of ${opts.max}. Run it again to continue, or raise maxEmails.` }
-      : {};
+    // System labels (INBOX, UNREAD, …) need no lookup; only names and user labels do.
+    const refs = [...change.add, ...change.remove];
+    const labels = refs.every(isSystemLabelId)
+      ? refs.map((id): ApiLabel => ({ id, name: id, type: "system" }))
+      : (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[]);
+    const add = await this.resolveLabels(change.add, labels);
+    const remove = await this.resolveLabels(change.remove, labels);
+    const selection = await this.selectMessages(sel, { add, remove }, opts.max);
+    const { ids } = selection;
+    const extra = { ...bulkLeftOver(selection, opts.max), ...(selection.unavailable ? { unavailable: selection.unavailable } : {}) };
     if (opts.dryRun) {
       const sample = ids.slice(0, BULK_PREVIEW);
       const fetched = await this.client.batchGet<ApiMessage>(
@@ -827,14 +964,14 @@ export class Mailbox {
             ]
           : [],
       );
-      return { dryRun: true, wouldChange: ids.length, ...moreNote, ...skipped, preview };
+      return { dryRun: true, wouldChange: ids.length, ...extra, preview };
     }
+    const addLabelIds = add.map((l) => l.id);
+    const removeLabelIds = remove.map((l) => l.id);
     for (let i = 0; i < ids.length; i += 1000) {
-      await this.client.request("POST", "messages/batchModify", {
-        json: { ids: ids.slice(i, i + 1000), addLabelIds, removeLabelIds },
-      });
+      await this.client.request("POST", "messages/batchModify", { json: { ids: ids.slice(i, i + 1000), addLabelIds, removeLabelIds } });
     }
-    return { changed: ids.length, ...moreNote, ...skipped };
+    return { changed: ids.length, ...extra };
   }
 
   async trash(kind: "messages" | "threads", id: string, untrash = false) {

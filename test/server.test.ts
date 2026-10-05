@@ -1368,4 +1368,121 @@ describe("fixes from the second review", () => {
     const lists = fake.requests.filter((r) => r.path === "messages");
     assert.deepEqual(lists.map((r) => r.query.get("includeSpamTrash")), [null, null, "true"]);
   });
+
+  describe("bulk changes only pick emails that still need the change", () => {
+    const unread = (mb: FakeMailbox) => [...mb.messages.values()].filter((m) => m.labelIds!.includes("UNREAD")).map((m) => m.id);
+    function promos(ctx: Ctx, n: number, labelIds = ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"]) {
+      for (let i = 0; i < n; i++) {
+        ctx.fake.deliver(ctx.work, crlf([`From: deals${i}@shop.example`, `To: ${WORK}`, `Subject: Sale ${i}`, "", "x"]), {
+          id: `promo${i}`,
+          labelIds: [...labelIds],
+        });
+      }
+    }
+
+    test("running a capped change again continues with the rest, and counts are real", async () => {
+      const ctx = await setup();
+      promos(ctx, 3);
+      ctx.work.messages.get("promo0")!.labelIds = ["CATEGORY_PROMOTIONS"]; // already read and archived
+      const dry = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "mark_read", dryRun: true });
+      assert.equal(dry.json.wouldChange, 2, "the email that's already read isn't counted");
+      const first = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "mark_read", maxEmails: 1 });
+      assert.equal(first.json.changed, 1);
+      assert.match(first.json.more, /Run the same change again to continue/);
+      const second = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "mark_read", maxEmails: 1 });
+      assert.equal(second.json.changed, 1);
+      assert.equal(second.json.more, undefined);
+      assert.deepEqual(unread(ctx.work).filter((id) => id.startsWith("promo")), []);
+      assert.deepEqual(ctx.fake.batchModifyCalls.map((c) => c.ids.length), [1, 1], "each email changed once");
+      const third = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "mark_read" });
+      assert.equal(third.json.changed, 0);
+      const archive = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "archive", dryRun: true });
+      assert.equal(archive.json.wouldChange, 2, "only emails still in the inbox");
+      const queries = ctx.fake.requests.filter((r) => r.path === "messages").map((r) => r.query.get("q"));
+      assert.deepEqual(queries.slice(0, 2), ["(category:promotions) is:unread -in:draft", "(category:promotions) is:unread -in:draft"]);
+      assert.equal(queries.at(-1), "(category:promotions) in:inbox -in:draft");
+    });
+
+    test("user labels are searched by their quoted name, or matched by ID when removing one", async () => {
+      const ctx = await setup();
+      promos(ctx, 2);
+      ctx.work.labels.push({ id: "Label_9", name: "My Label", type: "user" });
+      const added = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "add_labels", labelIds: ["my label"] });
+      assert.equal(added.json.changed, 2, added.text);
+      const again = await ctx.call("bulk_update", { account: "work", query: "category:promotions", action: "add_labels", labelIds: ["My Label", "Reports"] });
+      assert.equal(again.json.changed, 2, "they still lack Reports");
+      const removed = await ctx.call("bulk_update", { account: "work", query: "", action: "remove_labels", labelIds: ["My Label"] });
+      assert.equal(removed.json.changed, 2);
+      const removedBoth = await ctx.call("bulk_update", { account: "work", query: "", action: "remove_labels", labelIds: ["Label_9", "Reports"] });
+      assert.equal(removedBoth.json.changed, 2, "only Reports was left");
+      const lists = ctx.fake.requests.filter((r) => r.path === "messages");
+      assert.deepEqual(
+        lists.map((r) => [r.query.get("q"), r.query.getAll("labelIds").join(",")]),
+        [
+          ['(category:promotions) -label:"My Label" -in:draft', ""],
+          ['(category:promotions) (-label:"My Label" OR -label:"Reports") -in:draft', ""],
+          ["-in:draft", "Label_9"],
+          ['(label:"My Label" OR label:"Reports") -in:draft', ""],
+        ],
+      );
+      assert.ok(ctx.work.messages.get("promo0")!.labelIds!.every((l) => l !== "Label_9" && l !== "Label_7"));
+    });
+
+    test("by ID, emails over the limit are returned to pass next time; duplicates count once", async () => {
+      const ctx = await setup();
+      promos(ctx, 3);
+      const ids = ["promo0", "promo1", "promo0", "promo2"];
+      const first = await ctx.call("bulk_trash", { account: "work", messageIds: ids, action: "trash", maxEmails: 2 });
+      assert.equal(first.json.changed, 2);
+      assert.deepEqual(first.json.remainingMessageIds, ["promo2"]);
+      assert.match(first.json.more, /messageIds set to remainingMessageIds/);
+      const second = await ctx.call("bulk_trash", { account: "work", messageIds: first.json.remainingMessageIds, action: "trash", maxEmails: 2 });
+      assert.equal(second.json.changed, 1);
+      assert.equal(second.json.more, undefined);
+      assert.ok(["promo0", "promo1", "promo2"].every((id) => ctx.work.messages.get(id)!.labelIds!.includes("TRASH")));
+
+      // Threads: only emails that still need the change, each thread once, the rest handed back.
+      for (const [id, labels] of [["t-a", ["INBOX", "UNREAD"]], ["t-b", ["INBOX"]], ["t-c", ["INBOX", "UNREAD"]]] as const) {
+        ctx.fake.deliver(ctx.work, crlf(["From: a@example.com", `To: ${WORK}`, "Subject: T", "", "x"]), { id, threadId: "T1", labelIds: [...labels] });
+      }
+      ctx.fake.deliver(ctx.work, crlf(["From: a@example.com", `To: ${WORK}`, "Subject: U", "", "x"]), { id: "u-a", threadId: "T2" });
+      const t1 = await ctx.call("bulk_update", { account: "work", threadIds: ["T1", "T1", "T2"], action: "mark_read", maxEmails: 2 });
+      assert.equal(t1.json.changed, 2);
+      assert.deepEqual(t1.json.remainingThreadIds, ["T2"]);
+      const t2 = await ctx.call("bulk_update", { account: "work", threadIds: t1.json.remainingThreadIds, action: "mark_read", maxEmails: 2 });
+      assert.equal(t2.json.changed, 1);
+      assert.equal(t2.json.remainingThreadIds, undefined);
+      assert.deepEqual(ctx.fake.batchModifyCalls.slice(-2).map((c) => c.ids), [["t-a", "t-c"], ["u-a"]]);
+    });
+
+    test("2,000 emails in each of five accounts fit Cloudflare's 50-call limit with room for retries", async () => {
+      const ctx = await setup();
+      for (let i = 3; i <= 5; i++) {
+        const email = `extra${i}@example.com`;
+        ctx.fake.addMailbox(email, `rt-${i}`);
+        await ctx.store.upsert({ email, refreshToken: `rt-${i}`, scopes: [], addedAt: "" });
+      }
+      for (const mb of ctx.fake.mailboxes) {
+        for (let t = 0; t < 2100; t++) {
+          ctx.fake.deliver(mb, crlf([`From: s${t}@shop.example`, `To: ${mb.email}`, "Subject: Deal", "", "x"]), {
+            id: `${mb.refreshToken.replace(/\W/g, "")}m${t}`,
+            labelIds: ["INBOX", "CATEGORY_PROMOTIONS"],
+          });
+        }
+      }
+      ctx.fake.outboundCalls = 0;
+      const dry = await ctx.call("bulk_update", { query: "category:promotions", action: "archive", maxEmails: 2000, dryRun: true });
+      assert.deepEqual(dry.json.accounts.map((a: any) => a.wouldChange), [2000, 2000, 2000, 2000, 2000], dry.text);
+      assert.ok(dry.json.accounts.every((a: any) => /Run the same change again/.test(a.more)));
+      // Per account: token refresh, 4 searches of 500, 1 preview batch. No label list, no extra search.
+      assert.equal(ctx.fake.outboundCalls, 5 * 6, `dry run made ${ctx.fake.outboundCalls} calls`);
+      ctx.fake.outboundCalls = 0;
+      const real = await ctx.call("bulk_update", { query: "category:promotions", action: "archive", maxEmails: 2000 });
+      assert.deepEqual(real.json.accounts.map((a: any) => a.changed), [2000, 2000, 2000, 2000, 2000]);
+      // Per account: 4 searches of 500 and 2 batchModify calls of 1,000 (tokens are cached now).
+      assert.equal(ctx.fake.outboundCalls, 5 * 6, `made ${ctx.fake.outboundCalls} calls`);
+      assert.ok(ctx.fake.requests.every((r) => r.path !== "labels"));
+      assert.ok(ctx.fake.requests.filter((r) => r.path === "messages").every((r) => r.query.get("maxResults") === "500"));
+    });
+  });
 });

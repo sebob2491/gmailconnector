@@ -299,7 +299,11 @@ export class FakeGmail {
     // messages
     if (method === "GET" && path === "messages") {
       const q = url.searchParams.get("q") ?? "";
-      const all = [...mb.messages.values()].reverse().filter((m) => this.matches(mb, m, q, url.searchParams.get("includeSpamTrash") === "true"));
+      const labelIds = url.searchParams.getAll("labelIds");
+      const all = [...mb.messages.values()]
+        .reverse()
+        .filter((m) => labelIds.every((id) => m.labelIds?.includes(id)))
+        .filter((m) => this.matches(mb, m, q, url.searchParams.get("includeSpamTrash") === "true"));
       const start = Number(url.searchParams.get("pageToken") ?? 0);
       const size = Number(url.searchParams.get("maxResults") ?? 100);
       const page = all.slice(start, start + size);
@@ -403,25 +407,54 @@ export class FakeGmail {
     return json(400, { error: { message: `fake: unhandled ${method} ${path}` } });
   };
 
-  /** A small subset of Gmail search: category:, from:, is:, in:, label:, and the "-in:draft" exclusion. */
+  /**
+   * A small subset of Gmail search: category:, from:, is:, in:, label: (quoted names too), "-" to
+   * negate, ( ) and OR, which as in Gmail binds tighter than the implicit AND. Other terms match all.
+   */
   private matches(mb: FakeMailbox, msg: ApiMessage, q: string, includeSpamTrash: boolean): boolean {
     const labels = msg.labelIds ?? [];
-    const tokens = q.replace(/[()]/g, " ").split(/\s+/).filter(Boolean);
-    const wantsTrashOrSpam = tokens.some((t) => /^in:(trash|spam|anywhere)$/i.test(t));
+    const wantsTrashOrSpam = /(?:^|[\s({])in:(trash|spam|anywhere)\b/i.test(q);
     if (!includeSpamTrash && !wantsTrashOrSpam && (labels.includes("TRASH") || labels.includes("SPAM"))) return false;
-    for (const token of tokens) {
+    const term = (token: string): boolean => {
       const negate = token.startsWith("-");
-      const [key, value = ""] = token.replace(/^-/, "").split(":");
+      const body = token.replace(/^-/, "");
+      const colon = body.indexOf(":");
+      if (colon < 0) return true;
+      const key = body.slice(0, colon).toLowerCase();
+      const value = body.slice(colon + 1).replace(/^"(.*)"$/, "$1");
       let hit: boolean;
-      if (key === "category") hit = labels.includes(`CATEGORY_${value.toUpperCase()}`);
+      if (key === "category") hit = labels.includes(`CATEGORY_${value.toLowerCase() === "primary" ? "PERSONAL" : value.toUpperCase()}`);
       else if (key === "from") hit = (msg.payload?.headers?.find((h) => h.name === "From")?.value ?? "").toLowerCase().includes(value.toLowerCase());
       else if (key === "is") hit = labels.includes(value.toUpperCase());
       else if (key === "in") hit = value === "anywhere" || labels.includes(value.toUpperCase());
       else if (key === "label") hit = labels.some((l) => l === value || mb.labels.find((x) => x.id === l)?.name.toLowerCase() === value.toLowerCase());
-      else continue;
-      if (hit === negate) return false;
-    }
-    return true;
+      else return true;
+      return hit !== negate;
+    };
+    // Tokens: "(", ")", "OR", and terms (a quoted value may contain spaces and parentheses).
+    const tokens = q.match(/[()]|-?[^\s()"]*"[^"]*"|[^\s()]+/g) ?? [];
+    let pos = 0;
+    const all = (): boolean => {
+      let result = true;
+      while (pos < tokens.length && tokens[pos] !== ")") result = anyOf() && result;
+      return result;
+    };
+    const anyOf = (): boolean => {
+      let result = one();
+      while (tokens[pos] === "OR") {
+        pos++;
+        result = one() || result;
+      }
+      return result;
+    };
+    const one = (): boolean => {
+      const token = tokens[pos++];
+      if (token !== "(") return term(token);
+      const result = all();
+      pos++; // ")"
+      return result;
+    };
+    return all();
   }
 
   private applyModify(msg: ApiMessage, action: string, body: any) {
