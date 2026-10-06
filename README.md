@@ -88,7 +88,8 @@ phone browser. It takes about 15 minutes, in three places: Cloudflare, Google Cl
 
 1. Sign up at <https://dash.cloudflare.com/sign-up> (the free plan is enough).
 2. Go to **Workers & Pages → Create → Import a repository**. Connect GitHub and pick
-   `gmailconnector`.
+   `gmailconnector`. Setting up your own copy of someone else's? Click **Fork** on their GitHub page
+   first and pick your fork: each person runs their own connector, so nobody can see anyone else's mail.
 3. Fill in the form:
    - **Project name:** `gmail-multi-mcp` (it must match `name` in `wrangler.jsonc`).
    - **Build command:** `npm test`. Every deploy runs the tests first, and a failing test stops it.
