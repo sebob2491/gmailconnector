@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { attachmentCharset, attachmentText } from "../src/format.js";
 import { attachmentResult, decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
-import { cmapOf, docx, docxOf, fontResources, hex4, hexString, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, xlsx, xlsxOf, zip, zipOf } from "./files.js";
+import { cmapOf, docx, docxOf, fontResources, hex4, hexString, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, ttf, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
   const file = pdf([
@@ -761,4 +761,56 @@ test("PDFs with ordinary WinAnsi fonts read as before", async () => {
   }));
   const line = "Café “quoted” € 5 – dash";
   assert.equal((await readPdf(file))!.text, [line, line, line, line].join("\n"));
+});
+
+// ---------- embedded font programs ----------
+
+/** A font whose cmap names glyphs 1-5 A-E (two code points for A: the first wins), glyph 6 drawn as glyph 4, glyph 8 an emoji. */
+const FONT = () => ttf({ cmap: { 0x41: 1, 0x42: 2, 0x43: 3, 0x44: 4, 0x45: 5, 0xff21: 1, 0x1f600: 8 }, composites: { 6: 4 }, numGlyphs: 10 });
+
+test("glyphs a ToUnicode CMap leaves out or maps to <0000> are read from the embedded TrueType font", async () => {
+  // The CMap knows A and E, says glyph 2 has no character (what Skia writes for variants) and leaves 3, 6 and 8 out.
+  const cmap = cmapOf({ bfchar: [["0001", "0041"], ["0002", "0000"], ["0005", "0045"]] });
+  const text = hexString([1, 2, 3, 6, 5, 7, 8, 1, 2, 3, 6, 5, 1, 2, 3, 6, 5, 1, 2, 3, 6, 5]);
+  const file = pdf([`BT /F1 12 Tf 72 700 Td ${text} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap), fontFile: FONT() }) }));
+  // Glyph 7 is in no table: nothing. The cmap's format 12 subtable gives the emoji.
+  assert.equal((await readPdf(file))!.text, "ABCDE😀ABCDEABCDEABCDE");
+  // Without the font program, the same page gives only what the CMap knows ("AEAEAEAE": too little to count as text).
+  const plain = pdf([`BT /F1 12 Tf 72 700 Td ${text} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap) }) }));
+  assert.equal(await pdfText(plain), undefined);
+});
+
+test("Identity-H fonts without a ToUnicode CMap are read through the embedded font's cmap", async () => {
+  const text = hexString([1, 2, 3, 6, 5, 8, 1, 2, 3, 6, 5, 1, 2, 3, 6, 5, 1, 2, 3, 6, 5]);
+  const direct = pdf([`BT /F1 12 Tf 72 700 Td ${text} Tj ET`], [], (b) => ({ F1: b.type0Font({ fontFile: FONT() }) }));
+  assert.equal((await readPdf(direct))!.text, "ABCDE😀ABCDEABCDEABCDE");
+  // A /CIDToGIDMap stream: CIDs 1-5 are glyphs 5-1.
+  const cidToGid = Buffer.from([0, 0, 0, 5, 0, 4, 0, 3, 0, 2, 0, 1]);
+  const mapped = pdf([`BT /F1 12 Tf 72 700 Td ${hexString([1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5])} Tj ET`], [], (b) => ({
+    F1: b.type0Font({ fontFile: FONT(), cidToGid }),
+  }));
+  assert.equal((await readPdf(mapped))!.text, "EDCBAEDCBAEDCBAEDCBA");
+  // A font program without a cmap, or not TrueType, leaves such a font unreadable, as before.
+  for (const fontFile of [ttf({ cmap: { 0x41: 1 }, tables: ["head", "maxp", "glyf", "loca"] }), Buffer.from("OTTO" + "\0".repeat(200), "latin1")]) {
+    assert.equal(await pdfText(pdf([`BT /F1 12 Tf 72 700 Td ${text} Tj ET`], [], (b) => ({ F1: b.type0Font({ fontFile }) }))), undefined);
+  }
+});
+
+test("damaged or oversized font programs never fail a page", async () => {
+  const text = hexString(Array(12).fill([1, 2, 3]).flat());
+  const cmap = cmapOf({ bfchar: [["0001", "0041"], ["0002", "0000"], ["0003", "0043"]] });
+  const good = FONT();
+  const programs: Record<string, Buffer> = {
+    "cmap offsets past the end": Buffer.concat([good.subarray(0, 12), Buffer.from("cmap\0\0\0\0\0\0\xff\xff\0\0\x10\0", "latin1"), good.subarray(28)]),
+    "random bytes behind a TrueType header": Buffer.concat([Buffer.from([0, 1, 0, 0, 0, 9]), randomBytes(2000)]),
+    "a 1.5 MB font": Buffer.concat([good, Buffer.alloc(1.5 * 1024 * 1024)]),
+    "a table count of 65,535": Buffer.concat([Buffer.from([0, 1, 0, 0, 0xff, 0xff]), good.subarray(6)]),
+  };
+  for (const [name, fontFile] of Object.entries(programs)) {
+    const file = pdf([`BT /F1 12 Tf 72 700 Td ${text} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap), fontFile }) }));
+    const r = await timed(() => readPdf(file));
+    assert.equal(r.error, undefined, name);
+    assert.equal(r.value?.text, "AC".repeat(12), name);
+    assert.ok(r.ms < 100, `${name}: ${r.ms.toFixed(0)} ms`);
+  }
 });

@@ -1377,6 +1377,7 @@ class PdfFile {
   private readonly cache = new Map<number, PdfValue | PdfStream | null>();
   private readonly decoded = new Map<number, string | null>();
   private readonly cmaps = new Map<number, CMap | null>();
+  private readonly programs = new Map<number, FontProgram | null>();
   private resolving = 0;
   root?: PdfDict;
 
@@ -1517,30 +1518,55 @@ class PdfFile {
   }
 
   /**
-   * A stream's decoded content (one character per byte), within the file's unpacking budget and
-   * `maxBytes`; undefined for filters other than Flate, damaged data or a stream too large to unpack.
+   * A stream's decoded bytes, within the file's unpacking budget and `maxBytes`; undefined for
+   * filters other than Flate, damaged data or a stream too large to unpack (which is noted when
+   * the file's own limit was hit, not the caller's).
    */
+  decodeBytes(stream: PdfStream, maxBytes = MAX_PART_BYTES): Uint8Array | undefined {
+    const filters = [this.get(stream.dict.get("Filter"))].flat().map((f) => nameOf(f as PdfValue));
+    if (!filters.every((f) => f === undefined || f === "FlateDecode" || f === "Fl") || filters.length > 2) return undefined;
+    let data: Uint8Array = this.buf.subarray(stream.start, stream.end);
+    try {
+      for (const filter of filters) {
+        if (!filter) continue;
+        const limit = Math.min(maxBytes, this.budget.partBytes);
+        if (limit <= 0) throw new RangeError("budget");
+        data = inflate(data, "deflate", limit);
+        this.budget.spend(data.length);
+      }
+      return data;
+    } catch (err) {
+      if (!isOverLimit(err)) return undefined;
+      const limit = Math.min(maxBytes, this.budget.partBytes);
+      if (this.budget.partBytes <= maxBytes) this.budget.cut(this.budget.partBytes <= 0 ? FILE_TOO_LARGE : PDF_PART_TOO_LARGE);
+      // An aborted inflate did the work of `limit` bytes: charge it, so a file can't have it done over and over.
+      this.budget.spend(limit);
+      return undefined;
+    }
+  }
+
+  /** A stream's decoded content (one character per byte), see decodeBytes; cached by object number, failures too. */
   decode(stream: PdfStream, num?: number, maxBytes = MAX_PART_BYTES): string | undefined {
     if (num !== undefined && this.decoded.has(num)) return this.decoded.get(num) ?? undefined;
-    const filters = [this.get(stream.dict.get("Filter"))].flat().map((f) => nameOf(f as PdfValue));
-    let data: Uint8Array = this.buf.subarray(stream.start, stream.end);
-    let result: string | undefined;
-    if (filters.every((f) => f === undefined || f === "FlateDecode" || f === "Fl") && filters.length <= 2) {
-      try {
-        for (const filter of filters) {
-          if (!filter) continue;
-          const limit = Math.min(maxBytes, this.budget.partBytes);
-          if (limit <= 0) throw new RangeError("budget");
-          data = inflate(data, "deflate", limit);
-          this.budget.spend(data.length);
-        }
-        result = latin1(data);
-      } catch (err) {
-        // Only the file's own limits are worth a note; a stream past the caller's (a font's CMap) is just left out.
-        if (isOverLimit(err) && this.budget.partBytes <= maxBytes) this.budget.cut(this.budget.partBytes <= 0 ? FILE_TOO_LARGE : PDF_PART_TOO_LARGE);
-      }
-    }
+    const data = this.decodeBytes(stream, maxBytes);
+    const result = data && latin1(data);
     if (num !== undefined) this.decoded.set(num, result ?? null);
+    return result;
+  }
+
+  /** A font program (a /FontFile2 stream) parsed once per object; undefined when missing, not TrueType, damaged or over MAX_FONT_BYTES. */
+  fontProgram(value: PdfValue | undefined): FontProgram | undefined {
+    if (!(value instanceof PdfRef)) return undefined;
+    const cached = this.programs.get(value.num);
+    if (cached !== undefined) return cached ?? undefined;
+    const stream = this.stream(value);
+    const bytes = stream && this.decodeBytes(stream, MAX_FONT_BYTES);
+    let result: FontProgram | undefined;
+    if (bytes && bytes.length <= MAX_FONT_BYTES) {
+      this.budget.spend(bytes.length);
+      result = FontProgram.parse(bytes);
+    }
+    this.programs.set(value.num, result ?? null);
     return result;
   }
 
@@ -1887,6 +1913,160 @@ function parseCMap(s: string): CMap {
   return { codespace, map };
 }
 
+/** Most bytes of an embedded font program that are read, and most glyphs, cmap groups and characters taken from one. */
+const MAX_FONT_BYTES = 1024 * 1024;
+const MAX_GLYPHS = 65_536;
+const MAX_CMAP_GROUPS = 10_000;
+const MAX_FONT_CHARS = 200_000;
+
+/** The four-character tag of a table in a font program. */
+const tagAt = (view: DataView, at: number) => String.fromCharCode(view.getUint8(at), view.getUint8(at + 1), view.getUint8(at + 2), view.getUint8(at + 3));
+
+/**
+ * What an embedded TrueType program says about its glyphs: the character of each glyph id, from
+ * the font's cmap (a format 4 or 12 subtable, Unicode platforms preferred; the first character
+ * mapped to a glyph wins), and for a glyph that is just another glyph drawn elsewhere (a composite
+ * with one component, as .case and similar variants often are), that glyph's character. Every
+ * read is bounds-checked; a damaged font gives what could be read.
+ */
+class FontProgram {
+  private readonly texts = new Map<number, string>();
+  private glyf?: { view: DataView; glyf: number; glyfEnd: number; loca: number; locaEnd: number; long: boolean; count: number };
+
+  /** The program, or undefined when it isn't TrueType (CFF and collections aren't read) or has no usable cmap. */
+  static parse(bytes: Uint8Array): FontProgram | undefined {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    try {
+      const program = new FontProgram();
+      return program.read(view) ? program : undefined;
+    } catch {
+      return undefined; // past the end of a damaged font
+    }
+  }
+
+  get size() {
+    return this.texts.size;
+  }
+
+  /** The text of a glyph, by id; undefined when the font says nothing about it. */
+  text(gid: number, depth = 0): string | undefined {
+    const known = this.texts.get(gid);
+    if (known !== undefined) return known || undefined;
+    let text = "";
+    if (depth < 2) {
+      const base = this.component(gid);
+      if (base !== undefined && base !== gid) text = this.text(base, depth + 1) ?? "";
+    }
+    if (this.texts.size < 2 * MAX_GLYPHS) this.texts.set(gid, text);
+    return text || undefined;
+  }
+
+  private read(view: DataView): boolean {
+    const tag = view.getUint32(0);
+    if (tag !== 0x00010000 && tag !== 0x74727565 /* "true" */) return false;
+    const numTables = Math.min(view.getUint16(4), 64);
+    const tables = new Map<string, { at: number; end: number }>();
+    for (let i = 0; i < numTables; i++) {
+      const record = 12 + i * 16;
+      const at = view.getUint32(record + 8);
+      const end = at + view.getUint32(record + 12);
+      if (end <= view.byteLength) tables.set(tagAt(view, record), { at, end });
+    }
+    const cmap = tables.get("cmap");
+    if (!cmap) return false;
+    // The subtable to read: Unicode (platform 0, or 3 with encoding 1 or 10) in format 12 (full) or 4 (BMP).
+    let best: { at: number; score: number } | undefined;
+    const subtables = Math.min(view.getUint16(cmap.at + 2), 64);
+    for (let i = 0; i < subtables; i++) {
+      const record = cmap.at + 4 + i * 8;
+      const platform = view.getUint16(record);
+      const encoding = view.getUint16(record + 2);
+      const at = cmap.at + view.getUint32(record + 4);
+      if (at + 4 > cmap.end) continue;
+      const format = view.getUint16(at);
+      if (format !== 4 && format !== 12) continue;
+      const unicode = platform === 0 || (platform === 3 && (encoding === 1 || encoding === 10));
+      const score = (format === 12 ? 2 : 1) + (unicode ? 2 : 0);
+      if (!best || score > best.score) best = { at, score };
+    }
+    if (!best) return false;
+    if (view.getUint16(best.at) === 4) this.readFormat4(view, best.at, cmap.end);
+    else this.readFormat12(view, best.at, cmap.end);
+    const head = tables.get("head");
+    const maxp = tables.get("maxp");
+    const loca = tables.get("loca");
+    const glyf = tables.get("glyf");
+    if (head && maxp && loca && glyf) {
+      this.glyf = { view, glyf: glyf.at, glyfEnd: glyf.end, loca: loca.at, locaEnd: loca.end, long: view.getInt16(head.at + 50) === 1, count: Math.min(view.getUint16(maxp.at + 4), MAX_GLYPHS) };
+    }
+    return this.texts.size > 0;
+  }
+
+  private map(code: number, gid: number) {
+    if (gid === 0 || gid >= MAX_GLYPHS || code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) || this.texts.has(gid)) return;
+    this.texts.set(gid, String.fromCodePoint(code));
+  }
+
+  private readFormat4(view: DataView, at: number, end: number) {
+    const segments = view.getUint16(at + 6) >> 1;
+    const ends = at + 14;
+    const starts = ends + segments * 2 + 2;
+    const deltas = starts + segments * 2;
+    const rangeOffsets = deltas + segments * 2;
+    if (rangeOffsets + segments * 2 > end) return;
+    let chars = 0;
+    for (let i = 0; i < segments && chars < MAX_FONT_CHARS; i++) {
+      const last = view.getUint16(ends + i * 2);
+      const first = view.getUint16(starts + i * 2);
+      const delta = view.getInt16(deltas + i * 2);
+      const rangeOffset = view.getUint16(rangeOffsets + i * 2);
+      for (let code = first; code <= last && code !== 0xffff && chars < MAX_FONT_CHARS; code++, chars++) {
+        let gid: number;
+        if (rangeOffset === 0) gid = (code + delta) & 0xffff;
+        else {
+          const glyphAt = rangeOffsets + i * 2 + rangeOffset + (code - first) * 2;
+          if (glyphAt + 2 > end) break;
+          gid = view.getUint16(glyphAt);
+          if (gid) gid = (gid + delta) & 0xffff;
+        }
+        this.map(code, gid);
+      }
+    }
+  }
+
+  private readFormat12(view: DataView, at: number, end: number) {
+    const groups = Math.min(view.getUint32(at + 12), MAX_CMAP_GROUPS);
+    if (at + 16 + groups * 12 > end) return;
+    let chars = 0;
+    for (let i = 0; i < groups && chars < MAX_FONT_CHARS; i++) {
+      const group = at + 16 + i * 12;
+      const first = view.getUint32(group);
+      const last = view.getUint32(group + 4);
+      const gid = view.getUint32(group + 8);
+      for (let code = first; code <= last && chars < MAX_FONT_CHARS; code++, chars++) {
+        if (gid + (code - first) >= MAX_GLYPHS) break;
+        this.map(code, gid + (code - first));
+      }
+    }
+  }
+
+  /** The one glyph a composite glyph is made of (unscaled or not), or undefined for simple glyphs and other composites. */
+  private component(gid: number): number | undefined {
+    const g = this.glyf;
+    if (!g || gid + 1 >= g.count) return undefined;
+    try {
+      const { view, long } = g;
+      const start = g.glyf + (long ? view.getUint32(g.loca + gid * 4) : view.getUint16(g.loca + gid * 2) * 2);
+      const stop = g.glyf + (long ? view.getUint32(g.loca + gid * 4 + 4) : view.getUint16(g.loca + gid * 2 + 2) * 2);
+      if (stop - start < 14 || stop > g.glyfEnd || view.getInt16(start) >= 0) return undefined;
+      const flags = view.getUint16(start + 10);
+      return flags & 0x20 /* more components */ ? undefined : view.getUint16(start + 12);
+    } catch {
+      return undefined;
+    }
+  }
+}
+
 /**
  * What text extraction needs from a font: how a string's bytes split into character codes, the
  * text of each code, and glyph widths (in 1/1000 em) for placing runs.
@@ -1902,6 +2082,8 @@ interface PdfFont {
   map?: Map<number, string>;
   /** `map` as an array by code, when the codes are compact enough for one (then `map` isn't consulted). */
   texts?: (string | undefined)[];
+  /** Composite fonts with an embedded TrueType program: the text of a code's glyph by the program's own cmap, for codes the CMap lacks (or maps to nothing). */
+  glyph?: (code: number) => string | undefined;
   /**
    * Composite fonts without a ToUnicode CMap: codes are UTF-16BE ("utf16", the Uni*-UCS2/UTF16
    * encodings), or unknown but kept as bytes like before ("bytes", Identity orderings; the
@@ -1971,7 +2153,21 @@ function loadCompositeFont(file: PdfFile, dict: PdfDict): PdfFont {
     font.codespace = codespace;
     font.shortest = codespace.findIndex((ranges) => ranges.length);
   }
-  if (!toUnicode) {
+  // An embedded TrueType program's cmap names the glyphs' characters: for codes the CMap lacks, or every code when there is no CMap.
+  const fontFile = file.dict(descendant?.get("FontDescriptor"))?.get("FontFile2");
+  if (identity && fontFile instanceof PdfRef) {
+    const cidToGid = file.get(descendant?.get("CIDToGIDMap"));
+    const gidOf = isStream(cidToGid) ? file.decodeBytes(cidToGid, 2 * MAX_GLYPHS) : undefined;
+    let program: FontProgram | null | undefined = null; // null: not read yet
+    font.glyph = (code) => {
+      if (program === null) program = file.fontProgram(fontFile);
+      if (!program) return undefined;
+      const gid = gidOf ? (2 * code + 1 < gidOf.length ? gidOf[2 * code] * 256 + gidOf[2 * code + 1] : 0) : code;
+      return gid ? program.text(gid) : undefined;
+    };
+    if (!toUnicode && !file.fontProgram(fontFile)?.size) font.glyph = undefined;
+  }
+  if (!toUnicode && !font.glyph) {
     const ordering = file.get(file.dict(descendant?.get("CIDSystemInfo"))?.get("Ordering"));
     if (/^Uni\w+-(UCS2|UTF16)-[HV]$/.test(encodingName)) font.raw = "utf16";
     else if (!(ordering instanceof PdfString) || ordering.bytes === "Identity") font.raw = "bytes";
@@ -2091,7 +2287,7 @@ function decodeRun(font: PdfFont, raw: string): TextRun {
     RUN.spaces = spaces;
     return RUN;
   }
-  const { codespace, map, texts, cid } = font;
+  const { codespace, map, texts, glyph, cid } = font;
   const table = cid?.table;
   const utf16 = font.raw === "utf16";
   let count = 0;
@@ -2128,7 +2324,8 @@ function decodeRun(font: PdfFont, raw: string): TextRun {
       if (bytes > 2) UNITS[units++] = code >>> 16;
       UNITS[units++] = code & 0xffff;
     } else {
-      const t = texts ? (code < texts.length ? texts[code] : undefined) : map?.get(code);
+      let t = texts ? (code < texts.length ? texts[code] : undefined) : map?.get(code);
+      if (!t && glyph) t = glyph(code);
       if (t !== undefined) {
         if (t.length === 1) UNITS[units++] = t.charCodeAt(0);
         else for (let k = 0; k < t.length; k++) UNITS[units++] = t.charCodeAt(k);

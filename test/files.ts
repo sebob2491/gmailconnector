@@ -131,13 +131,16 @@ export class PdfBuilder {
    * subsets: Identity-H unless `encoding` says otherwise; `toUnicode` names a CMap object; `w` is
    * the /W array's content and `dw` the default width; `ordering` is the CIDSystemInfo ordering.
    */
-  type0Font(opts: { toUnicode?: number; encoding?: string; w?: string; dw?: number; ordering?: string; base?: string } = {}): number {
+  type0Font(opts: { toUnicode?: number; encoding?: string; w?: string; dw?: number; ordering?: string; base?: string; fontFile?: Buffer; cidToGid?: Buffer } = {}): number {
     const base = opts.base ?? "Inter-Regular";
+    const fontFile = opts.fontFile && this.add(`/Filter /FlateDecode /Length1 ${opts.fontFile.length}`, deflateSync(opts.fontFile));
     const descriptor = this.add(
-      `<< /Type /FontDescriptor /FontName /${base} /Flags 4 /FontBBox [-700 -300 2500 1100] /ItalicAngle 0 /Ascent 969 /Descent -241 /CapHeight 727 /StemV 39 >>`,
+      `<< /Type /FontDescriptor /FontName /${base} /Flags 4 /FontBBox [-700 -300 2500 1100] /ItalicAngle 0 /Ascent 969 /Descent -241 /CapHeight 727 /StemV 39` +
+        `${fontFile === undefined ? "" : ` /FontFile2 ${refs(fontFile)}`} >>`,
     );
+    const cidToGid = opts.cidToGid ? refs(this.add("/Filter /FlateDecode", deflateSync(opts.cidToGid))) : "/Identity";
     const descendant = this.add(
-      `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${base} /FontDescriptor ${refs(descriptor)} /CIDToGIDMap /Identity` +
+      `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${base} /FontDescriptor ${refs(descriptor)} /CIDToGIDMap ${cidToGid}` +
         ` /CIDSystemInfo << /Registry (Adobe) /Ordering (${opts.ordering ?? "Identity"}) /Supplement 0 >>` +
         `${opts.dw === undefined ? "" : ` /DW ${opts.dw}`}${opts.w === undefined ? "" : ` /W [${opts.w}]`} >>`,
     );
@@ -195,6 +198,59 @@ export function pdfUpdate(file: Buffer, root: number, objects: ({ num: number } 
     ...objects.map((o) => pdfObject(o.num, o)),
     Buffer.from(`trailer\n<< /Root ${root} 0 R${extraTrailer} >>\nstartxref\n0\n%%EOF\n`, "latin1"),
   ]);
+}
+
+/**
+ * A minimal TrueType font program: a cmap mapping code points to glyph ids (format 4 for the BMP,
+ * and format 12 when a code point lies beyond it), `composites` naming glyphs drawn as another
+ * glyph (as .case variants often are), and the tables a reader needs to find those; `tables`
+ * leaves some out. Enough to look glyphs up, not to render them.
+ */
+export function ttf(opts: { cmap: Record<number, number>; composites?: Record<number, number>; numGlyphs?: number; tables?: string[] }): Buffer {
+  const codes = Object.keys(opts.cmap).map(Number).sort((a, b) => a - b);
+  const composites = opts.composites ?? {};
+  const numGlyphs = opts.numGlyphs ?? Math.max(0, ...codes.map((c) => opts.cmap[c]), ...Object.keys(composites).map(Number), ...Object.values(composites)) + 1;
+  const be16 = (values: number[]) => Buffer.from(values.flatMap((v) => [(v >> 8) & 0xff, v & 0xff]));
+  const be32 = (values: number[]) => Buffer.from(values.flatMap((v) => [(v >>> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff]));
+  // cmap: format 4 over the BMP code points (one segment each, plus the final 0xFFFF one), format 12 over all when needed.
+  const bmp = codes.filter((c) => c <= 0xffff);
+  const segments = bmp.length + 1;
+  const format4 = Buffer.concat([
+    be16([4, 16 + segments * 8, 0, segments * 2, 0, 0, 0]),
+    be16([...bmp, 0xffff]),
+    be16([0]),
+    be16([...bmp, 0xffff]),
+    be16([...bmp.map((c) => (opts.cmap[c] - c) & 0xffff), 1]),
+    be16(Array(segments).fill(0)),
+  ]);
+  const wide = codes.some((c) => c > 0xffff);
+  const format12 = wide ? Buffer.concat([be16([12, 0]), be32([16 + codes.length * 12, 0, codes.length]), ...codes.map((c) => be32([c, c, opts.cmap[c]]))]) : Buffer.alloc(0);
+  const records = wide ? 2 : 1;
+  const cmap = Buffer.concat([be16([0, records]), be16([3, 1]), be32([4 + records * 8]), ...(wide ? [be16([3, 10]), be32([4 + records * 8 + format4.length])] : []), format4, format12]);
+  // glyf and loca (long offsets): composites are one component each; other glyphs are empty.
+  const glyphs: Buffer[] = [];
+  const loca: number[] = [0];
+  for (let g = 0; g < numGlyphs; g++) {
+    const base = composites[g];
+    const data = base === undefined ? Buffer.alloc(0) : Buffer.concat([be16([0xffff, 0, 0, 0, 0, 0x0003, base, 0, 120])]);
+    glyphs.push(data);
+    loca.push(loca[g] + data.length);
+  }
+  const head = Buffer.alloc(54);
+  head.writeInt16BE(1, 50); // long loca offsets
+  const maxp = Buffer.concat([be32([0x00005000]), be16([numGlyphs])]);
+  const tables: [string, Buffer][] = [["cmap", cmap], ["glyf", Buffer.concat(glyphs)], ["head", head], ["loca", be32(loca)], ["maxp", maxp]];
+  const kept = tables.filter(([tag]) => !opts.tables || opts.tables.includes(tag));
+  let offset = 12 + kept.length * 16;
+  const directory: Buffer[] = [be32([0x00010000]), be16([kept.length, 0, 0, 0])];
+  const bodies: Buffer[] = [];
+  for (const [tag, data] of kept) {
+    directory.push(Buffer.from(tag, "latin1"), be32([0, offset, data.length]));
+    const padded = Buffer.concat([data, Buffer.alloc((4 - (data.length % 4)) % 4)]);
+    bodies.push(padded);
+    offset += padded.length;
+  }
+  return Buffer.concat([...directory, ...bodies]);
 }
 
 /** A 4-digit hex code, as CMaps write them. */
