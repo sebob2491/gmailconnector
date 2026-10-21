@@ -226,6 +226,7 @@ export function decodeBody(data: string, contentType?: string): string {
 }
 
 export interface AttachmentInfo {
+  /** Gmail's attachment ID, used to download the file; not shown in results (they're long, and partId is stable). */
   id?: string;
   partId?: string;
   filename: string;
@@ -466,7 +467,8 @@ export interface FormattedMessage {
   labelIds?: string[];
   plaintextBody?: string;
   htmlBody?: string;
-  attachments?: AttachmentInfo[];
+  /** The attachments as listed in results: without Gmail's attachment ID (get_attachment takes the partId). */
+  attachments?: Omit<AttachmentInfo, "id">[];
   raw?: string;
   /** Set when a body was shortened; says how to get the rest. */
   truncated?: string;
@@ -527,7 +529,7 @@ export async function formatMessage(
         `${shortenedLinks} long link${shortenedLinks === 1 ? " was" : "s were"} cut to ${shortenedLinks === 1 ? "its" : "their"} website (https://site/…). ` +
         `For the full links, call again with messageFormat FULL_CONTENT (and maxBodyChars: 0 if the body was also shortened).`;
     }
-    if (content.attachments.length) out.attachments = content.attachments;
+    if (content.attachments.length) out.attachments = content.attachments.map(({ id: _id, ...listed }) => listed);
   }
   return out;
 }

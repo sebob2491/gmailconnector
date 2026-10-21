@@ -398,7 +398,8 @@ describe("reading", () => {
     assert.equal(msg.htmlBody, undefined);
     assert.equal(msg.attachments[0].filename, "report.pdf");
     assert.equal(msg.attachments[0].mimeType, "application/pdf");
-    assert.ok(msg.attachments[0].id);
+    assert.equal(msg.attachments[0].partId, "1");
+    assert.equal(msg.attachments[0].id, undefined, "Gmail's long attachment IDs aren't listed");
   });
 
   test("get_message FULL_CONTENT includes the HTML body; METADATA_ONLY omits subject", async () => {
@@ -561,7 +562,7 @@ describe("drafts", () => {
     assert.deepEqual(got.json.toRecipients, ["x@example.com"]);
     assert.equal(got.json.plaintextBody, "See attached.");
     assert.equal(got.json.attachments[0].filename, "invoice.txt");
-    const attId = got.json.attachments[0].id;
+    const attId = personal.messages.get(got.json.messageId)!.payload!.parts!.find((p) => p.filename === "invoice.txt")!.body!.attachmentId;
     assert.equal(Buffer.from(personal.attachments.get(`${got.json.messageId}/${attId}`)!, "base64url").toString(), "invoice-bytes");
 
     await call("update_draft", { account: "personal", draftId: created.json.id, attachments: [] });

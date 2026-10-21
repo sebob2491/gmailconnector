@@ -47,7 +47,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   PDFs don't break mid-sentence) and filled-in form fields included. Spreadsheets keep empty cells in
   place and show dates as dates; Word tables come out row by row. Text files are decoded in their own
   character set. Very large files (and booby-trapped ones) are read only as far as needed, with a
-  note saying what was left out.
+  note saying what was left out. Emails list their attachments with file name, type, size and a stable
+  `partId`, which is what `get_attachment` takes (Gmail's attachment IDs, often hundreds of characters
+  long, are left out of results).
   Files that can't be shown (unreadable types over 1 MB, images over 4 MB, anything over 8 MB to read as text) are refused from their listed size and type before anything is downloaded, and the email's own bodies are never decoded just to find an attachment.
 - New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
