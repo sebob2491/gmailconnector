@@ -56,6 +56,16 @@ export interface ComposeInput {
 }
 
 export type ThreadView = "THREAD_VIEW_MINIMAL" | "THREAD_VIEW_METADATA_ONLY";
+
+export interface SearchOptions {
+  query?: string;
+  pageSize?: number;
+  pageToken?: string;
+  includeTrash?: boolean;
+  view?: ThreadView;
+  /** Leave out this many threads at the start of the page (ones a merged timeline already showed). */
+  skip?: number;
+}
 export type DraftView = "DRAFT_VIEW_METADATA_ONLY" | "DRAFT_VIEW_FULL";
 
 export const LABEL_COLOR_PRESETS: Record<string, { backgroundColor: string; textColor: string }> = {
@@ -597,13 +607,16 @@ export class Mailbox {
 
   // ---------- threads & messages ----------
 
-  async searchThreads(opts: {
-    query?: string;
-    pageSize?: number;
-    pageToken?: string;
-    includeTrash?: boolean;
-    view?: ThreadView;
-  }) {
+  async searchThreads(opts: SearchOptions) {
+    const { ids: _ids, ...page } = await this.searchPage(opts);
+    return page;
+  }
+
+  /**
+   * One page of a thread search. `ids` are the thread IDs Gmail listed (after `skip`), in Gmail's
+   * order, newest first; `threads` are those of them that could be read.
+   */
+  async searchPage(opts: SearchOptions) {
     const includeDrafts = mentionsDrafts(opts.query);
     const q = opts.query?.trim()
       ? includeDrafts
@@ -619,11 +632,11 @@ export class Mailbox {
       },
     });
     const format: MessageFormat = opts.view === "THREAD_VIEW_METADATA_ONLY" ? "METADATA_ONLY" : "MINIMAL";
-    const ids = (list.threads ?? []) as { id: string }[];
+    const ids = ((list.threads ?? []) as { id: string }[]).map((t) => t.id).slice(opts.skip ?? 0);
     const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
-      ids.map((t) => ({ path: `threads/${t.id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
+      ids.map((id) => ({ path: `threads/${id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
     );
-    const { found, failed } = settle(ids.map((t) => t.id), fetched);
+    const { found, failed } = settle(ids, fetched);
     const threads = await mapLimit(found, 8, async ({ id, value: thread }) => {
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
@@ -648,9 +661,10 @@ export class Mailbox {
       };
     });
     return {
+      ids,
       threads,
       ...unavailable("threadIds", failed),
-      ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}),
+      ...(list.nextPageToken ? { nextPageToken: list.nextPageToken as string } : {}),
     };
   }
 

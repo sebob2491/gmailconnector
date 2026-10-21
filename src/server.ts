@@ -14,6 +14,7 @@ import {
   mapLimit,
   unsafeUnsubscribeHost,
   type MailboxOptions,
+  type SearchOptions,
   unsubscribeOptions,
   type SenderGroup,
   type UnsubscribeOptions,
@@ -85,13 +86,27 @@ export class AccountRouter {
 
 const MULTI_TOKEN_PREFIX = "multi:";
 
-function encodeMultiToken(tokens: Record<string, string>): string | undefined {
-  return Object.keys(tokens).length
-    ? MULTI_TOKEN_PREFIX + Buffer.from(JSON.stringify(tokens)).toString("base64url")
+/**
+ * Where a listing continues in one account: Gmail's next page token, or (merged searches only) the
+ * page just read, `token` being the token it was read with ("" for the first page), with the `skip`
+ * threads at its start that were already shown.
+ */
+type Cursor = string | { token: string; skip: number };
+
+function encodeMultiToken(cursors: Record<string, Cursor>): string | undefined {
+  return Object.keys(cursors).length
+    ? MULTI_TOKEN_PREFIX + Buffer.from(JSON.stringify(cursors)).toString("base64url")
     : undefined;
 }
 
-function decodeMultiToken(token: string): Record<string, string> {
+function isCursor(value: unknown): value is Cursor {
+  if (typeof value === "string") return true;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const { token, skip, ...rest } = value as Record<string, unknown>;
+  return typeof token === "string" && Number.isInteger(skip) && (skip as number) >= 0 && !Object.keys(rest).length;
+}
+
+function decodeMultiToken(token: string): Record<string, Cursor> {
   let decoded: unknown;
   try {
     decoded = JSON.parse(Buffer.from(token.slice(MULTI_TOKEN_PREFIX.length), "base64url").toString("utf8"));
@@ -99,44 +114,53 @@ function decodeMultiToken(token: string): Record<string, string> {
     decoded = undefined;
   }
   const valid =
-    decoded !== null &&
-    typeof decoded === "object" &&
-    !Array.isArray(decoded) &&
-    Object.values(decoded as object).every((v) => typeof v === "string");
+    decoded !== null && typeof decoded === "object" && !Array.isArray(decoded) && Object.values(decoded as object).every(isCursor);
   if (!valid) throw new AccountError("Invalid pageToken. Start the search again without a pageToken.");
-  return decoded as Record<string, string>;
+  return decoded as Record<string, Cursor>;
 }
 
-/**
- * Runs a paginated list operation on one or many accounts. With several accounts the results are
- * grouped per account and `nextPageToken` is a combined token that continues every account at once.
- */
-async function fanOut<T extends { nextPageToken?: string }>(
-  mailboxes: Mailbox[],
-  pageToken: string | undefined,
-  fn: (mb: Mailbox, pageToken: string | undefined) => Promise<T>,
-) {
+/** The mailboxes a (combined) page token continues, each with its cursor; every mailbox when there is no token. */
+function continuedBy(mailboxes: Mailbox[], pageToken: string | undefined): { mb: Mailbox; cursor?: Cursor }[] {
+  if (!pageToken?.startsWith(MULTI_TOKEN_PREFIX)) return mailboxes.map((mb) => ({ mb }));
+  const cursors = decodeMultiToken(pageToken);
+  const lower = new Map(Object.entries(cursors).map(([email, cursor]) => [email.toLowerCase(), cursor]));
+  const targets = mailboxes.filter((mb) => lower.has(mb.email.toLowerCase())).map((mb) => ({ mb, cursor: lower.get(mb.email.toLowerCase()) }));
+  if (!targets.length) {
+    throw new AccountError(
+      "This pageToken doesn't continue any of the requested accounts. Use the same `account` as the call that returned it (or omit it).",
+    );
+  }
+  return targets;
+}
+
+function singleAccountToken(pageToken: string | undefined, mailboxes: Mailbox[]): boolean {
   const combined = pageToken?.startsWith(MULTI_TOKEN_PREFIX) ?? false;
   if (pageToken && !combined && mailboxes.length > 1) {
     throw new AccountError(
       "This pageToken came from a single-account call. Pass the same `account` you used for that call.",
     );
   }
-  if (!combined && mailboxes.length === 1) {
+  return !combined && mailboxes.length === 1;
+}
+
+/**
+ * Runs a paginated list operation (list_drafts) on one or many accounts. With several accounts the
+ * results are grouped per account and `nextPageToken` is a combined token that continues every
+ * account at once. Searches use searchTimeline instead, which merges the accounts.
+ */
+async function fanOut<T extends { nextPageToken?: string }>(
+  mailboxes: Mailbox[],
+  pageToken: string | undefined,
+  fn: (mb: Mailbox, pageToken: string | undefined) => Promise<T>,
+) {
+  if (singleAccountToken(pageToken, mailboxes)) {
     const mb = mailboxes[0];
     return { account: mb.email, ...(await fn(mb, pageToken)) };
   }
-  let targets = mailboxes.map((mb) => ({ mb, token: undefined as string | undefined }));
-  if (combined) {
-    const tokens = decodeMultiToken(pageToken!);
-    const lower = new Map(Object.entries(tokens).map(([email, token]) => [email.toLowerCase(), token]));
-    targets = mailboxes.filter((mb) => lower.has(mb.email.toLowerCase())).map((mb) => ({ mb, token: lower.get(mb.email.toLowerCase()) }));
-    if (!targets.length) {
-      throw new AccountError(
-        "This pageToken doesn't continue any of the requested accounts. Use the same `account` as the call that returned it (or omit it).",
-      );
-    }
-  }
+  const targets = continuedBy(mailboxes, pageToken).map(({ mb, cursor }) => ({
+    mb,
+    token: typeof cursor === "string" ? cursor : cursor?.token || undefined,
+  }));
   const next: Record<string, string> = {};
   const accounts = await Promise.all(
     targets.map(async ({ mb, token }) => {
@@ -164,9 +188,68 @@ function threadTime(thread: { date?: string; messages?: { date?: string }[] }): 
 }
 
 /**
- * Turns a search of several accounts into one timeline, newest first, each thread saying which
+ * Searches one or many accounts. With several, the results form one timeline, newest first across
+ * accounts and across pages: each account reads a page, and only the threads newer than everything
+ * the accounts with another page may still hold are shown. That frontier is the newest among those
+ * accounts' oldest dates; the threads behind it are held back. The combined token then continues an
+ * account with Gmail's next token, or re-reads the same page skipping the threads already shown
+ * (one list call, and metadata only for the rest). So a page can be shorter than pageSize ×
+ * accounts, and the pages concatenate in order with nothing missing or repeated. (A thread does move
+ * to a later page if it gets a new reply between two calls, as it would in Gmail itself.) An
+ * account whose page fails keeps its place, so the next page tries it again.
+ */
+async function searchTimeline(mailboxes: Mailbox[], pageToken: string | undefined, search: Omit<SearchOptions, "pageToken" | "skip">) {
+  if (singleAccountToken(pageToken, mailboxes)) {
+    const mb = mailboxes[0];
+    return { account: mb.email, ...(await mb.searchThreads({ ...search, pageToken })) };
+  }
+  type Page = Awaited<ReturnType<Mailbox["searchPage"]>>;
+  const pages = await Promise.all(
+    continuedBy(mailboxes, pageToken).map(async ({ mb, cursor }) => {
+      const token = typeof cursor === "string" ? cursor : (cursor?.token ?? "");
+      const skip = typeof cursor === "object" ? cursor.skip : 0;
+      let page: Page | undefined;
+      let error: string | undefined;
+      try {
+        page = await mb.searchPage({ ...search, pageToken: token || undefined, skip });
+      } catch (err) {
+        error = (err as Error).message;
+      }
+      return { mb, cursor, token, skip, page, error };
+    }),
+  );
+  const times = pages.map((p) => (p.page ? p.page.threads.map(threadTime) : []));
+  let frontier = -Infinity;
+  pages.forEach((p, i) => {
+    if (p.page?.nextPageToken && times[i].length) frontier = Math.max(frontier, Math.min(...times[i]));
+  });
+  const next: Record<string, Cursor> = {};
+  const accounts = pages.map((p, i) => {
+    const { page } = p;
+    if (!page) {
+      if (p.cursor !== undefined) next[p.mb.email] = p.cursor;
+      return { account: p.mb.email, error: p.error, ...(p.cursor !== undefined ? { hasMore: true } : {}) };
+    }
+    const { ids, threads, nextPageToken, unavailable } = page;
+    // Gmail lists newest first, so the threads to hold back are the tail of the page from the first
+    // one behind the frontier, whatever this connector makes of their dates.
+    const held = times[i].findIndex((t) => t < frontier);
+    if (held >= 0) next[p.mb.email] = { token: p.token, skip: p.skip + ids.indexOf(threads[held].id) };
+    else if (nextPageToken) next[p.mb.email] = nextPageToken;
+    return {
+      account: p.mb.email,
+      threads: held >= 0 ? threads.slice(0, held) : threads,
+      ...(unavailable ? { unavailable } : {}),
+      ...(held >= 0 || nextPageToken ? { hasMore: true } : {}),
+    };
+  });
+  return mergeTimeline({ accounts, nextPageToken: encodeMultiToken(next) });
+}
+
+/**
+ * Turns the accounts' pages of a search into one timeline, newest first, each thread saying which
  * account it's in. Problems with an account (errors, threads Gmail didn't return) and which accounts
- * have more results move to the top level. Sorting is per page, since each account pages on its own.
+ * have more results move to the top level.
  */
 function mergeTimeline(result: { accounts: Record<string, any>[]; nextPageToken?: string }) {
   const threads = result.accounts
@@ -447,7 +530,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Search email threads",
       description:
-        "Searches email threads in one or all linked Gmail accounts. Without `account` (or with \"all\"), every linked account is searched and the results are merged into one `threads` list, newest first, where each thread's `account` says which inbox it's in: mention it to the user, and pass it back when opening the thread. Each account returns up to pageSize threads per page, so the order is newest first within each page; an account's problems are listed under `errors`, and `accountsWithMore` says which accounts have more. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
+        "Searches email threads in one or all linked Gmail accounts. Without `account` (or with \"all\"), every linked account is searched and the results are merged into one `threads` list, newest first, where each thread's `account` says which inbox it's in: mention it to the user, and pass it back when opening the thread. The pages come in true newest-first order across accounts: a page holds the newest threads of all accounts together and the next page continues where it stopped, so a page can hold fewer than pageSize × accounts threads; an account's problems are listed under `errors`, and `accountsWithMore` says which accounts have more. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
       inputSchema: {
         account: multiAccountArg,
         query: z.string().optional().describe(SEARCH_QUERY_HELP),
@@ -463,10 +546,8 @@ export function createServer(deps: ServerDeps): McpServer {
     },
     async (args) =>
       run(async () => {
-        const result = await fanOut(await router.many(args.account), args.pageToken, (mb, pageToken) =>
-          mb.searchThreads({ ...args, pageToken }),
-        );
-        return "accounts" in result ? mergeTimeline(result) : result;
+        const { account, pageToken, ...search } = args;
+        return searchTimeline(await router.many(account), pageToken, search);
       }),
   );
 

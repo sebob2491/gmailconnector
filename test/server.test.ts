@@ -315,20 +315,24 @@ describe("search_threads", () => {
     assert.deepEqual(res.json.threads[0].toRecipients, [PERSONAL, '"Doe, Bob" <bob@example.com>']);
   });
 
-  test("the combined page token continues only the accounts that have more", async () => {
+  test("the combined page token continues the accounts with more, holding back what may not be next", async () => {
     const { call, fake, work } = await setup();
     work.pageSize = 1;
+    // The work emails are newer than the personal one, and work has another page that could hold
+    // something newer still, so the personal thread waits for the next page.
     const first = await call("search_threads", {});
     assert.ok(first.json.nextPageToken.startsWith("multi:"));
-    assert.deepEqual(first.json.accountsWithMore, [WORK]);
-    assert.equal(first.json.threads.filter((t: any) => t.account === WORK).length, 1);
+    assert.deepEqual(first.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt2"]]);
+    assert.deepEqual(first.json.accountsWithMore, [PERSONAL, WORK]);
 
     fake.requests.length = 0;
     const second = await call("search_threads", { pageToken: first.json.nextPageToken });
-    assert.deepEqual(second.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt1"]]);
+    assert.deepEqual(second.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt1"], [PERSONAL, "pt1"]]);
     assert.equal(second.json.accountsWithMore, undefined);
     assert.equal(second.json.nextPageToken, undefined);
-    assert.ok(fake.requests.every((r) => r.email === WORK));
+    // The personal page is listed again (one call), and only the thread not shown yet is read.
+    const personalCalls = fake.requests.filter((r) => r.email === PERSONAL).map((r) => r.path);
+    assert.deepEqual(personalCalls, ["threads", "threads/pt1"]);
   });
 
   test("one failing account doesn't hide the others' results", async () => {
@@ -885,7 +889,7 @@ describe("fixes from the code review", () => {
   });
 
   test("page tokens are checked against the accounts being searched", async () => {
-    const { call, work } = await setup();
+    const { call, personal, work } = await setup();
     work.pageSize = 1;
     const single = await call("search_threads", { account: "work" });
     assert.ok(single.json.nextPageToken && !single.json.nextPageToken.startsWith("multi:"));
@@ -893,7 +897,10 @@ describe("fixes from the code review", () => {
     assert.equal(reused.isError, true);
     assert.match(reused.text, /single-account call/);
 
+    // With the personal thread newest, page 1 shows it, and the token only continues work.
+    personal.messages.get("p1")!.internalDate = String(Date.now());
     const combined = await call("search_threads", {});
+    assert.deepEqual(combined.json.accountsWithMore, [WORK]);
     const wrongAccount = await call("search_threads", { account: "personal", pageToken: combined.json.nextPageToken });
     assert.equal(wrongAccount.isError, true);
     assert.match(wrongAccount.text, /doesn't continue/);
@@ -1365,17 +1372,15 @@ describe("fixes from the second review", () => {
       for (let t = 0; t < 2; t++) fake.deliver(mb, crlf(["From: s@x.example", `To: ${mb.email}`, `Subject: T${t}`, "", "x"]), { threadId: `${mb === work ? "w" : "p"}x${t}` });
     }
     const page1 = await call("search_threads", {});
-    const workPage1 = page1.json.threads.find((t: any) => t.account === WORK).id;
+    assert.deepEqual(page1.json.threads.map((t: any) => t.id), ["wx1"], "the newest thread; personal's newest may not be next");
     fake.failAlways.set("threads", 500);
     const failed = await call("search_threads", { pageToken: page1.json.nextPageToken });
     assert.deepEqual(failed.json.errors.map((e: any) => e.account), [PERSONAL, WORK], failed.text);
     assert.deepEqual(failed.json.accountsWithMore, [PERSONAL, WORK]);
     assert.ok(failed.json.nextPageToken, "the token still continues both accounts");
     fake.failAlways.clear();
-    const page2 = await call("search_threads", { pageToken: failed.json.nextPageToken });
-    assert.deepEqual(page2.json.threads.map((t: any) => t.account).sort(), [PERSONAL, WORK].sort());
-    const workPage2 = page2.json.threads.find((t: any) => t.account === WORK).id;
-    assert.notEqual(workPage2, workPage1, "it continues where page 1 stopped");
+    const rest = await allPages(call, failed.json.nextPageToken);
+    assert.deepEqual([...page1.json.threads, ...rest].map((t: any) => t.id), ["wx1", "wx0", "px1", "px0", "wt2", "wt1", "pt1"], "nothing lost or repeated");
   });
 
   test("excluding Spam or Trash in a bulk query doesn't pull in the other", async () => {
@@ -1682,7 +1687,64 @@ describe("smaller thread views", () => {
   });
 });
 
+/** Follows nextPageToken from `pageToken` to the end, returning the threads of every page in order. */
+async function allPages(call: Ctx["call"], pageToken: string | undefined, args: Record<string, unknown> = {}): Promise<any[]> {
+  const threads: any[] = [];
+  for (let i = 0; i < 20; i++) {
+    const res = await call("search_threads", { ...args, pageToken });
+    assert.equal(res.isError, false, res.text);
+    threads.push(...res.json.threads);
+    pageToken = res.json.nextPageToken;
+    if (!pageToken) return threads;
+  }
+  throw new Error("more than 20 pages");
+}
+
 describe("combined search timeline", () => {
+  test("pages come in true newest-first order across accounts, with nothing missing or repeated", async () => {
+    const { call, fake, personal, work } = await setup();
+    const day = (d: number) => String(Date.UTC(2026, 9, d, 12, 0, 0));
+    // Gmail lists newest first; the fake lists in reverse delivery order, so deliver oldest first.
+    personal.messages.get("p1")!.internalDate = day(3);
+    work.messages.get("w1")!.internalDate = day(2);
+    work.messages.get("w2")!.internalDate = day(10);
+    const dates: Record<string, number[]> = { p: [12, 20], w: [11, 13, 14, 15, 16, 17, 18, 19] };
+    for (const [prefix, days] of Object.entries(dates)) {
+      for (const d of days) {
+        const mb = prefix === "p" ? personal : work;
+        fake.deliver(mb, crlf([`From: s@x.example`, `To: ${mb.email}`, `Subject: Day ${d}`, "", "x"]), { threadId: `${prefix}d${d}` }).internalDate = day(d);
+      }
+    }
+    const pages: any[][] = [];
+    let pageToken: string | undefined;
+    do {
+      const res = await call("search_threads", { pageSize: 3, pageToken });
+      assert.equal(res.isError, false, res.text);
+      pages.push(res.json.threads);
+      pageToken = res.json.nextPageToken;
+    } while (pageToken);
+    assert.deepEqual(
+      pages.map((p) => p.map((t: any) => t.id)),
+      [
+        ["pd20", "wd19", "wd18", "wd17"], // personal's older threads wait: work's next page could be newer
+        ["wd16", "wd15", "wd14"],
+        ["wd13", "pd12", "wd11", "wt2"],
+        ["pt1", "wt1"],
+      ],
+    );
+    const all = pages.flat();
+    assert.equal(new Set(all.map((t: any) => t.id)).size, 13, "no duplicates");
+    assert.equal(all.length, personal.messages.size + work.messages.size, "no gaps");
+    const times = all.map((t: any) => Date.parse(t.date));
+    assert.ok(times.every((t, i) => i === 0 || t <= times[i - 1]), "newest first throughout");
+    // A page of a single account is a plain Gmail page, as before.
+    work.pageSize = 4;
+    const single = await call("search_threads", { account: "work" });
+    assert.ok(!single.json.nextPageToken.startsWith("multi:"));
+    assert.deepEqual(single.json.threads.map((t: any) => t.id), ["wd19", "wd18", "wd17", "wd16"]);
+    assert.equal((await allPages(call, single.json.nextPageToken, { account: "work" })).length, 6);
+  });
+
   test("problems with one account are listed at the top, with the account", async () => {
     const { call, fake } = await setup();
     fake.failAlways.set("threads/wt1", 429);
