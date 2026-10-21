@@ -689,6 +689,7 @@ export function createServer(deps: ServerDeps): McpServer {
         to: addressList("Overrides the default reply recipients."),
         cc: addressList("Overrides the default Cc recipients."),
         bcc: addressList("Bcc recipients."),
+        attachments: attachmentsArg,
       },
       annotations: sends,
     },
@@ -714,6 +715,10 @@ export function createServer(deps: ServerDeps): McpServer {
         forwardText: z.string().optional().describe("Optional. Plain text comments above the forwarded message. Do NOT format with Markdown."),
         htmlBody: z.string().optional().describe("Optional. HTML comments above the forwarded message."),
         includeSignature: includeSignatureArg,
+        attachments: z
+          .array(attachmentArg)
+          .optional()
+          .describe("Optional. Attachments to add, sent along with the original's. Together they cannot exceed 25MB (less on the hosted connector)."),
       },
       annotations: sends,
     },

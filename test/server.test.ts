@@ -2132,3 +2132,68 @@ describe("send-as awareness", () => {
     assert.equal(sendAsCalls(fake), 3);
   });
 });
+
+describe("attachments on replies and forwards", () => {
+  test("reply takes attachments like send_message", async () => {
+    const { call, fake } = await setup();
+    const res = await call("reply", {
+      account: "personal",
+      messageId: "p1",
+      body: "Here's the menu.",
+      attachments: [{ content: b64("menu-bytes"), filename: "menu.txt", mimeType: "text/plain" }],
+    });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(PERSONAL)[0].raw);
+    assert.equal(mime.get("In-Reply-To"), "<lunch-1@example.com>");
+    assert.match(mime.parts[0].text, /^Here's the menu\.\n\nOn Mon, 1 Sep 2026/);
+    const file = mime.parts.find((p) => p.filename === "menu.txt")!;
+    assert.deepEqual([file.type, file.text], ["text/plain", "menu-bytes"]);
+  });
+
+  test("forward sends extra attachments along with the original's", async () => {
+    const { call, fake } = await setup();
+    const res = await call("forward", {
+      account: "work",
+      messageId: "w1",
+      to: ["accountant@example.com"],
+      forwardText: "With my notes.",
+      attachments: [{ content: b64("notes-bytes"), filename: "notes.txt", mimeType: "text/plain" }],
+    });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(WORK)[0].raw);
+    const files = mime.parts.filter((p) => p.filename);
+    assert.deepEqual(files.map((f) => [f.filename, f.text]), [
+      ["report.pdf", "%PDF-1.4 fake pdf bytes"],
+      ["notes.txt", "notes-bytes"],
+    ]);
+  });
+
+  test("the size limits count the original's attachments and the added ones together", async () => {
+    const note = "The connector's owner can raise this limit with MAX_FORWARD_MB.";
+    const { call, fake, work } = await setup({ maxAttachmentBytes: 2 * 1048576, maxAttachmentNote: note });
+    work.messages.set("s1", {
+      id: "s1",
+      threadId: "s1",
+      labelIds: ["INBOX"],
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Slides" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/plain", filename: "", headers: [], body: { data: Buffer.from("see").toString("base64url"), size: 3 } },
+          { partId: "1", mimeType: "application/pdf", filename: "deck.pdf", headers: [], body: { attachmentId: "ATT1", size: 1.5 * 1048576 } },
+        ],
+      },
+    });
+    fake.batchCalls = 0;
+    const extra = { content: Buffer.alloc(1048576, 7).toString("base64"), filename: "more.bin" };
+    const res = await call("forward", { account: "work", messageId: "s1", to: ["x@example.com"], attachments: [extra] });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /^This email's attachments add up to 2\.5 MB \(1\.5 MB on the email and 1\.0 MB being added\), more than the 2 MB this connector re-attaches/);
+    assert.equal(fake.batchCalls, 0, "nothing was downloaded");
+    assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")));
+    assert.equal(fake.sentBy(WORK).length, 0);
+  });
+});

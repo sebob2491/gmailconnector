@@ -21,6 +21,7 @@ import {
   type MessageFormat,
 } from "./format.js";
 import {
+  attachmentSize,
   Base64UrlData,
   buildMimeChunks,
   decodeBase64,
@@ -698,16 +699,21 @@ export class Mailbox {
   /**
    * Downloads every attachment of a message so it can be re-attached (forwarding, draft edits),
    * keeping each as Gmail's base64url text so it is never decoded and encoded again. Attachments
-   * over the limit are refused from their listed sizes before downloading anything. Large ones are
-   * fetched on their own as bytes (no batch text to split, no JSON to parse); small ones share a batch.
+   * over the limit are refused from their listed sizes before downloading anything; attachments
+   * being `added` to the same email count towards it. Large ones are fetched on their own as bytes
+   * (no batch text to split, no JSON to parse); small ones share a batch.
    */
   private async downloadAttachments(
     msg: ApiMessage,
     content: ExtractedContent,
     tooBig: (size: string, limit: string, note?: string) => string,
+    added: OutgoingAttachment[] = [],
   ): Promise<OutgoingAttachment[]> {
-    const total = content.attachments.reduce((sum, a) => sum + a.size, 0);
-    const size = `${(total / 1048576).toFixed(1)} MB`;
+    const mb = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MB`;
+    const listed = content.attachments.reduce((sum, a) => sum + a.size, 0);
+    const extra = added.reduce((sum, a) => sum + attachmentSize(a.content), 0);
+    const total = listed + extra;
+    const size = extra ? `${mb(total)} (${mb(listed)} on the email and ${mb(extra)} being added)` : mb(total);
     if (total > MAX_ATTACHMENT_BYTES) throw new MimeError(tooBig(size, "25 MB Gmail allows in one email"));
     const limit = this.options.maxAttachmentBytes;
     if (limit !== undefined && total > limit) {
@@ -887,6 +893,7 @@ export class Mailbox {
       html,
       inReplyTo: ctx.inReplyTo,
       references: ctx.references,
+      attachments: toAttachments(input.attachments),
     });
     const upload = GmailClient.uploadBody({ threadId: ctx.threadId }, mime);
     const sent = await this.sendMail(() => this.client.request("POST", "messages/send", { upload }));
@@ -901,10 +908,13 @@ export class Mailbox {
     forwardText?: string;
     htmlBody?: string;
     includeSignature?: boolean;
+    /** Attachments to send along with the original's. */
+    attachments?: AttachmentInput[];
   }) {
     if (!input.to?.length && !input.cc?.length && !input.bcc?.length) {
       throw new MimeError("Provide at least one recipient in to, cc or bcc.");
     }
+    const added = toAttachments(input.attachments);
     const original = await this.getRawMessage(input.messageId, "full");
     const p = original.payload;
     const content = await extractContent(p, this.loader(original.id));
@@ -937,14 +947,18 @@ export class Mailbox {
       html,
       inReplyTo: header(p, "Message-ID"),
       references: referencesFor(p),
-      attachments: await this.downloadAttachments(
-        original,
-        content,
-        (size, limit, note) =>
-          `This email's attachments add up to ${size}, more than the ${limit}, so it can't be forwarded with them from here. ` +
-          `Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.` +
-          (note ? ` ${note}` : ""),
-      ),
+      attachments: [
+        ...(await this.downloadAttachments(
+          original,
+          content,
+          (size, limit, note) =>
+            `This email's attachments add up to ${size}, more than the ${limit}, so it can't be forwarded with them from here. ` +
+            `Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.` +
+            (note ? ` ${note}` : ""),
+          added,
+        )),
+        ...added,
+      ],
     });
     // Only the assembled bytes stay alive while sending: the attachment text they were built from can go.
     const upload = GmailClient.uploadBody({ threadId: original.threadId }, mime);
