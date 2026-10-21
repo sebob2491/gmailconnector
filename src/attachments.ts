@@ -113,9 +113,10 @@ export interface TextReadOptions extends ReadOptions {
 export function readTextFile(bytes: Uint8Array, mimeType: string, filename: string, opts: TextReadOptions = {}): ReadResult {
   const budget = new Budget(opts.maxChars);
   const html = /html/i.test(mimeType) || /\.html?$/i.test(filename);
-  // A character takes at most 4 bytes; HTML markup can take many more bytes per character of text.
-  const maxBytes = html ? budget.chars * 50 : budget.chars * 4 + 4;
+  // A character takes at most 4 bytes; HTML markup can take many more bytes per character of text, but only so much is converted.
+  const maxBytes = html ? Math.min(budget.chars * 50, MAX_HTML_BYTES) : budget.chars * 4 + 4;
   const partial = bytes.length > maxBytes;
+  if (html && bytes.length > MAX_HTML_BYTES) budget.cut(FILE_TOO_LARGE);
   const decoded = decodeText(partial ? bytes.subarray(0, maxBytes) : bytes, opts.charset, html, partial);
   const text = html ? htmlToText(decoded) : decoded.replace(/^\ufeff/, "");
   // When the whole file was decoded, the caller can count what it cuts; only a cut-off read means "more".
@@ -133,6 +134,8 @@ export function decodeTextFile(bytes: Uint8Array, mimeType: string, filename: st
 export const MAX_TEXT_CHARS = 1_000_000;
 /** Most bytes one ZIP entry or PDF stream may unpack to (the Worker has 128 MB of memory in all). */
 const MAX_PART_BYTES = 8 * 1024 * 1024;
+/** Most bytes of an HTML attachment that are converted to text (its markup is kept in memory several times over). */
+const MAX_HTML_BYTES = 4 * 1024 * 1024;
 /** Most bytes all parts of one file may unpack to together, which also bounds the CPU spent. */
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
 /** Large parts compressed more than this are decompression bombs; real documents stay far below it. */
@@ -142,6 +145,10 @@ const PART_TOO_LARGE = "Part of this file is too large to read here, so only its
 const PDF_PART_TOO_LARGE = "Part of this PDF is too large to read here and was skipped.";
 const FILE_TOO_LARGE = "This file is too large to read here in full, so only its beginning is shown.";
 const TEXT_TOO_LONG = `The text is longer than ${MAX_TEXT_CHARS.toLocaleString("en-US")} characters, so only the beginning is shown.`;
+
+/** Most tokens (operands and operators) of a PDF's content streams that are read; a few bytes each, far more than a text layer needs. */
+const MAX_PDF_TOKENS = 8_000_000;
+const PDF_TOO_COMPLEX = "This PDF's content is too complex to read here in full, so only the first part is shown.";
 
 /** Thrown when a file can't be read within the memory limits, e.g. a decompression bomb. */
 export class FileTooLargeError extends Error {}
@@ -166,6 +173,8 @@ class Budget {
   /** True when `chars` is the caller's own limit rather than MAX_TEXT_CHARS. */
   private readonly callerLimit: boolean;
   private unpacked = 0;
+  /** Content-stream tokens that may still be read. */
+  tokens = MAX_PDF_TOKENS;
   incomplete?: string;
 
   constructor(maxChars?: number) {
@@ -293,6 +302,7 @@ function zipEntries(bytes: Uint8Array): ZipEntry[] {
  * only what is shown. Throws FileTooLargeError for entries that unpack to far more than they claim.
  */
 function readEntry(bytes: Uint8Array, entry: ZipEntry, budget: Budget, want = MAX_PART_BYTES): { xml: string; cut: boolean } {
+  if (entry.localOffset < 0 || entry.localOffset + 30 > bytes.length) throw new Error("damaged ZIP file: an entry lies beyond its end");
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const start = entry.localOffset + 30 + view.getUint16(entry.localOffset + 26, true) + view.getUint16(entry.localOffset + 28, true);
   const packed = bytes.subarray(start, start + entry.compressedSize);
@@ -307,21 +317,23 @@ function readEntry(bytes: Uint8Array, entry: ZipEntry, budget: Budget, want = MA
   };
   if (entry.method === 0) return done(packed.subarray(0, limit), packed.length > limit);
   if (entry.method !== 8) throw new Error(`unsupported ZIP compression method ${entry.method}`);
-  if (entry.size > MAX_PART_BYTES && entry.size / Math.max(1, packed.length) > MAX_RATIO) {
+  // 0xFFFFFFFF is the ZIP64 marker (the real size is elsewhere, and some writers put it even on small entries): size unknown.
+  const size = entry.size === 0xffffffff ? undefined : entry.size;
+  if (size !== undefined && size > MAX_PART_BYTES && size / Math.max(1, packed.length) > MAX_RATIO) {
     throw new FileTooLargeError(
       "This file unpacks to far more data than its size suggests (a damaged file or a decompression bomb), so it wasn't read.",
     );
   }
-  if (entry.size <= limit) {
+  if (size === undefined || size <= limit) {
     try {
       return done(inflate(packed, "deflate-raw", limit), false);
     } catch (err) {
       if (!isOverLimit(err)) throw err;
-      throw new FileTooLargeError("This file unpacks to more data than it declares (a damaged file or a decompression bomb), so it wasn't read.");
+      if (size !== undefined) throw new FileTooLargeError("This file unpacks to more data than it declares (a damaged file or a decompression bomb), so it wasn't read.");
     }
   }
-  // Inflate only the share of the compressed data that should unpack to `limit` bytes.
-  let take = Math.max(1024, Math.floor(packed.length * (limit / entry.size) * 0.9));
+  // Inflate only the share of the compressed data that should unpack to `limit` bytes (an unknown size is taken as the usual ratio).
+  let take = Math.max(1024, Math.floor(packed.length * (limit / (size ?? packed.length * 8)) * 0.9));
   for (let attempt = 0; attempt < 3; attempt++, take = Math.floor(take / 4)) {
     try {
       return done(inflate(packed.subarray(0, take), "deflate-raw", limit), true);
@@ -345,17 +357,75 @@ function firstReadBytes(chars: number): number {
 
 // ---------- XML ----------
 
-const XML_ENTITY = /&(?:#[xX]([0-9a-fA-F]{1,8})|#([0-9]{1,8})|(amp|lt|gt|quot|apos));/g;
-const XML_NAMED: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+const XML_NAMED: Record<string, number> = { amp: 38, lt: 60, gt: 62, quot: 34, apos: 39 };
+/** Where the entity entityCode last read ends (the index after its ";"). */
+let entityEnd = 0;
+/** The code units of decoded entities, turned into text a chunk at a time. */
+const XML_UNITS: number[] = [];
 
-/** Decodes XML's five named entities and numeric character references. */
+/** The code point of the entity at `amp` (one of the five named ones, or &#N; / &#xH; with up to 8 digits and a valid code point), or -1. */
+function entityCode(text: string, amp: number): number {
+  let semi = -1;
+  for (let p = amp + 2, stop = Math.min(text.length, amp + 12); p < stop; p++) {
+    if (text.charCodeAt(p) === 59 /* ; */) {
+      semi = p;
+      break;
+    }
+  }
+  if (semi < 0) return -1;
+  entityEnd = semi + 1;
+  if (text.charCodeAt(amp + 1) === 35 /* # */) {
+    const hex = text.charCodeAt(amp + 2) === 120 || text.charCodeAt(amp + 2) === 88; /* x X */
+    let p = amp + (hex ? 3 : 2);
+    if (p === semi || semi - p > 8) return -1;
+    let code = 0;
+    for (; p < semi; p++) {
+      const d = text.charCodeAt(p);
+      const v = hex ? (d < 128 ? HEX_VALUE[d] : -1) : d >= 48 && d <= 57 ? d - 48 : -1;
+      if (v < 0) return -1;
+      code = code * (hex ? 16 : 10) + v;
+    }
+    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? code : -1;
+  }
+  return XML_NAMED[text.slice(amp + 1, semi)] ?? -1;
+}
+
+/**
+ * Decodes XML's five named entities and numeric character references, by a scan: only what is
+ * decoded is copied, in chunks, so a million references cost their length, not an object each.
+ */
 function decodeXml(text: string): string {
-  if (!text.includes("&")) return text;
-  return text.replace(XML_ENTITY, (match: string, hex: string | undefined, dec: string | undefined, name: string | undefined) => {
-    if (name) return XML_NAMED[name];
-    const code = hex ? parseInt(hex, 16) : parseInt(dec!, 10);
-    return code > 0 && code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : match;
-  });
+  let amp = text.indexOf("&");
+  if (amp < 0) return text;
+  let out = "";
+  let pos = 0;
+  let count = 0;
+  const flush = () => {
+    if (!count) return;
+    XML_UNITS.length = count;
+    out += String.fromCharCode.apply(null, XML_UNITS);
+    count = 0;
+  };
+  while (amp >= 0) {
+    const code = entityCode(text, amp);
+    if (code < 0) {
+      amp = text.indexOf("&", amp + 1);
+      continue;
+    }
+    if (amp > pos) {
+      flush();
+      out += text.slice(pos, amp);
+    }
+    if (code > 0xffff) {
+      XML_UNITS[count++] = 0xd800 + ((code - 0x10000) >> 10);
+      XML_UNITS[count++] = 0xdc00 + ((code - 0x10000) & 0x3ff);
+    } else XML_UNITS[count++] = code;
+    if (count >= STRING_CHUNK - 1) flush();
+    pos = entityEnd;
+    amp = text.indexOf("&", pos);
+  }
+  flush();
+  return pos < text.length ? out + text.slice(pos) : out;
 }
 
 /**
@@ -620,6 +690,10 @@ interface GrowingReader {
 /** Sorts part names like "slide10.xml" after "slide2.xml". */
 const byNumber = (a: string, b: string) => Number(/(\d+)\.xml$/.exec(a)?.[1] ?? 0) - Number(/(\d+)\.xml$/.exec(b)?.[1] ?? 0);
 
+/** Tables nested, or cells open, deeper than this are read as part of what holds them; rows wider than Excel's limit are cut there. */
+const MAX_TABLE_DEPTH = 64;
+const MAX_COLUMNS = 16_384;
+
 /** Collects text up to a character limit. */
 class TextSink {
   readonly parts: string[] = [];
@@ -650,17 +724,22 @@ function documentText(xml: string, limit: number): Parsed {
   let inText = false;
   let hidden = 0;
   let tabStops = 0;
+  let newlines = 0;
   const put = (s: string) => {
     const cell = cells.at(-1);
     if (cell) cell.parts.push(s);
-    else sink.add(s);
+    else if (s !== "\n" || newlines < 2) {
+      // A run of empty paragraphs ends up as one blank line anyway, so it needn't take up the text budget.
+      newlines = s === "\n" ? newlines + 1 : s.endsWith("\n") ? 1 : 0;
+      sink.add(s);
+    }
   };
   walkXml(
     xml,
     (tag) => {
       const { name, close, empty } = tag;
       if (name === "Fallback" || name === "del" || name === "moveFrom") {
-        if (!empty) hidden += close ? -1 : 1;
+        if (!empty) hidden = Math.max(0, hidden + (close ? -1 : 1)); // a stray closing tag must not hide what follows
         return;
       }
       if (hidden) return;
@@ -688,18 +767,29 @@ function documentText(xml: string, limit: number): Parsed {
           break;
         case "tr":
           if (empty) break;
-          if (!close) rows.push([]);
-          else put(`${(rows.pop() ?? []).join("\t").replace(/\t+$/, "")}\n`);
+          if (!close) {
+            if (rows.length < MAX_TABLE_DEPTH) rows.push([]);
+          } else {
+            const row = rows.pop() ?? [];
+            while (row.length && !row[row.length - 1]) row.pop(); // no trailing tabs
+            put(`${row.join("\t")}\n`);
+          }
           break;
         case "tc":
           if (empty) break;
-          if (!close) cells.push({ parts: [], span: 1 });
-          else {
+          if (!close) {
+            if (cells.length < MAX_TABLE_DEPTH) cells.push({ parts: [], span: 1 });
+          } else {
             const cell = cells.pop();
             const text = (cell?.parts.join("") ?? "").replace(/\s+/g, " ").trim();
             const row = rows.at(-1);
-            if (row) row.push(text, ...Array<string>(Math.max(0, (cell?.span ?? 1) - 1)).fill(""));
-            else put(text);
+            if (!row) put(text);
+            else {
+              row.push(text);
+              // The columns a cell spans are padded, up to Excel's width.
+              const padding = Math.min(Math.max(0, (cell?.span ?? 1) - 1), Math.max(0, MAX_COLUMNS - row.length));
+              for (let i = 0; i < padding; i++) row.push("");
+            }
           }
           break;
         case "gridSpan": {
@@ -722,6 +812,21 @@ function documentText(xml: string, limit: number): Parsed {
 
 type DateKind = "date" | "time" | "datetime" | "duration";
 
+/** A simple number format: text around the number, decimals, a thousands separator, a percent sign (the value times 100). */
+interface NumberFormat {
+  prefix: string;
+  suffix: string;
+  decimals: number;
+  thousands: boolean;
+  percent: boolean;
+}
+
+type CellFormat = DateKind | NumberFormat;
+
+/** Most characters of a number format code that are looked at, and most cell styles read. */
+const MAX_FORMAT_CODE = 256;
+const MAX_CELL_STYLES = 65_536;
+
 /** Built-in number formats that show dates or times (ids 27-36 and 50-58 are East Asian date formats). */
 function builtinDateKind(id: number): DateKind | undefined {
   if ((id >= 14 && id <= 17) || (id >= 27 && id <= 31) || id === 36 || (id >= 50 && id <= 54) || id === 57 || id === 58) return "date";
@@ -731,18 +836,54 @@ function builtinDateKind(id: number): DateKind | undefined {
   return undefined;
 }
 
-/** Whether a custom number format shows a date, a time, both, or an elapsed duration ([h]:mm). */
-function formatDateKind(code: string): DateKind | undefined {
-  const f = code
-    .split(";")[0]
+/**
+ * What a custom number format shows: a date, a time, both, an elapsed duration ([h]:mm), or a
+ * number with a simple format (0.0%, "$"#,##0.00, …); undefined for anything else. Only the first
+ * section (positive numbers) counts, and only its first MAX_FORMAT_CODE characters.
+ */
+function cellFormat(code: string): CellFormat | undefined {
+  const section = code.slice(0, MAX_FORMAT_CODE).split(";")[0];
+  // The format without quoted text, escaped characters, padding and colour/condition brackets (but with [h]-style ones).
+  const f = section
     .replace(/"[^"]*"/g, "")
     .replace(/\\./g, "")
     .replace(/[_*]./g, "")
-    .replace(/\[(?![hms]+\])[^\]]*\]/gi, "");
+    .replace(/\[(?![hms]+\])[^[\]]*\]/gi, "");
   if (/\[[hms]+\]/i.test(f)) return "duration";
   const date = /[yd]/i.test(f) || /m{3,}/i.test(f);
   const time = /[hs]/i.test(f) || /am\/pm|a\/p/i.test(f);
-  return date && time ? "datetime" : date ? "date" : time ? "time" : undefined;
+  if (date || time) return date && time ? "datetime" : date ? "date" : "time";
+  return numberFormat(section);
+}
+
+/** A simple number format: literal text, then digits with an optional thousands separator and decimals, a percent sign, more text. */
+function numberFormat(section: string): NumberFormat | undefined {
+  const m = /^((?:"[^"]*"|\\.|[^"#0?,.%\\[\]*_;@E])*)([#?,]*0*(?:\.[0#?]+)?)(%?)((?:"[^"]*"|\\.|[^"#0?,.%\\[\]*_;@E])*)$/.exec(section);
+  if (!m || !m[2] || !/[0#?]/.test(m[2])) return undefined;
+  const literal = (text: string) => text.replace(/"([^"]*)"|\\(.)/g, "$1$2");
+  const dot = m[2].indexOf(".");
+  return { prefix: literal(m[1]), suffix: literal(m[4]), decimals: dot < 0 ? 0 : Math.min(20, m[2].length - dot - 1), thousands: m[2].includes(","), percent: m[3] === "%" };
+}
+
+/** Built-in number formats 1-4 and 9-10; the rest show plain numbers (or dates, see builtinDateKind). */
+function builtinNumberFormat(id: number): NumberFormat | undefined {
+  const codes: Record<number, string> = { 1: "0", 2: "0.00", 3: "#,##0", 4: "#,##0.00", 9: "0%", 10: "0.00%" };
+  return codes[id] === undefined ? undefined : numberFormat(codes[id]);
+}
+
+/** A number shown with a simple format: decimals, thousands separators, percent, text around it. */
+function formatNumber(n: number, format: NumberFormat): string {
+  const value = format.percent ? n * 100 : n;
+  if (!Number.isFinite(value) || Math.abs(value) >= 1e21) return String(n);
+  let digits = Math.abs(value).toFixed(format.decimals);
+  if (format.thousands) {
+    const dot = digits.indexOf(".");
+    const whole = dot < 0 ? digits : digits.slice(0, dot);
+    let grouped = "";
+    for (let i = 0; i < whole.length; i++) grouped += (i && (whole.length - i) % 3 === 0 ? "," : "") + whole[i];
+    digits = grouped + (dot < 0 ? "" : digits.slice(dot));
+  }
+  return `${value < 0 && Number(digits) !== 0 ? "-" : ""}${format.prefix}${digits}${format.percent ? "%" : ""}${format.suffix}`;
 }
 
 const pad = (n: number) => (n < 10 ? `0${n}` : String(n));
@@ -771,7 +912,7 @@ function formatSerial(serial: number, kind: DateKind, date1904: boolean): string
   // Day 1 is 1900-01-01, and Excel counts a 1900-02-29 that never was (day 60). The epochs are days from 1970-01-01.
   const epoch = date1904 ? -24107 : serial < 60 ? -25568 : -25569;
   const days = Math.floor(seconds / 86400);
-  const date = civilDate(epoch + days);
+  const date = !date1904 && days === 60 ? "1900-02-29" : civilDate(epoch + days);
   const rest = seconds - days * 86400;
   const time = `${pad(Math.floor(rest / 3600))}:${pad(Math.floor(rest / 60) % 60)}${rest % 60 ? `:${pad(rest % 60)}` : ""}`;
   return kind === "date" ? date : kind === "time" ? time : `${date} ${time}`;
@@ -792,12 +933,15 @@ function columnIndex(text: string, start: number, end: number): number | undefin
 
 /** Cells further right than this are put right after the previous cell instead of padding the row with tabs. */
 const MAX_COLUMN_GAP = 200;
-/** Up to this many missing rows become blank lines; longer gaps get one line saying so. */
+/** Up to this many missing (or empty) rows become blank lines; longer gaps get one line saying so. */
 const MAX_BLANK_ROWS = 10;
+/** Excel's last row. */
+const MAX_ROWS = 1_048_576;
 
 interface SheetContext {
   shared(index: number): string | undefined;
-  dateKinds: (DateKind | undefined)[];
+  /** What each cell style (by index) shows: a date or time kind, or a number format. */
+  formats: (CellFormat | undefined)[];
   date1904: boolean;
 }
 
@@ -819,8 +963,10 @@ function cellText(type: string | undefined, value: string, inline: string, style
   if (type === "str" || type === "e" || type === "d") return oneLine(value);
   const n = Number(value);
   if (value.trim() === "" || Number.isNaN(n)) return oneLine(value);
-  const kind = ctx.dateKinds[style];
-  return (kind && formatSerial(n, kind, ctx.date1904)) ?? numberText(value, n);
+  const format = ctx.formats[style];
+  if (format === undefined) return numberText(value, n);
+  if (typeof format === "string") return formatSerial(n, format, ctx.date1904) ?? numberText(value, n);
+  return formatNumber(n, format);
 }
 
 /**
@@ -881,7 +1027,8 @@ class SheetReader {
               this.flushRow();
               done = tag.end;
             } else {
-              this.row = Number(attr(tag, "r")) || this.row + 1;
+              const r = Number(attr(tag, "r"));
+              this.row = Number.isInteger(r) && r > this.lastRow && r <= MAX_ROWS ? r : this.row + 1;
               this.cells = [];
               this.nextColumn = 0;
               if (tag.empty) {
@@ -900,7 +1047,8 @@ class SheetReader {
             } else {
               const ref = findAttr(tag, "r", false);
               const column = ref < 0 ? undefined : columnIndex(tag.xml, ref, attrValueEnd);
-              const at = column !== undefined && column >= this.nextColumn && column - this.nextColumn <= MAX_COLUMN_GAP ? column : this.nextColumn;
+              const wanted = column !== undefined && column >= this.nextColumn && column - this.nextColumn <= MAX_COLUMN_GAP ? column : this.nextColumn;
+              const at = Math.min(wanted, MAX_COLUMNS - 1);
               if (tag.empty) this.nextColumn = at + 1;
               else {
                 this.hasCell = true;
@@ -937,13 +1085,15 @@ class SheetReader {
     this.offset = cut ? done : xml.length;
   }
 
+  /** Writes the row; an empty row is left to the next row's gap (so a run of them becomes blank lines, or one line saying so). */
   private flushRow() {
     const { row, lastRow, cells, sink } = this;
+    let end = cells.length;
+    while (end > 0 && !cells[end - 1]) end--; // no trailing tabs
+    if (!end) return;
     const gap = row - lastRow - 1;
     if (gap > MAX_BLANK_ROWS) sink.add(`(rows ${lastRow + 1}–${row - 1} are empty)\n`);
     else if (gap > 0) sink.add("\n".repeat(gap));
-    let end = cells.length;
-    while (end > 0 && !cells[end - 1]) end--; // no trailing tabs
     let line = "";
     for (let i = 0; i < end; i++) line += i ? `\t${cells[i] ?? ""}` : (cells[i] ?? "");
     sink.add(`${line}\n`);
@@ -951,7 +1101,10 @@ class SheetReader {
   }
 
   text(): string {
-    return this.sink.parts.join("").replace(/\n+$/, "");
+    const text = this.sink.parts.join("");
+    let end = text.length;
+    while (end > 0 && text.charCodeAt(end - 1) === 10) end--;
+    return end === text.length ? text : text.slice(0, end);
   }
 }
 
@@ -995,25 +1148,30 @@ class SharedStrings {
   }
 }
 
-/** Which cell styles (by index) show dates or times. */
-function dateStyles(xml: string): (DateKind | undefined)[] {
-  const custom = new Map<number, DateKind | undefined>();
-  const kinds: (DateKind | undefined)[] = [];
+/** What each cell style (by index) shows: dates and times, and simple number formats. */
+function cellStyles(xml: string): (CellFormat | undefined)[] {
+  const custom = new Map<number, CellFormat | undefined>();
+  const formats: (CellFormat | undefined)[] = [];
   let inCellXfs = false;
   walkXml(
     xml,
     (tag) => {
       const { name, close, empty } = tag;
-      if (name === "numFmt" && !close) custom.set(Number(attr(tag, "numFmtId")), formatDateKind(attr(tag, "formatCode") ?? ""));
+      if (name === "numFmt" && !close) {
+        // Only the start of a format code matters, so a huge one isn't even decoded.
+        const at = findAttr(tag, "formatCode", false);
+        const code = at < 0 ? "" : decodeXml(tag.xml.slice(at, Math.min(attrValueEnd, at + 8 * MAX_FORMAT_CODE)));
+        custom.set(Number(attr(tag, "numFmtId")), cellFormat(code));
+      }
       else if (name === "cellXfs" && !empty) inCellXfs = !close;
-      else if (name === "xf" && inCellXfs && !close) {
+      else if (name === "xf" && inCellXfs && !close && formats.length < MAX_CELL_STYLES) {
         const id = Number(attr(tag, "numFmtId") ?? 0);
-        kinds.push(custom.has(id) ? custom.get(id) : builtinDateKind(id));
+        formats.push(custom.has(id) ? custom.get(id) : (builtinDateKind(id) ?? builtinNumberFormat(id)));
       }
     },
     () => {},
   );
-  return kinds;
+  return formats;
 }
 
 function readWorkbook(pkg: Package, workbookPath: string): ReadResult {
@@ -1062,7 +1220,7 @@ function readWorkbook(pkg: Package, workbookPath: string): ReadResult {
       if (index >= shared.strings.length && sharedCut) budget.cut(PART_TOO_LARGE);
       return shared.strings[index];
     },
-    dateKinds: stylesXml ? dateStyles(stylesXml) : [],
+    formats: stylesXml ? cellStyles(stylesXml) : [],
     date1904,
   };
   loadShared();
@@ -1143,16 +1301,24 @@ function win1252(raw: string): string {
   return raw;
 }
 
-const LITERAL_SPECIAL = /[\\()]/g;
-const ESCAPES: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", "(": "(", ")": ")", "\\": "\\" };
-
+/** Code units (or bytes) turned into a string at a time: String.fromCharCode takes them as arguments, on the stack. */
+const STRING_CHUNK = 4096;
 /** Where the string readLiteral last read ends (the index after its ")"). */
 let literalEnd = 0;
+/** The bytes of a literal string being read with escapes (chunks of this many become text at a time). */
+const LITERAL_BYTES: number[] = [];
+/** Nested parentheses in a literal string are balanced up to this depth; past it they are plain characters. */
+const MAX_PAREN_DEPTH = 4096;
 
-/** Reads a literal string starting at `start` (the "("): its bytes, one per character; `literalEnd` is then the index after ")". */
+/**
+ * Reads a literal string starting at `start` (the "("): its bytes, one per character; `literalEnd`
+ * is then the index after ")". Escapes are read byte by byte into chunks, so a string of millions
+ * of escapes or parentheses costs its length, not a copy per character.
+ */
 function readLiteral(s: string, start: number): string {
+  const n = s.length;
   // Most strings have no escapes or nested parentheses: their ")" is the first special character.
-  for (let i = start + 1; i < s.length; i++) {
+  for (let i = start + 1; i < n; i++) {
     const c = s.charCodeAt(i);
     if (c === 41 /* ) */) {
       literalEnd = i + 1;
@@ -1160,41 +1326,55 @@ function readLiteral(s: string, start: number): string {
     }
     if (c === 92 /* \ */ || c === 40 /* ( */) break;
   }
-  let depth = 1;
+  const bytes = LITERAL_BYTES;
+  let count = 0;
   let out = "";
+  let depth = 1;
   let pos = start + 1;
-  LITERAL_SPECIAL.lastIndex = pos;
-  for (let m = LITERAL_SPECIAL.exec(s); m; m = LITERAL_SPECIAL.exec(s)) {
-    out += s.slice(pos, m.index);
-    const ch = m[0];
-    let next = m.index + 1;
-    if (ch === "\\") {
-      const e = s[next];
-      if (e in ESCAPES) {
-        out += ESCAPES[e];
-        next++;
-      } else if (e >= "0" && e <= "7") {
-        let oct = "";
-        while (oct.length < 3 && s[next] >= "0" && s[next] <= "7") oct += s[next++];
-        out += String.fromCharCode(parseInt(oct, 8) & 0xff);
-      } else if (e === "\r") next += s[next + 1] === "\n" ? 2 : 1; // line continuation
-      else if (e === "\n") next++;
-      else if (e !== undefined) {
-        out += e;
-        next++;
-      }
-    } else if (ch === "(") {
-      depth++;
-      out += ch;
-    } else if (--depth === 0) {
-      literalEnd = next;
-      return out;
-    } else out += ch;
-    pos = next;
-    LITERAL_SPECIAL.lastIndex = next;
+  const put = (b: number) => {
+    bytes[count++] = b;
+    if (count === STRING_CHUNK) {
+      bytes.length = count;
+      out += String.fromCharCode.apply(null, bytes);
+      count = 0;
+    }
+  };
+  while (pos < n) {
+    const c = s.charCodeAt(pos++);
+    if (c === 92 /* \ */) {
+      const e = s.charCodeAt(pos);
+      if (e === 110 /* n */) put(10);
+      else if (e === 114 /* r */) put(13);
+      else if (e === 116 /* t */) put(9);
+      else if (e === 98 /* b */) put(8);
+      else if (e === 102 /* f */) put(12);
+      else if (e >= 48 && e <= 55) {
+        let value = 0;
+        for (let digits = 0; digits < 3 && s.charCodeAt(pos) >= 48 && s.charCodeAt(pos) <= 55; digits++) value = value * 8 + s.charCodeAt(pos++) - 48;
+        put(value & 0xff);
+        continue;
+      } else if (e === 13 /* \r: a line continuation */) {
+        pos += s.charCodeAt(pos + 1) === 10 ? 2 : 1;
+        continue;
+      } else if (e === 10) {
+        pos++;
+        continue;
+      } else if (pos < n) put(e); // \( \) \\ and anything else: the character itself
+      pos++;
+    } else if (c === 40 /* ( */) {
+      if (depth < MAX_PAREN_DEPTH) depth++;
+      put(c);
+    } else if (c === 41 /* ) */ && --depth === 0) {
+      literalEnd = pos;
+      break;
+    } else put(c);
   }
-  literalEnd = s.length;
-  return out + s.slice(pos);
+  if (pos >= n) literalEnd = n;
+  if (count) {
+    bytes.length = count;
+    out += String.fromCharCode.apply(null, bytes);
+  }
+  return out;
 }
 
 /** A hex string's bytes, one per character. */
@@ -1245,7 +1425,25 @@ function skipPdfSpace(s: string, p: { pos: number }) {
   }
 }
 
-const pdfName = (raw: string) => (raw.includes("#") ? raw.replace(/#([0-9A-Fa-f]{2})/g, (_, h: string) => String.fromCharCode(parseInt(h, 16))) : raw);
+/** A name's characters: "#xx" escapes decoded (an invalid escape stays as written). */
+function pdfName(raw: string): string {
+  let hash = raw.indexOf("#");
+  if (hash < 0) return raw;
+  let out = "";
+  let pos = 0;
+  while (hash >= 0) {
+    const a = raw.charCodeAt(hash + 1);
+    const b = raw.charCodeAt(hash + 2);
+    const high = a < 128 ? HEX_VALUE[a] : -1;
+    const low = b < 128 ? HEX_VALUE[b] : -1;
+    if (high >= 0 && low >= 0) {
+      out += raw.slice(pos, hash) + String.fromCharCode(high * 16 + low);
+      pos = hash + 3;
+    }
+    hash = raw.indexOf("#", Math.max(pos, hash + 1));
+  }
+  return out + raw.slice(pos);
+}
 
 /** Parses one PDF object (dictionary, array, string, name, number, reference, …) at `p.pos`; undefined if damaged. */
 function parsePdfValue(s: string, p: { pos: number }, depth = 0): PdfValue | undefined {
@@ -1328,8 +1526,9 @@ const nameOf = (v: PdfValue | PdfStream | undefined) => (v instanceof PdfName ? 
 const isDict = (v: unknown): v is PdfDict => v instanceof Map;
 const isStream = (v: unknown): v is PdfStream => typeof v === "object" && v !== null && "start" in v && "dict" in v;
 
-/** Most objects a PDF may have for its page tree to be used (larger ones are read in file order). */
+/** Most objects a PDF may have for its page tree to be used (larger ones are read in file order), and most "N G obj" headers looked at. */
 const MAX_PDF_OBJECTS = 200_000;
+const MAX_PDF_HEADERS = 400_000;
 /** Most object streams a PDF may have for its page tree to be used. */
 const MAX_OBJECT_STREAMS = 2_000;
 /** Longest object (other than stream data) that is parsed. */
@@ -1368,9 +1567,16 @@ function headerNumber(buf: Uint8Array, at: number): number | undefined {
  * doesn't matter) and by reading object streams. When an object is defined more than once (each
  * incremental update appends new versions), the definition furthest into the file wins.
  */
+/** Where a top-level object's body lies: from `at` (just after its "obj" keyword) to `end`; `streamAt` is its "stream" keyword, -1 for none. */
+interface PdfBody {
+  at: number;
+  end: number;
+  streamAt: number;
+}
+
 class PdfFile {
-  /** Object number → offset just after its "obj" keyword. */
-  private readonly top = new Map<number, number>();
+  /** Top-level objects by number. */
+  private readonly top = new Map<number, PdfBody>();
   /** Objects packed in object streams: number → the stream's object number and its index there. */
   private readonly packed = new Map<number, { stream: number; index: number }>();
   private readonly objectStreams = new Map<number, { text: string; first: number; offsets: number[] }>();
@@ -1386,34 +1592,54 @@ class PdfFile {
     readonly budget: Budget,
   ) {}
 
-  /** Indexes a PDF's objects; undefined when its page tree can't be used (no trailer, encrypted, too big). */
+  /**
+   * Indexes a PDF's objects in one pass over the file; undefined when its page tree can't be used
+   * (no trailer, encrypted, too big). Each keyword is looked for with a cursor that only moves
+   * forward, and an object's body ends at the next "endobj", "N G obj" header or MAX_OBJECT_BYTES,
+   * whichever comes first, so a file missing its keywords still costs its length, not its square.
+   */
   static open(bytes: Uint8Array, budget: Budget): PdfFile | undefined {
     const buf = bufferOf(bytes);
+    const n = buf.length;
     const file = new PdfFile(buf, budget);
     const objectStreams: { num: number; at: number }[] = [];
     let trailer: { at: number; dict: PdfDict } | undefined;
+    // The next occurrence of each keyword at or after the position being read (n when there is none).
+    const cursors = { obj: 0, endobj: 0, stream: 0, endstream: 0 };
+    const next = (keyword: keyof typeof cursors, from: number) => {
+      if (cursors[keyword] < from) {
+        const found = buf.indexOf(keyword, from);
+        cursors[keyword] = found < 0 ? n : found;
+      }
+      return cursors[keyword];
+    };
+    let headers = 0;
     let pos = 0;
     for (;;) {
-      const at = buf.indexOf("obj", pos);
-      if (at < 0) break;
+      const at = next("obj", pos);
+      if (at >= n) break;
       pos = at + 3;
       if (at >= 3 && buf[at - 1] === 0x64 && buf[at - 2] === 0x6e && buf[at - 3] === 0x65) continue; // endobj
       if (isRegularByte(buf[at + 3])) continue;
       const num = headerNumber(buf, at);
       if (num === undefined) continue;
+      if (++headers > MAX_PDF_HEADERS) return undefined;
       if (file.top.size >= MAX_PDF_OBJECTS && !file.top.has(num)) return undefined;
-      file.top.set(num, pos);
-      // A stream's data can hold anything (even "1 0 obj"), so continue after it.
-      const body = file.bodyOf(pos);
-      if (body.streamAt >= 0) {
-        const dict = parsePdfValue(latin1(buf.subarray(pos, body.streamAt)), { pos: 0 });
+      const limit = Math.min(next("endobj", pos), next("obj", pos), pos + MAX_OBJECT_BYTES, n);
+      const streamAt = next("stream", pos) < limit ? cursors.stream : -1;
+      const body: PdfBody = { at: pos, end: limit, streamAt };
+      file.top.set(num, body);
+      if (streamAt >= 0) {
+        const dict = parsePdfValue(latin1(buf.subarray(pos, streamAt)), { pos: 0 });
         if (isDict(dict)) {
           const type = nameOf(dict.get("Type"));
           if (type === "ObjStm") objectStreams.push({ num, at });
           if (type === "XRef" && (!trailer || at > trailer.at)) trailer = { at, dict };
         }
-        const end = buf.indexOf("endstream", body.streamAt + 6);
-        pos = end < 0 ? buf.length : end + 9;
+        // A stream's data can hold anything (even "1 0 obj"), so continue after its "endstream"; the body ends there, or at its "endobj".
+        const dataEnd = next("endstream", streamAt + 6);
+        body.end = Math.min(dataEnd < n ? dataEnd + 9 : n, next("endobj", streamAt));
+        pos = dataEnd < n ? dataEnd + 9 : n;
       }
     }
     const classic = buf.lastIndexOf("trailer", buf.length);
@@ -1430,14 +1656,6 @@ class PdfFile {
     return file;
   }
 
-  /** Where an object's body ends ("endobj"), and where its "stream" keyword is (-1 if it has none). */
-  private bodyOf(pos: number): { end: number; streamAt: number } {
-    const endobj = this.buf.indexOf("endobj", pos);
-    const end = endobj < 0 ? Math.min(this.buf.length, pos + MAX_OBJECT_BYTES) : endobj;
-    const stream = this.buf.subarray(pos, Math.min(end, pos + MAX_OBJECT_BYTES)).indexOf("stream", 0);
-    return { end, streamAt: stream < 0 ? -1 : pos + stream };
-  }
-
   /** Reads an object stream's index, so its objects can be found (a later definition by file position wins). */
   private indexObjectStream(num: number, at: number): boolean {
     const stream = this.stream(new PdfRef(num));
@@ -1452,7 +1670,7 @@ class PdfFile {
       const member = header[2 * i];
       offsets.push(header[2 * i + 1]);
       if (!Number.isInteger(member)) return false;
-      if ((this.top.get(member) ?? -1) < at) this.packed.set(member, { stream: num, index: i });
+      if ((this.top.get(member)?.at ?? -1) < at) this.packed.set(member, { stream: num, index: i });
     }
     this.objectStreams.set(num, { text, first, offsets });
     return true;
@@ -1469,16 +1687,15 @@ class PdfFile {
     let result: PdfValue | PdfStream | undefined;
     try {
       const member = this.packed.get(num);
-      const at = this.top.get(num);
+      const body = this.top.get(num);
       if (member) {
         const holder = this.objectStreams.get(member.stream)!;
         const start = holder.first + holder.offsets[member.index];
         const end = member.index + 1 < holder.offsets.length ? holder.first + holder.offsets[member.index + 1] : holder.text.length;
         result = parsePdfValue(holder.text.slice(start, end), { pos: 0 });
-      } else if (at !== undefined) {
-        const body = this.bodyOf(at);
-        const value = parsePdfValue(latin1(this.buf.subarray(at, body.streamAt >= 0 ? body.streamAt : Math.min(body.end, at + MAX_OBJECT_BYTES))), { pos: 0 });
-        result = body.streamAt >= 0 && isDict(value) ? this.streamAt(value, body.streamAt) : value;
+      } else if (body) {
+        const value = parsePdfValue(latin1(this.buf.subarray(body.at, body.streamAt >= 0 ? body.streamAt : body.end)), { pos: 0 });
+        result = body.streamAt >= 0 && isDict(value) ? this.streamAt(value, body.streamAt, body.end) : value;
       }
     } finally {
       this.resolving--;
@@ -1487,7 +1704,8 @@ class PdfFile {
     return result;
   }
 
-  private streamAt(dict: PdfDict, keyword: number): PdfStream {
+  /** The stream whose "stream" keyword is at `keyword`, its data ending by /Length, else at the "endstream" before `bodyEnd`. */
+  private streamAt(dict: PdfDict, keyword: number, bodyEnd: number): PdfStream {
     let start = keyword + 6;
     if (this.buf[start] === 13) start++;
     if (this.buf[start] === 10) start++;
@@ -1495,8 +1713,8 @@ class PdfFile {
     let end = typeof length === "number" && length >= 0 ? start + length : -1;
     // Trust /Length only when "endstream" follows it.
     if (end < 0 || end > this.buf.length || !latin1(this.buf.subarray(end, end + 32)).includes("endstream")) {
-      const found = this.buf.indexOf("endstream", start);
-      end = found < 0 ? this.buf.length : found;
+      const found = this.buf.subarray(start, Math.max(start, bodyEnd)).indexOf("endstream");
+      end = found < 0 ? Math.max(start, bodyEnd) : start + found;
       while (end > start && (this.buf[end - 1] === 10 || this.buf[end - 1] === 13)) end--;
     }
     return { dict, start, end };
@@ -1618,6 +1836,9 @@ const LATIN1_NAMES =
   "Eth Ntilde Ograve Oacute Ocircumflex Otilde Odieresis multiply Oslash Ugrave Uacute Ucircumflex Udieresis Yacute Thorn germandbls " +
   "agrave aacute acircumflex atilde adieresis aring ae ccedilla egrave eacute ecircumflex edieresis igrave iacute icircumflex idieresis " +
   "eth ntilde ograve oacute ocircumflex otilde odieresis divide oslash ugrave uacute ucircumflex udieresis yacute thorn ydieresis";
+/** Glyph names of the Greek letters U+0391–U+03A9 and U+03B1–U+03C9, in order ("." where unassigned); "mu" keeps its Latin-1 meaning. */
+const GREEK_CAPITAL_NAMES = "Alpha Beta Gamma Delta Epsilon Zeta Eta Theta Iota Kappa Lambda Mu Nu Xi Omicron Pi Rho . Sigma Tau Upsilon Phi Chi Psi Omega";
+const GREEK_NAMES = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma1 sigma tau upsilon phi chi psi omega";
 /** Glyph names of Windows-1252's bytes 0x80–0x9F, in order ("." where the byte has no character). */
 const WIN1252_NAMES =
   "Euro . quotesinglbase florin quotedblbase ellipsis dagger daggerdbl circumflex perthousand Scaron guilsinglleft OE . Zcaron . " +
@@ -1665,6 +1886,8 @@ function glyphList(): Map<string, string> {
   define(LATIN1_NAMES, 0xa0);
   define(WIN1252_NAMES, 0x80, WIN1252);
   for (const [name, text] of Object.entries(OTHER_GLYPHS)) list.set(name, text);
+  define(GREEK_CAPITAL_NAMES, 0x391);
+  define(GREEK_NAMES, 0x3b1);
   return list;
 }
 
@@ -2264,8 +2487,6 @@ interface TextRun {
 const RUN: TextRun = { text: "", width: 0, count: 0, spaces: 0 };
 /** The code units of the run being decoded. */
 const UNITS: number[] = [];
-/** Code units (or bytes) turned into a string at a time: String.fromCharCode takes them as arguments, on the stack. */
-const STRING_CHUNK = 4096;
 
 /** Decodes a shown string through its font: Windows-1252 for ordinary simple fonts (no copying), else code by code. */
 function decodeRun(font: PdfFont, raw: string): TextRun {
@@ -2473,6 +2694,8 @@ const MAX_STATE_DEPTH = 64;
 const MAX_FORM_DEPTH = 8;
 /** Numeric operands kept for an operator (the last six matter); a power of two. */
 const MAX_NUMBERS = 32;
+/** Elements of an array operand (a TJ array) that are kept. */
+const MAX_ARRAY_ELEMENTS = 65_536;
 
 interface TextState {
   ctm: Matrix;
@@ -2513,6 +2736,10 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
     return;
   }
   budget.spend(s.length);
+  if (budget.tokens <= 0) {
+    budget.cut(PDF_TOO_COMPLEX);
+    return;
+  }
   let state: TextState = { ...initial };
   const saved: TextState[] = [];
   // The text matrix (a b c d e f) and the text line matrix: arrays, so the closures below share them without boxing each value.
@@ -2573,11 +2800,21 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
   };
   const n = s.length;
   let pos = 0;
+  let nextGt = -1;
+  let nextCr = -1;
+  let tokens = budget.tokens;
   while (pos < n) {
     const c = s.charCodeAt(pos);
     if (c <= 32) {
       pos++;
-    } else if ((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) {
+      continue;
+    }
+    if (--tokens <= 0) {
+      budget.tokens = 0;
+      budget.cut(PDF_TOO_COMPLEX);
+      return;
+    }
+    if ((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) {
       // A number: [+-]?digits[.digits] or [+-]?.digits; the digits over a power of ten round exactly as Number() does.
       let p = pos;
       let negative = false;
@@ -2605,8 +2842,9 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
       }
       const number = digits > 15 ? Number(s.slice(pos, p)) : negative ? -value / scale : value / scale;
       pos = p;
-      if (inArray) array[arrayLength++] = number;
-      else {
+      if (inArray) {
+        if (arrayLength < MAX_ARRAY_ELEMENTS) array[arrayLength++] = number;
+      } else {
         nums[numCount & (MAX_NUMBERS - 1)] = number;
         numCount++;
         lastKind = 1;
@@ -2614,8 +2852,9 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
     } else if (c === 40 /* ( */) {
       const literal = readLiteral(s, pos);
       pos = literalEnd;
-      if (inArray) array[arrayLength++] = literal;
-      else {
+      if (inArray) {
+        if (arrayLength < MAX_ARRAY_ELEMENTS) array[arrayLength++] = literal;
+      } else {
         str = literal;
         lastKind = 2;
       }
@@ -2630,8 +2869,13 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
         pos += 2; // a dictionary (an inline image's or marked content's); its entries are skipped as operands
         continue;
       }
-      const end = s.indexOf(">", pos + 1);
-      if (end < 0) {
+      // The next ">" is looked for once per stretch of the stream, so a million "<" without one don't cost a search each.
+      if (nextGt <= pos) {
+        const found = s.indexOf(">", pos + 1);
+        nextGt = found < 0 ? n : found;
+      }
+      const end = nextGt;
+      if (end >= n) {
         pos++;
         continue;
       }
@@ -2675,8 +2919,9 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
         out += String.fromCharCode.apply(null, bytes);
       }
       pos = end + 1;
-      if (inArray) array[arrayLength++] = out;
-      else {
+      if (inArray) {
+        if (arrayLength < MAX_ARRAY_ELEMENTS) array[arrayLength++] = out;
+      } else {
         str = out;
         lastKind = 2;
       }
@@ -2691,7 +2936,13 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
       }
       pos++;
     } else if (c === 37 /* % */) {
-      while (pos < n && s.charCodeAt(pos) !== 10 && s.charCodeAt(pos) !== 13) pos++;
+      // A comment runs to the end of its line.
+      const lf = s.indexOf("\n", pos);
+      if (nextCr <= pos) {
+        const found = s.indexOf("\r", pos);
+        nextCr = found < 0 ? n : found;
+      }
+      pos = Math.min(lf < 0 ? n : lf, nextCr);
     } else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 39 || c === 34 || c === 42) {
       let p = pos + 1;
       for (; p < n; p++) {
@@ -2700,7 +2951,10 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
       }
       const op = s.slice(pos, p);
       pos = p;
-      if (writer.full) return;
+      if (writer.full) {
+        budget.tokens = tokens;
+        return;
+      }
       switch (op) {
         case "Tj":
           if (lastKind === 2 && str !== undefined) show(str);
@@ -2786,7 +3040,11 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
           break;
         }
         case "Do":
-          if (lastKind === 3 && name !== undefined) drawForm(name, ctx, resources, state, formDepth);
+          if (lastKind === 3 && name !== undefined) {
+            budget.tokens = tokens;
+            drawForm(name, ctx, resources, state, formDepth);
+            tokens = budget.tokens;
+          }
           break;
       }
       numCount = 0;
@@ -2795,6 +3053,7 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
       lastKind = 0;
     } else pos++; // ) > { } and stray bytes
   }
+  budget.tokens = tokens;
 }
 
 /** Reads a Form XObject drawn with Do, where it is drawn; each form once per page, never recursively. */
@@ -2940,8 +3199,8 @@ function pageContent(file: PdfFile, page: PdfPage): string | undefined {
   for (const ref of refs) {
     const stream = file.stream(ref);
     if (!stream) return undefined;
-    // A stream that can't be decoded (another filter, or too large) is left out, not treated as damage.
-    parts.push(file.decode(stream) ?? "");
+    // A stream that can't be decoded (another filter, or too large) is left out, not treated as damage; each is decoded once per file.
+    parts.push(file.decode(stream, ref instanceof PdfRef ? ref.num : undefined) ?? "");
   }
   return parts.join("\n");
 }
@@ -3015,6 +3274,11 @@ function readPageTree(file: PdfFile, budget: Budget): ReadResult | undefined {
     }
     const content = pageContent(file, step.value);
     if (content === undefined) return undefined;
+    if (!content && !step.value.dict.has("Annots")) {
+      pages.push(""); // nothing drawn: no text to place
+      step = tree.next();
+      continue;
+    }
     if (pages.length === 1 && !multi) {
       multi = true;
       total += pageMarker(1).length;

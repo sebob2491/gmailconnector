@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { attachmentCharset, attachmentText } from "../src/format.js";
@@ -198,7 +199,7 @@ test("spreadsheet values look like they do in Excel", async () => {
   });
   assert.equal(
     await officeText(file),
-    "--- Sheet: Values ---\n2024-10-01\t2024-10-01 13:30\t1234.5\t18:00\t36:00:00\t0.3\tTRUE\tFALSE\t#DIV/0!\ta & b",
+    "--- Sheet: Values ---\n2024-10-01\t2024-10-01 13:30\t$1,234.50\t18:00\t36:00:00\t0.3\tTRUE\tFALSE\t#DIV/0!\ta & b",
   );
   // Workbooks using the 1904 date system.
   const mac = xlsxOf({ date1904: true, styles: '<cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs>', sheets: [{ name: "S", data: '<row r="1"><c r="A1" s="1"><v>0</v></c></row>' }] });
@@ -813,4 +814,173 @@ test("damaged or oversized font programs never fail a page", async () => {
     assert.equal(r.value?.text, "AC".repeat(12), name);
     assert.ok(r.ms < 100, `${name}: ${r.ms.toFixed(0)} ms`);
   }
+});
+
+// ---------- regressions from fuzzing ----------
+
+test("text after a form XObject keeps its place, whatever the form's length", async () => {
+  // Before, the page's tokenizer resumed at the form's length: text after Do was skipped (a long form) or read twice (a short one).
+  for (const padding of [600, 1]) {
+    const b = new PdfBuilder();
+    const form = b.add("/Type /XObject /Subtype /Form /BBox [0 0 612 792]", Buffer.from(`BT /F1 12 Tf 72 686 Td (from the form) Tj ET\n${"% padding\n".repeat(padding)}`));
+    const content = b.content("BT /F1 12 Tf 72 700 Td (one) Tj ET /Fx Do BT /F1 12 Tf 72 672 Td (two) Tj 0 -14 Td (three) Tj 0 -14 Td (four) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(content)} /Resources << /XObject << /Fx ${refs(form)} >> >> >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "one\nfrom the form\ntwo\nthree\nfour");
+  }
+});
+
+test("a content stream shared by many pages is decoded once, and reading stops within the budgets", async () => {
+  // 3,000 pages share one stream that unpacks to 8 MB: it is inflated once, read a few times (the byte budget), then the file is cut.
+  const b = new PdfBuilder();
+  const stream = b.add("/Filter /FlateDecode", deflateSync(Buffer.from(`BT /F1 12 Tf 72 720 Td (shared content stream text) Tj ET\n${"% padding comment line\n".repeat(350_000)}`)));
+  const pages = Array.from({ length: 3000 }, () => b.add(`<< /Type /Page /Contents ${refs(stream)} >>`));
+  const shared = await timed(() => readPdf(b.build(pageTree(b, pages))));
+  assert.match(shared.value!.text, /^--- Page 1 ---\nshared content stream text/);
+  assert.match(shared.value!.incomplete ?? "", /too large/);
+  assert.ok(shared.ms < 400, `shared stream: ${shared.ms.toFixed(0)} ms`);
+  // One page whose /Contents array names the same small stream 20,000 times.
+  const c = new PdfBuilder();
+  const small = c.content("BT /F1 12 Tf 72 720 Td (again) Tj ET");
+  const page = c.add(`<< /Type /Page /Contents [${refs(Array(20_000).fill(small))}] >>`);
+  const repeated = await timed(() => readPdf(c.build(pageTree(c, [page])), { maxChars: 20_000 }));
+  assert.match(repeated.value!.text, /^(again){100}/);
+  assert.ok(repeated.ms < 200, `repeated stream: ${repeated.ms.toFixed(0)} ms`);
+});
+
+test("PDFs missing their endobj keywords are indexed in linear time", async () => {
+  const b = new PdfBuilder();
+  const pages = Array.from({ length: 5000 }, (_, i) => textPage(b, `Page ${i} of a file whose endobj keywords are gone.`));
+  const file = Buffer.from(b.build(pageTree(b, pages)).toString("latin1").replaceAll("endobj", "      "), "latin1");
+  const r = await timed(() => readPdf(file, { maxChars: 20_000 }));
+  assert.match(r.value!.text, /Page 0 of a file/);
+  assert.ok(r.ms < 300, `no endobj: ${r.ms.toFixed(0)} ms`);
+  // A million headers (no bodies) are given up on quickly: the file is read in file order instead (no text).
+  const headers = await timed(() => readPdf(Buffer.from(`%PDF-1.4\n${"1 0 obj\n".repeat(1_000_000)}`)));
+  assert.equal(headers.value, undefined);
+  assert.ok(headers.ms < 300, `headers: ${headers.ms.toFixed(0)} ms`);
+});
+
+test("content streams built to amplify (nested parentheses, escapes, hex starts, huge TJ arrays) stay cheap", async () => {
+  const cases: Record<string, string> = {
+    "4 MB of '('": `BT (${"(".repeat(4_000_000)}) Tj ET`,
+    "4 MB of escapes": `BT (${"\\n".repeat(2_000_000)}) Tj ET`,
+    "1M hex starts": `BT ${"<4".repeat(1_000_000)} ET`,
+    "a TJ array of 1M elements": `BT /F1 12 Tf 72 720 Td [${"(a)-1".repeat(500_000)}] TJ ET`,
+  };
+  for (const [name, content] of Object.entries(cases)) {
+    const file = pdf([`BT /F1 12 Tf 72 700 Td (Readable text before the trap in this file.) Tj ET\n${content}`]);
+    const r = await timed(() => readPdf(file));
+    assert.equal(r.error, undefined, name);
+    assert.match(r.value?.text ?? "", /^Readable text before the trap/, name);
+    assert.ok(r.ms < 400, `${name}: ${r.ms.toFixed(0)} ms`);
+  }
+  // Past the token budget, a file is cut with a note rather than read on.
+  const b = new PdfBuilder();
+  const busy = b.add("/Filter /FlateDecode", deflateSync(Buffer.from("0 0 m 1 1 l S\n".repeat(500_000))));
+  const page = b.add(`<< /Type /Page /Contents [${refs(b.content("BT /F1 12 Tf 72 700 Td (Before more than eight million drawing tokens.) Tj ET"), busy, busy, busy)}] >>`);
+  const r = await readPdf(b.build(pageTree(b, [page])));
+  assert.equal(r!.text, "Before more than eight million drawing tokens.");
+  assert.match(r!.incomplete ?? "", /too complex/);
+});
+
+test("spreadsheets with huge runs of empty rows or cells are read in linear time", async () => {
+  // 100,000 empty rows, then text: one line says so (as for missing rows).
+  const rows = await timed(() => readOffice(xlsxOf({ sheets: [{ name: "S", data: `${'<row r="1"/>'.repeat(1).replace('r="1"', 'r="1"')}${Array.from({ length: 100_000 }, (_, i) => `<row r="${i + 1}"/>`).join("")}<row r="100001"><c t="inlineStr"><is><t>text</t></is></c></row>` }] })));
+  assert.equal(rows.value!.text, "--- Sheet: S ---\n(rows 1–100000 are empty)\ntext");
+  assert.ok(rows.ms < 150, `empty rows: ${rows.ms.toFixed(0)} ms`);
+  // 40,000 empty cells, then text: the text lands in Excel's last column.
+  const cells = await timed(() => readOffice(xlsxOf({ sheets: [{ name: "S", data: `<row r="1">${"<c/>".repeat(40_000)}<c t="inlineStr"><is><t>text</t></is></c></row>` }] })));
+  assert.equal(cells.value!.text, `--- Sheet: S ---\n${"\t".repeat(16_383)}text`);
+  assert.ok(cells.ms < 150, `empty cells: ${cells.ms.toFixed(0)} ms`);
+  // A Word table row of 625 cells spanning 64 columns each, then text.
+  const row = `<w:tbl><w:tr>${'<w:tc><w:tcPr><w:gridSpan w:val="64"/></w:tcPr></w:tc>'.repeat(625)}<w:tc><w:p><w:r><w:t>text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`;
+  const table = await timed(() => readOffice(docxOf(row)));
+  assert.equal(table.value!.text, "text"); // the row's leading tabs are leading white space of the document
+  assert.ok(table.ms < 150, `table row: ${table.ms.toFixed(0)} ms`);
+});
+
+test("number format codes are read in linear time, and only so far", async () => {
+  for (const [code, shown] of [["[".repeat(100_000), "45000"], ["[h".repeat(50_000), "00:00"], ['"'.repeat(1_000_000), "45000"]]) {
+    const file = xlsxOf({ sheets: [{ name: "S", data: '<row r="1"><c s="1"><v>45000</v></c></row>' }], styles: `<numFmts><numFmt numFmtId="164" formatCode="${code.replace(/"/g, "&quot;")}"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs>` });
+    const r = await timed(() => readOffice(file));
+    assert.equal(r.value!.text, `--- Sheet: S ---\n${shown}`);
+    assert.ok(r.ms < 100, `${code.slice(0, 2)}…: ${r.ms.toFixed(0)} ms`);
+  }
+});
+
+test("simple number formats are applied: percent, currency, thousands, built-in ones", async () => {
+  const file = xlsxOf({
+    styles:
+      `<numFmts><numFmt numFmtId="164" formatCode="0.0%"/><numFmt numFmtId="165" formatCode="&quot;$&quot;#,##0.00"/><numFmt numFmtId="166" formatCode="#,##0.00 &quot;EUR&quot;;[Red]-#,##0.00"/><numFmt numFmtId="167" formatCode="0.00E+00"/><numFmt numFmtId="168" formatCode="0.${"0".repeat(150)}"/></numFmts>` +
+      '<cellXfs><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="165"/><xf numFmtId="9"/><xf numFmtId="3"/><xf numFmtId="166"/><xf numFmtId="167"/><xf numFmtId="4"/><xf numFmtId="168"/></cellXfs>',
+    sheets: [
+      {
+        name: "S",
+        data:
+          '<row r="1"><c s="1"><v>0.085</v></c><c s="2"><v>1234.5</v></c><c s="3"><v>0.5</v></c><c s="4"><v>1234567</v></c><c s="5"><v>-98765.432</v></c><c s="6"><v>12345</v></c><c s="7"><v>-0.001</v></c><c s="8"><v>1.5</v></c></row>',
+      },
+    ],
+  });
+  // Decimals are capped at 20 (a format asking for 150 is nonsense).
+  assert.equal((await readOffice(file)).text, `--- Sheet: S ---\n8.5%\t$1,234.50\t50%\t1,234,567\t-98,765.43 EUR\t12345\t0.00\t1.5${"0".repeat(19)}`);
+});
+
+test("odd row numbers and serial 60 are shown sensibly", async () => {
+  const file = xlsxOf({
+    styles: '<cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs>',
+    sheets: [
+      {
+        name: "S",
+        data:
+          '<row r="1000000000000000000"><c t="inlineStr"><is><t>a</t></is></c></row><row r="1"><c t="inlineStr"><is><t>b</t></is></c></row>' +
+          '<row r="Infinity"><c t="inlineStr"><is><t>c</t></is></c></row><row r="5"><c s="1"><v>60</v></c><c s="1"><v>59</v></c><c s="1"><v>61</v></c></row>',
+      },
+    ],
+  });
+  assert.equal((await readOffice(file)).text, "--- Sheet: S ---\na\nb\nc\n\n1900-02-29\t1900-02-28\t1900-03-01");
+});
+
+test("a stray closing tag in Word markup doesn't hide the text after it", async () => {
+  assert.equal(await officeText(docxOf("</w:del><w:p><w:r><w:t>visible</w:t></w:r></w:p></mc:Fallback><w:p><w:r><w:t>still visible</w:t></w:r></w:p>")), "visible\nstill visible");
+  // Runs of empty paragraphs don't eat the text budget.
+  assert.equal(await officeText(docxOf(`${"<w:p/>".repeat(1_000_000)}<w:p><w:r><w:t>end</w:t></w:r></w:p>`)), "end");
+});
+
+test("a million character references in a Word document are decoded cheaply", async () => {
+  const r = await timed(() => readOffice(docxOf(`<w:p><w:r><w:t>${"&#x41;".repeat(1_000_000)}&#x1F600;&amp;&#65;&bogus;&#xZZ;</w:t></w:r></w:p>`)));
+  assert.equal(r.value!.text, `${"A".repeat(1_000_000)}😀&A&bogus;&#xZZ;`);
+  assert.ok(r.ms < 300, `entities: ${r.ms.toFixed(0)} ms`);
+});
+
+test("HTML attachments are converted only up to 4 MB, whatever maxChars asks", () => {
+  const html = Buffer.from(`<p>${"word ".repeat(100)}</p>`.repeat(13_000)); // about 6.6 MB
+  const r = readTextFile(html, "text/html", "big.html", { maxChars: 0 });
+  assert.match(r.incomplete ?? "", /too large/);
+  // About 4 MB of the 6.6 MB became text (the rest is the note's business).
+  assert.ok(r.text.length > 3_000_000 && r.text.length < 5_000_000, String(r.text.length));
+});
+
+test("damaged ZIP offsets fail with the module's own error, and the ZIP64 size marker means unknown", async () => {
+  const good = docx(["Hello there"]);
+  const patched = Buffer.from(good);
+  // The central directory's local-header offset of the document part, pointed past the file.
+  const name = Buffer.from("word/document.xml");
+  const central = patched.indexOf(name, patched.indexOf(name) + 1) - 46;
+  assert.equal(patched.readUInt32LE(central), 0x02014b50);
+  patched.writeUInt32LE(0xfffffff0, central + 42);
+  await assert.rejects(readOffice(patched), (err: unknown) => !(err instanceof RangeError) && /damaged ZIP/.test(String(err)));
+  const marked = zipOf([{ name: "word/document.xml", data: Buffer.from('<w:document><w:body><w:p><w:r><w:t>sized unknown</w:t></w:r></w:p></w:body></w:document>'), declaredSize: 0xffffffff }]);
+  assert.equal(await officeText(marked), "sized unknown");
+});
+
+test("Greek glyph names resolve", async () => {
+  const file = pdf(["BT /F1 12 Tf 72 700 Td (The Greek letters \\001\\002\\003 and \\004\\005\\006 here.) Tj ET"], [], (b) => ({
+    F1: b.simpleFont({ subtype: "Type1", base: "Symbol", encoding: "<< /Differences [1 /alpha /beta /gamma /Alpha /Beta /Gamma] >>" }),
+  }));
+  assert.equal((await readPdf(file))!.text, "The Greek letters αβγ and ΑΒΓ here.");
+});
+
+test("no trailing-run regular expressions remain in the attachment reader (they backtrack quadratically)", () => {
+  const source = readFileSync(new URL("../../src/attachments.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /[+*]\$\/[a-z]*[,)]/);
 });
