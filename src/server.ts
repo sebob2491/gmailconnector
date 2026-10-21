@@ -305,6 +305,10 @@ async function runContent(fn: () => Promise<CallToolResult["content"]>): Promise
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 /** PDFs without extractable text are returned as files up to this size, for clients that can read PDFs directly. */
 const MAX_PDF_BYTES = 5 * 1024 * 1024;
+/** Most bytes downloaded to read a file as text (text, PDF and Office files); the Worker has 128 MB in all. */
+const MAX_READ_BYTES = 8 * 1024 * 1024;
+/** A file whose declared type and name say nothing readable is downloaded for a look at its first bytes only up to this size. */
+const MAX_SNIFF_BYTES = 1024 * 1024;
 
 /** Label changes behind each bulk action. */
 const BULK_ACTIONS: Record<string, { add: string[]; remove: string[]; needsLabels?: "add" | "remove" }> = {
@@ -1006,18 +1010,38 @@ export function createServer(deps: ServerDeps): McpServer {
     async (args) =>
       runContent(async () => {
         const mb = await router.one(args.account);
-        const { info, bytes, message } = await mb.getAttachment(args.messageId, args);
-        const mimeType = sniffType(bytes, info.mimeType, info.filename);
-        const kind = kindOf(mimeType, info.filename);
-        const meta = {
+        const { info, message, download } = await mb.findAttachment(args.messageId, args);
+        const metaOf = (mimeType: string, size: number) => ({
           account: mb.email,
           messageId: args.messageId,
           filename: info.filename,
           mimeType,
-          size: bytes.length,
+          size,
           ...(info.partId !== undefined ? { partId: info.partId } : {}),
           viewUrl: viewUrl(mb.email, `all/${args.messageId}`),
-        };
+        });
+        const noteOn = (mimeType: string, size: number, note: string): CallToolResult["content"] => [
+          { type: "text", text: JSON.stringify({ ...metaOf(mimeType, size), note }) },
+        ];
+        // Decide from the listed size and the declared type (or the file name's, when the type is
+        // generic) before downloading anything: a file that can't be shown isn't fetched.
+        const declared = sniffType(new Uint8Array(0), info.mimeType, info.filename);
+        const likely = kindOf(declared, info.filename);
+        const size = `${(info.size / 1048576).toFixed(1)} MB`;
+        if (likely === "binary" && info.size > MAX_SNIFF_BYTES) {
+          return noteOn(declared, info.size, `This type of file (${declared}) can't be read as text. Open it in Gmail with viewUrl.`);
+        }
+        if (likely === "image" && info.size > MAX_IMAGE_BYTES) {
+          return noteOn(declared, info.size, "This image is too large to show here. Open it in Gmail with viewUrl.");
+        }
+        if (likely !== "image" && info.size > MAX_READ_BYTES) {
+          return noteOn(declared, info.size, `This file is too large to read here (${size}; up to 8 MB can be read). Open it in Gmail with viewUrl.`);
+        }
+
+        const bytes = await download();
+        const mimeType = sniffType(bytes, info.mimeType, info.filename);
+        const kind = kindOf(mimeType, info.filename);
+        const meta = metaOf(mimeType, bytes.length);
         const max = args.maxChars ?? DEFAULT_MAX_BODY_CHARS;
         const asText = (read: ReadResult, extra: Record<string, unknown> = {}): CallToolResult["content"] => {
           const { text, truncated } = attachmentResult(read, max);
@@ -1026,7 +1050,7 @@ export function createServer(deps: ServerDeps): McpServer {
             { type: "text", text: text || "(The file contains no text.)" },
           ];
         };
-        const withNote = (note: string): CallToolResult["content"] => [{ type: "text", text: JSON.stringify({ ...meta, note }) }];
+        const withNote = (note: string): CallToolResult["content"] => noteOn(mimeType, bytes.length, note);
 
         if (kind === "text") {
           const charset = attachmentCharset(message.payload, info.partId);

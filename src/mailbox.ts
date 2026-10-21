@@ -15,6 +15,7 @@ import {
   stripInvisible,
   viewUrl,
   type ApiMessage,
+  type ApiMessagePart,
   type AttachmentInfo,
   type ExtractedContent,
   type FormatOptions,
@@ -29,6 +30,7 @@ import {
   escapeHtml,
   htmlToText,
   isValidAddress,
+  latin1,
   MAX_ATTACHMENT_BYTES,
   MimeError,
   type MimeChunk,
@@ -461,20 +463,106 @@ const DIRECT_FETCH_BYTES = 64 * 1024;
 const MAX_DIRECT_FETCHES = 8;
 
 /**
+ * The attachments of a message, read from its part tree alone (no body is decoded), by the same
+ * rules as extractContent: attached emails, and any part with a file name or an attachment ID that
+ * isn't the body text.
+ */
+export function listAttachments(payload: ApiMessagePart | undefined): AttachmentInfo[] {
+  const attachments: AttachmentInfo[] = [];
+  const add = (part: ApiMessagePart, fallbackName: string) => {
+    const disposition = (header(part, "Content-Disposition") ?? "").toLowerCase();
+    const contentId = header(part, "Content-ID")?.replace(/^<|>$/g, "");
+    attachments.push({
+      id: part.body?.attachmentId,
+      partId: part.partId,
+      filename: part.filename || fallbackName,
+      mimeType: part.mimeType ?? "application/octet-stream",
+      size: part.body?.size ?? 0,
+      inline: disposition.startsWith("inline") || (!disposition && Boolean(contentId)),
+      ...(contentId ? { contentId } : {}),
+    });
+  };
+  const walk = (part: ApiMessagePart) => {
+    const mimeType = (part.mimeType ?? "").toLowerCase();
+    if (mimeType.startsWith("message/")) {
+      if (part.body?.attachmentId || part.filename) add(part, "attached-message.eml");
+      else for (const child of part.parts ?? []) walk(child);
+      return;
+    }
+    if (part.parts?.length) {
+      for (const child of part.parts) walk(child);
+      return;
+    }
+    const disposition = (header(part, "Content-Disposition") ?? "").toLowerCase();
+    const isBodyText = (mimeType === "text/plain" || mimeType === "text/html") && !part.filename && !disposition.startsWith("attachment");
+    if (!isBodyText && (part.filename || part.body?.attachmentId)) add(part, "(unnamed)");
+  };
+  if (payload) walk(payload);
+  return attachments;
+}
+
+/** Base64url text is decoded natively in pieces of this many characters (a multiple of 4). */
+const DECODE_CHUNK = 3 * 1024 * 1024;
+
+/**
+ * Decodes base64url text given as bytes, piece by piece into one buffer sized for the result, so
+ * that no string of the whole text is ever built: the peak is the text plus the file.
+ */
+export function decodeBase64Url(data: Uint8Array): Buffer {
+  let n = data.length;
+  while (n && data[n - 1] === 0x3d) n--; // "=" padding
+  const out = Buffer.allocUnsafe(Math.floor((n * 3) / 4));
+  let written = 0;
+  for (let start = 0; start < n; start += DECODE_CHUNK) {
+    written += Buffer.from(latin1(data.subarray(start, Math.min(start + DECODE_CHUNK, n))), "base64url").copy(out, written);
+  }
+  return written === out.length ? out : out.subarray(0, written);
+}
+
+/** Where the base64url value of a `"data"` key starts and ends in raw JSON, from `from` on. */
+function dataValueAt(json: Uint8Array, from: number): { key: number; start: number; end: number } | undefined {
+  const view = Buffer.from(json.buffer, json.byteOffset, json.byteLength);
+  for (let key = view.indexOf('"data"', from); key >= 0; key = view.indexOf('"data"', key + 6)) {
+    let start = key + 6;
+    const space = (b: number) => b === 0x20 || b === 0x0a || b === 0x0d || b === 0x09;
+    while (start < json.length && space(json[start])) start++;
+    if (json[start] !== 0x3a) continue; // not a key
+    start++;
+    while (start < json.length && space(json[start])) start++;
+    if (json[start] !== 0x22) continue;
+    const end = view.indexOf(0x22, start + 1); // base64url holds no quotes or escapes
+    if (end > start) return { key, start: start + 1, end };
+  }
+  return undefined;
+}
+
+/**
  * The base64url text of an attachments.get answer, sliced out of the raw JSON without parsing it
  * (base64url has no characters JSON would escape). Falls back to parsing for any other shape.
  */
 export function attachmentDataOf(json: Uint8Array): Uint8Array {
-  const view = Buffer.from(json.buffer, json.byteOffset, json.byteLength);
-  const key = view.indexOf('"data"');
-  if (key >= 0) {
-    let start = key + 6;
-    while (start < json.length && (json[start] === 0x20 || json[start] === 0x3a || json[start] === 0x0a || json[start] === 0x0d || json[start] === 0x09)) start++;
-    const end = json[start] === 0x22 ? view.indexOf(0x22, start + 1) : -1;
-    if (end > start) return json.subarray(start + 1, end);
-  }
+  const found = dataValueAt(json, 0);
+  if (found) return json.subarray(found.start, found.end);
   return Buffer.from((JSON.parse(new TextDecoder().decode(json)) as { data?: string }).data ?? "", "latin1");
 }
+
+/**
+ * A message's raw JSON with every body's `data` blanked out, so that its structure (headers, parts,
+ * attachment IDs and sizes) can be parsed without the bodies: a 2 MB newsletter then parses in a
+ * fraction of a millisecond instead of being decoded from text and parsed whole.
+ */
+export function withoutBodyData(json: Uint8Array): Uint8Array {
+  const kept: Uint8Array[] = [];
+  let pos = 0;
+  for (let found = dataValueAt(json, 0); found; found = dataValueAt(json, found.end)) {
+    kept.push(json.subarray(pos, found.start));
+    pos = found.end;
+  }
+  if (!kept.length) return json;
+  kept.push(json.subarray(pos));
+  return Buffer.concat(kept);
+}
+
 
 // ---------- send-as addresses ----------
 
@@ -1285,12 +1373,31 @@ export class Mailbox {
   // ---------- attachments ----------
 
   /**
-   * Downloads one attachment. Identify it by `partId` (stable), `filename`, or `attachmentId`;
-   * with none of these, a message's only attachment is used.
+   * The bytes of an attachment, fetched as bytes and decoded straight from the answer (no JSON
+   * parsing, no string of the file), so the peak memory is about the file plus a third.
    */
-  async getAttachment(messageId: string, ref: { partId?: string; filename?: string; attachmentId?: string }) {
-    const msg = await this.getRawMessage(messageId, "full");
-    const { attachments } = await extractContent(msg.payload, this.loader(msg.id));
+  private async attachmentBytes(messageId: string, attachmentId: string): Promise<Buffer> {
+    const json = await this.client.getBytes(`messages/${checkId(messageId, "message")}/attachments/${checkId(attachmentId, "attachment")}`);
+    return decodeBase64Url(attachmentDataOf(json));
+  }
+
+  /**
+   * A message's structure (headers, parts, attachment IDs and sizes) with the bodies' `data` left
+   * out: fetched as bytes and parsed after blanking the data (see withoutBodyData).
+   */
+  private async getMessageSkeleton(messageId: string): Promise<ApiMessage> {
+    const json = await this.client.getBytes(`messages/${checkId(messageId, "message")}`, { format: "full" });
+    return JSON.parse(new TextDecoder().decode(withoutBodyData(json))) as ApiMessage;
+  }
+
+  /**
+   * Finds one attachment of a message without downloading it: by `partId` (stable), `filename`, or
+   * `attachmentId`; with none of these, a message's only attachment. Only the message's part tree
+   * is read (no body is decoded or even parsed). `download()` then fetches the file's bytes.
+   */
+  async findAttachment(messageId: string, ref: { partId?: string; filename?: string; attachmentId?: string }) {
+    const msg = await this.getMessageSkeleton(messageId);
+    const attachments = listAttachments(msg.payload);
     const byName = ref.filename?.trim().toLowerCase();
     const attachment =
       (ref.partId !== undefined && attachments.find((a) => a.partId === ref.partId)) ||
@@ -1299,26 +1406,26 @@ export class Mailbox {
       (!ref.partId && !byName && !ref.attachmentId && attachments.length === 1 ? attachments[0] : undefined);
     // Gmail issues new attachment IDs on every read, but old ones keep working, so a stale ID is still
     // usable. Its name and type are recovered from the attachment of the same size (or the only one),
-    // since the file's type decides how it can be read.
+    // since the file's type decides how it can be read; that takes the download.
     if (!attachment && ref.attachmentId) {
-      const bytes = Buffer.from((await this.loader(msg.id)(ref.attachmentId)) as string, "base64url");
+      const bytes = await this.attachmentBytes(msg.id, ref.attachmentId);
       const sameSize = attachments.filter((a) => a.size === bytes.length);
       const match = sameSize.length === 1 ? sameSize[0] : attachments.length === 1 ? attachments[0] : undefined;
       const fallback: AttachmentInfo = { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: bytes.length, inline: false };
-      return {
-        info: match ?? fallback,
-        bytes,
-        message: msg,
-      };
+      return { info: match ?? fallback, message: msg, download: async () => bytes };
     }
     if (!attachment) {
       const list = attachments.map((a) => `${a.filename} (partId ${a.partId})`).join(", ") || "none";
       throw new MimeError(`No matching attachment on message ${messageId}. Its attachments: ${list}.`);
     }
-    const data = attachment.id
-      ? await this.loader(msg.id)(attachment.id)
-      : (findPart(msg, attachment.partId)?.body?.data ?? "");
-    return { info: attachment, bytes: Buffer.from(data, "base64url"), message: msg };
+    const download = async () => {
+      if (attachment.id) return this.attachmentBytes(msg.id, attachment.id);
+      // A file kept inline in the message (rare: Gmail stores attachments separately) was blanked
+      // out with the bodies, so the message is read once more for it.
+      const full = attachment.size ? await this.getRawMessage(messageId, "full") : msg;
+      return Buffer.from(findPart(full, attachment.partId)?.body?.data ?? "", "base64url");
+    };
+    return { info: attachment, message: msg, download };
   }
 
   // ---------- unsubscribing ----------

@@ -8,7 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
-import { sendAsCache } from "../src/mailbox.js";
+import { decodeBase64Url, sendAsCache, withoutBodyData } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -2440,5 +2440,137 @@ describe("small defects", () => {
     assert.deepEqual(full.json.drafts[0].attachments, [{ filename: "a.txt", mimeType: "text/plain", size: 3, partId: "1" }]);
     const meta = await call("list_drafts", { account: "work" });
     assert.equal(meta.json.drafts[0].attachments, undefined);
+  });
+});
+
+describe("cheaper attachment reads", () => {
+  /** A message whose body Gmail stores out of line (as it does for large ones), plus the given attachments. */
+  const bigMail = (ctx: Ctx, id: string, bodySize: number, files: { name: string; type: string; size: number; id?: string }[]) => {
+    ctx.work.messages.set(id, {
+      id,
+      threadId: id,
+      labelIds: ["INBOX"],
+      snippet: "x",
+      internalDate: "1700000000000",
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Big" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/html", filename: "", headers: [{ name: "Content-Type", value: "text/html; charset=UTF-8" }], body: { attachmentId: "BODY", size: bodySize } },
+          ...files.map((f, i) => ({ partId: String(i + 1), mimeType: f.type, filename: f.name, headers: [], body: { attachmentId: f.id ?? `ATT${i + 1}`, size: f.size } })),
+        ],
+      },
+    });
+    ctx.work.attachments.set(`${id}/BODY`, Buffer.from("<p>" + "x".repeat(bodySize) + "</p>").toString("base64url"));
+  };
+
+  test("a small attachment on a huge email takes two calls and never touches the body", async () => {
+    const ctx = await setup();
+    const csv = Buffer.from("a,b\n1,2\n");
+    bigMail(ctx, "big1", 2 * 1048576, [{ name: "prices.csv", type: "text/csv", size: csv.length }]);
+    ctx.work.attachments.set("big1/ATT1", csv.toString("base64url"));
+    ctx.fake.requests.length = 0;
+    const started = performance.now();
+    const res = (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "big1", filename: "prices.csv" } })) as any;
+    const took = performance.now() - started;
+    assert.equal(res.isError, undefined, res.content[0].text);
+    assert.equal(res.content[1].text, "a,b\n1,2\n");
+    assert.deepEqual(JSON.parse(res.content[0].text).size, csv.length);
+    assert.deepEqual(ctx.fake.requests.map((r) => r.path), ["messages/big1", "messages/big1/attachments/ATT1"], "the 2 MB body is never fetched");
+    assert.ok(took < 250, `took ${took.toFixed(0)} ms`);
+  });
+
+  test("files that can't be shown are refused from their listed size and type, without a download", async () => {
+    const ctx = await setup();
+    bigMail(ctx, "big2", 100, [
+      { name: "disk.img", type: "application/octet-stream", size: 20 * 1048576 },
+      { name: "photo.png", type: "image/png", size: 5 * 1048576 },
+      { name: "scan.pdf", type: "application/pdf", size: 9 * 1048576 },
+      { name: "deck.pptx", type: "application/octet-stream", size: 9 * 1048576 },
+    ]);
+    const note = async (filename: string) => {
+      const res = await ctx.call("get_attachment", { account: "work", messageId: "big2", filename });
+      assert.equal(res.isError, false, res.text);
+      return res.json;
+    };
+    const img = await note("disk.img");
+    assert.match(img.note, /^This type of file \(application\/octet-stream\) can't be read as text/);
+    assert.equal(img.size, 20 * 1048576);
+    assert.match((await note("photo.png")).note, /^This image is too large to show here/);
+    assert.match((await note("scan.pdf")).note, /^This file is too large to read here \(9\.0 MB; up to 8 MB can be read\)/);
+    const deck = await note("deck.pptx");
+    assert.match(deck.note, /too large to read here/);
+    assert.equal(deck.mimeType, "application/vnd.openxmlformats-officedocument.presentationml.presentation", "the type comes from the name");
+    assert.ok(!ctx.fake.requests.some((r) => r.path.includes("/attachments/")), "nothing was downloaded");
+
+    // A small file of unknown type is still downloaded and told apart by its first bytes.
+    bigMail(ctx, "big3", 100, [{ name: "photo.dat", type: "application/octet-stream", size: png.length }]);
+    ctx.work.attachments.set("big3/ATT1", png.toString("base64url"));
+    const res = (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "big3", filename: "photo.dat" } })) as any;
+    assert.equal(res.content[1].type, "image");
+    assert.equal(JSON.parse(res.content[0].text).mimeType, "image/png");
+  });
+
+  test("a message's bodies are blanked out before parsing, compact or pretty-printed", () => {
+    const message = {
+      id: "m",
+      snippet: 'say "data": not a key',
+      payload: {
+        headers: [{ name: "Subject", value: 'quoted "data" word' }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/html", body: { size: 5, data: "PHA-eA" } },
+          { partId: "1", filename: "a.pdf", body: { attachmentId: "ATT1", size: 9 } },
+          { partId: "2", mimeType: "text/plain", body: { data: "", size: 0 } },
+        ],
+      },
+    };
+    for (const text of [JSON.stringify(message), JSON.stringify(message, null, 2)]) {
+      const stripped = JSON.parse(Buffer.from(withoutBodyData(Buffer.from(text))).toString("utf8"));
+      assert.equal(stripped.payload.parts[0].body.data, "");
+      assert.equal(stripped.payload.parts[0].body.size, 5);
+      assert.equal(stripped.payload.parts[1].body.attachmentId, "ATT1");
+      assert.equal(stripped.payload.headers[0].value, 'quoted "data" word');
+      assert.equal(stripped.snippet, 'say "data": not a key');
+    }
+    const plain = Buffer.from('{"id":"m","payload":{"headers":[]}}');
+    assert.equal(withoutBodyData(plain), plain, "unchanged when there is nothing to blank");
+  });
+
+  test("a file kept inline in the message is still read", async () => {
+    const ctx = await setup();
+    ctx.work.messages.set("inline1", {
+      id: "inline1",
+      threadId: "inline1",
+      labelIds: ["INBOX"],
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Inline" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/plain", filename: "", headers: [], body: { data: Buffer.from("see").toString("base64url"), size: 3 } },
+          { partId: "1", mimeType: "text/plain", filename: "note.txt", headers: [], body: { data: Buffer.from("inline note").toString("base64url"), size: 11 } },
+        ],
+      },
+    });
+    ctx.fake.requests.length = 0;
+    const res = (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "inline1", filename: "note.txt" } })) as any;
+    assert.equal(res.content[1].text, "inline note");
+    assert.deepEqual(ctx.fake.requests.map((r) => r.path), ["messages/inline1", "messages/inline1"]);
+  });
+
+  test("attachment bytes are decoded in pieces, exactly", () => {
+    const piece = 3 * 1024 * 1024;
+    for (const length of [0, 1, 2, 3, 4, 5, piece - 1, piece, piece + 1, piece + 2, piece + 3, 2 * piece + 7]) {
+      const bytes = Buffer.from(Array.from({ length }, (_, i) => (i * 7919 + (i >> 8)) & 0xff));
+      for (const text of [bytes.toString("base64url"), bytes.toString("base64").replace(/\+/g, "-").replace(/\//g, "_")]) {
+        assert.ok(decodeBase64Url(Buffer.from(text, "latin1")).equals(bytes), `length ${length}${text.endsWith("=") ? " with padding" : ""}`);
+      }
+    }
   });
 });
