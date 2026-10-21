@@ -754,6 +754,13 @@ class TextBuilder {
   parts: string[] = [];
   private lineStart = true;
   private newlines = 0;
+  private emitted = 0;
+  /**
+   * For each open table, innermost last, its open cell: how many pieces of text had been emitted when
+   * the cell opened (-1 between cells), and how many parts there were.
+   */
+  private cellEmitted: number[] = [];
+  private cellStart: number[] = [];
   /** A collapsed space is due before the next word. */
   space = false;
   /** A separator due before the next word on this line (a tab between table cells). */
@@ -771,6 +778,60 @@ class TextBuilder {
     this.newlines = 0;
     this.space = false;
     this.sep = "";
+    this.marker = "";
+    this.emitted++;
+  }
+
+  /** Whether the current position is in a table cell (of the innermost open table). */
+  private get inCell(): boolean {
+    const n = this.cellEmitted.length;
+    return n > 0 && this.cellEmitted[n - 1] >= 0;
+  }
+
+  /** Whether the current position is in a table cell that has no text yet. */
+  private get atCellStart(): boolean {
+    const n = this.cellEmitted.length;
+    return n > 0 && this.cellEmitted[n - 1] === this.emitted;
+  }
+
+  /** A table starts: until its first cell, what follows isn't in a cell. */
+  openTable() {
+    this.cellEmitted.push(-1);
+    this.cellStart.push(0);
+  }
+
+  /** A table ends (and any cell left open in it). */
+  closeTable() {
+    this.endCell();
+    this.sep = "";
+    this.cellEmitted.pop();
+    this.cellStart.pop();
+  }
+
+  /** A cell starts (ending one left open before it in the same row). */
+  openCell() {
+    if (this.inCell) this.endCell();
+    if (!this.cellEmitted.length) this.openTable();
+    this.cellEmitted[this.cellEmitted.length - 1] = this.emitted;
+    this.cellStart[this.cellStart.length - 1] = this.parts.length;
+  }
+
+  /**
+   * A cell ends: line breaks after its last text are taken back, so that the next cell follows on the
+   * same line after a tab (and the row's end makes the only line break).
+   */
+  endCell() {
+    this.sep = "\t";
+    if (!this.inCell) return;
+    const top = this.cellEmitted.length - 1;
+    this.cellEmitted[top] = -1;
+    const start = this.cellStart[top];
+    const parts = this.parts;
+    while (parts.length > start && parts[parts.length - 1] === "\n") parts.pop();
+    let newlines = 0;
+    while (newlines < 2 && parts[parts.length - 1 - newlines] === "\n") newlines++;
+    this.lineStart = !parts.length || newlines > 0;
+    this.newlines = newlines;
     this.marker = "";
   }
 
@@ -809,16 +870,19 @@ class TextBuilder {
     this.sep = "";
   }
 
-  /** Ends the current line, if anything is on it. */
+  /** Ends the current line, if anything is on it (nothing at the start of a table cell). */
   line() {
-    if (!this.lineStart) this.newline();
+    if (!this.lineStart && !this.atCellStart) this.newline();
   }
 
-  /** Leaves a blank line before what follows (unless at the very start). */
+  /**
+   * Leaves a blank line before what follows (unless at the very start). In a table cell, paragraphs
+   * and other blocks are separated by a line break instead, and none at the cell's start.
+   */
   blank() {
     if (!this.parts.length || this.marker) return;
     this.line();
-    if (this.newlines < 2) this.newline();
+    if (this.newlines < 2 && !this.inCell) this.newline();
   }
 
   get length() {
@@ -985,7 +1049,16 @@ export function htmlToText(html: string): string {
       const alt = attrs?.get("alt");
       if (link && alt) link.alts.push(decodeEntities(alt).replace(HTML_SPACE, " ").trim());
     } else if (tag === "td" || tag === "th") {
-      if (closing) b.sep = "\t";
+      if (closing) b.endCell();
+      else b.openCell();
+    } else if (tag === "table") {
+      if (closing) b.closeTable();
+      b.line();
+      if (!closing) b.openTable();
+    } else if (tag === "tr") {
+      b.endCell();
+      b.sep = "";
+      b.line();
     } else if (tag === "li") {
       b.line();
       if (!closing) {

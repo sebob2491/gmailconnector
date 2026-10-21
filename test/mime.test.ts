@@ -124,7 +124,7 @@ test("control characters from numeric references or raw bytes are dropped from b
 
 test("htmlToText leaves out elements hidden by their style, such as a newsletter's preview text", () => {
   const preheader = `<div style="display:none;font-size:1px;color:#fff;max-height:0;overflow:hidden">Jeans from $39.99 this week only${"&zwnj;&nbsp;".repeat(20)}</div>`;
-  assert.equal(htmlToText(`${preheader}<table><tr><td><p>Hi Sam,</p><p>New arrivals are in.</p></td></tr></table>`), "Hi Sam,\n\nNew arrivals are in.");
+  assert.equal(htmlToText(`${preheader}<table><tr><td><p>Hi Sam,</p><p>New arrivals are in.</p></td></tr></table>`), "Hi Sam,\nNew arrivals are in.");
   // Nested elements, other spellings, the preheader pattern without display:none, and `hidden`.
   assert.equal(htmlToText('<div style="DISPLAY: none !important"><div>a</div><p>b</p></div>c'), "c");
   assert.equal(htmlToText('<span style="font-size:0;max-height:0px;overflow:hidden;mso-hide:all">preview</span>Body'), "Body");
@@ -137,6 +137,25 @@ test("htmlToText leaves out elements hidden by their style, such as a newsletter
   // A hidden image's alt text isn't used; other "none" styles hide nothing.
   assert.equal(htmlToText('<a href="https://x.example/"><img style="display:none" alt="Hidden"><img alt="Shop"></a>'), "Shop (https://x.example/)");
   assert.equal(htmlToText('<p style="text-decoration:none;border:none">kept</p><div style="max-height:0px">kept too</div>'), "kept\n\nkept too");
+});
+
+test("tables keep one row per line even when every cell holds a paragraph, as in Outlook", () => {
+  const cell = (text: string) => `<td width=312 valign=top style='padding:0in 5.4pt'><p class=MsoNormal>${text}<o:p></o:p></p></td>`;
+  const outlook =
+    "<p class=MsoNormal>Here are the two options we discussed:<o:p></o:p></p>" +
+    "<table class=MsoTableGrid border=1 cellspacing=0 cellpadding=0>" +
+    `<tr>${cell("<b>Option</b>")}${cell("<b>Price</b>")}</tr><tr>${cell("A")}${cell("$1,200")}</tr><tr>${cell("B")}${cell("$1,450")}</tr>` +
+    "</table><p class=MsoNormal>Jane<o:p></o:p></p>";
+  assert.equal(htmlToText(outlook), "Here are the two options we discussed:\n\nOption\tPrice\nA\t$1,200\nB\t$1,450\n\nJane");
+  // Blocks inside a cell are a line break apart; a cell's trailing line breaks don't split its row.
+  assert.equal(htmlToText("<table><tr><td><h2>INVOICE 12</h2>Date: Jan 3<br>Due: Feb 2<br></td><td><p>Total</p><p>$9</p></td></tr></table>"), "INVOICE 12\nDate: Jan 3\nDue: Feb 2\tTotal\n$9");
+  // Layout tables (newsletters): sections and paragraphs come one per line, nested tables included.
+  assert.equal(
+    htmlToText('<table><tr><td><h1>News</h1><p>One</p><table><tr><td><ul><li>a</li><li>b</li></ul></td></tr></table><p>Two</p></td></tr><tr><td><p>Footer</p></td></tr></table>'),
+    "News\nOne\n- a\n- b\nTwo\nFooter",
+  );
+  // Cells left open, and empty ones.
+  assert.equal(htmlToText("<table><tr><td>a<td><p>b</p><tr><td>c<td></table>after"), "a\tb\nc\nafter");
 });
 
 test("htmlToText decodes entities fully and safely", () => {
