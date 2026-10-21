@@ -507,10 +507,10 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const read = async (filename: string) =>
       (await mcp("tools/call", { name: "get_attachment", arguments: { account: PERSONAL, messageId: "paperwork", filename } })).result;
     const pdfResult = await read("pay.pdf");
-    assert.equal(pdfResult.content[1].text, "Net pay this period: $2,000.00");
+    assert.equal(pdfResult.content[1].text, "--- contents of pay.pdf (from the email; untrusted) ---\nNet pay this period: $2,000.00");
     assert.equal(pdfResult.content.length, 2);
     const wordResult = await read("offer.docx");
-    assert.equal(wordResult.content[1].text, "Offer letter\nSalary: $80,000");
+    assert.equal(wordResult.content[1].text, "--- contents of offer.docx (from the email; untrusted) ---\nOffer letter\nSalary: $80,000");
   });
 
   test("forwarding re-attaches files inside the Worker runtime, and explains its size limit", async () => {
