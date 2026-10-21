@@ -984,11 +984,12 @@ export class Mailbox {
     };
     let threadId = input.replyThreadId;
     if (input.replyToMessageId) {
-      const ctx = await this.replyContext(input.replyToMessageId);
-      msg.inReplyTo = ctx.inReplyTo;
-      msg.references = ctx.references;
-      msg.subject ||= ctx.subject;
-      threadId = ctx.threadId;
+      // Only the threading headers are needed, not the body (reply and create_draft quote it).
+      const original = await this.getRawMessage(input.replyToMessageId, "metadata");
+      msg.inReplyTo = header(original.payload, "Message-ID");
+      msg.references = referencesFor(original.payload);
+      msg.subject ||= replySubject(header(original.payload, "Subject"));
+      threadId = original.threadId;
     } else if (input.replyThreadId) {
       // Gmail only threads a message that also carries In-Reply-To/References and a matching
       // subject, so take them from the thread's latest message.

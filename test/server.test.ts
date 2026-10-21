@@ -727,6 +727,23 @@ describe("fixes from the code review", () => {
     assert.equal(second.get("To"), '"Help <help@vendor.com>" <noreply@vendor.com>');
   });
 
+  test("send_message with replyToMessageId reads only the original's headers", async () => {
+    const { call, fake } = await setup();
+    fake.requests.length = 0;
+    const res = await call("send_message", { account: "work", replyToMessageId: "w1", to: ["boss@work.example"], body: "Done." });
+    assert.equal(res.isError, false, res.text);
+    const read = fake.requests.find((r) => r.path === "messages/w1")!;
+    assert.equal(read.query.get("format"), "metadata");
+    assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")), "the attachment isn't downloaded");
+    const [sent] = fake.sentBy(WORK);
+    assert.equal(sent.metadata.threadId, "wt1");
+    const mime = inspectMime(sent.raw);
+    assert.equal(mime.get("In-Reply-To"), "<q3@work.example>");
+    assert.equal(mime.get("References"), "<q3@work.example>");
+    assert.equal(mime.get("Subject"), "Re: Q3 report");
+    assert.equal(mime.parts[0].text, "Done.", "nothing is quoted");
+  });
+
   test("send_message with only replyThreadId adds the headers Gmail needs to thread it", async () => {
     const { call, fake } = await setup();
     const res = await call("send_message", {
