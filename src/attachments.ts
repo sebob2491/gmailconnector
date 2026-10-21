@@ -926,14 +926,27 @@ const win1252Decoder = new TextDecoder("windows-1252");
  * encoding. Plain ASCII needs no decoding, which skips a costly round trip for most strings.
  */
 function win1252(raw: string): string {
-  return /[^\x00-\x7f]/.test(raw) ? win1252Decoder.decode(Buffer.from(raw, "latin1")) : raw;
+  for (let i = 0; i < raw.length; i++) if (raw.charCodeAt(i) > 127) return win1252Decoder.decode(Buffer.from(raw, "latin1"));
+  return raw;
 }
 
 const LITERAL_SPECIAL = /[\\()]/g;
 const ESCAPES: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", "(": "(", ")": ")", "\\": "\\" };
 
-/** Reads a literal string starting at `start` (the "("): its bytes (one per character) and the index after ")". */
-function readLiteral(s: string, start: number): { value: string; end: number } {
+/** Where the string readLiteral last read ends (the index after its ")"). */
+let literalEnd = 0;
+
+/** Reads a literal string starting at `start` (the "("): its bytes, one per character; `literalEnd` is then the index after ")". */
+function readLiteral(s: string, start: number): string {
+  // Most strings have no escapes or nested parentheses: their ")" is the first special character.
+  for (let i = start + 1; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 41 /* ) */) {
+      literalEnd = i + 1;
+      return s.slice(start + 1, i);
+    }
+    if (c === 92 /* \ */ || c === 40 /* ( */) break;
+  }
   let depth = 1;
   let out = "";
   let pos = start + 1;
@@ -961,12 +974,14 @@ function readLiteral(s: string, start: number): { value: string; end: number } {
       depth++;
       out += ch;
     } else if (--depth === 0) {
-      return { value: out, end: next };
+      literalEnd = next;
+      return out;
     } else out += ch;
     pos = next;
     LITERAL_SPECIAL.lastIndex = next;
   }
-  return { value: out + s.slice(pos), end: s.length };
+  literalEnd = s.length;
+  return out + s.slice(pos);
 }
 
 /** A hex string's bytes, one per character. */
@@ -1065,8 +1080,8 @@ function parsePdfValue(s: string, p: { pos: number }, depth = 0): PdfValue | und
   }
   if (c === 40 /* ( */) {
     const literal = readLiteral(s, p.pos);
-    p.pos = literal.end;
-    return new PdfString(literal.value);
+    p.pos = literalEnd;
+    return new PdfString(literal);
   }
   if (c === 47 /* / */) {
     PDF_NAME.lastIndex = p.pos;
@@ -1649,8 +1664,10 @@ function parseCMap(s: string): CMap {
       else continue;
       array = undefined;
       k = 0;
-    } else if (c === 40 /* ( */) pos = readLiteral(s, pos).end;
-    else if (c === 37 /* % */) {
+    } else if (c === 40 /* ( */) {
+      readLiteral(s, pos);
+      pos = literalEnd;
+    } else if (c === 37 /* % */) {
       while (pos < n && s.charCodeAt(pos) !== 10 && s.charCodeAt(pos) !== 13) pos++;
     } else pos++;
   }
@@ -1670,6 +1687,8 @@ interface PdfFont {
   shortest?: number;
   /** Composite fonts: the text of each code, from the ToUnicode CMap; codes it lacks give nothing. */
   map?: Map<number, string>;
+  /** `map` as an array by code, when the codes are compact enough for one (then `map` isn't consulted). */
+  texts?: (string | undefined)[];
   /**
    * Composite fonts without a ToUnicode CMap: codes are UTF-16BE ("utf16", the Uni*-UCS2/UTF16
    * encodings), or unknown but kept as bytes like before ("bytes", Identity orderings; the
@@ -1682,8 +1701,12 @@ interface PdfFont {
   first: number;
   widths: number[];
   missing: number;
-  /** Composite fonts: widths by CID (/W, single widths and ranges as first, last, width, …) and the default (/DW); CID = code for Identity encodings. */
-  cid?: { widths: Map<number, number>; ranges: number[]; dw: number; identity: boolean };
+  /**
+   * Composite fonts: widths by CID (/W as single widths, in `table` by CID when the CIDs are compact
+   * (NaN where unset) else in `widths`, and as ranges first, last, width, …) and the default (/DW);
+   * CID = code for Identity encodings.
+   */
+  cid?: { widths: Map<number, number>; table?: Float64Array; ranges: number[]; dw: number; identity: boolean };
   /** False when widths are guessed (fonts without /Widths, e.g. the standard 14), so run ends are estimates. */
   exact: boolean;
 }
@@ -1722,6 +1745,13 @@ function loadCompositeFont(file: PdfFile, dict: PdfDict): PdfFont {
   const identity = encodingName === "Identity-H" || encodingName === "Identity-V";
   const toUnicode = file.cmap(dict.get("ToUnicode"));
   const font: PdfFont = { ...DEFAULT_FONT, composite: true, map: toUnicode?.map };
+  if (toUnicode?.map.size) {
+    const max = compactMax(toUnicode.map.keys(), toUnicode.map.size);
+    if (max >= 0) {
+      font.texts = new Array<string | undefined>(max + 1);
+      for (const [code, text] of toUnicode.map) font.texts[code] = text;
+    }
+  }
   // Codes are two bytes under the Identity encodings; otherwise the encoding CMap's codespace says, or the ToUnicode CMap's.
   const codespace = identity ? undefined : isStream(encoding) ? file.cmap(dict.get("Encoding"))?.codespace : toUnicode?.codespace;
   if (codespace?.some((ranges) => ranges.length)) {
@@ -1736,7 +1766,7 @@ function loadCompositeFont(file: PdfFile, dict: PdfDict): PdfFont {
   // Glyph widths by CID: /W holds "c [w1 w2 …]" and "cfirst clast w" entries; /DW is the width of the rest.
   const dw = file.get(descendant?.get("DW"));
   const w = file.array(descendant?.get("W"));
-  const cid = { widths: new Map<number, number>(), ranges: [] as number[], dw: typeof dw === "number" && dw >= 0 ? dw : 1000, identity };
+  const cid: NonNullable<PdfFont["cid"]> = { widths: new Map(), ranges: [], dw: typeof dw === "number" && dw >= 0 ? dw : 1000, identity };
   for (let i = 0; w && i < w.length && cid.widths.size < MAX_CID_WIDTHS; ) {
     const first = w[i];
     const next = file.get(w[i + 1]);
@@ -1752,9 +1782,24 @@ function loadCompositeFont(file: PdfFile, dict: PdfDict): PdfFont {
       i += 3;
     } else break;
   }
+  const max = cid.widths.size ? compactMax(cid.widths.keys(), cid.widths.size) : -1;
+  if (max >= 0) {
+    cid.table = new Float64Array(max + 1).fill(NaN);
+    for (const [c, width] of cid.widths) cid.table[c] = width;
+  }
   font.cid = cid;
   font.exact = identity && (cid.widths.size > 0 || cid.ranges.length > 0 || typeof dw === "number");
   return font;
+}
+
+/** The largest of `size` integer keys when an array by key would be reasonably full (else -1): a lookup table beats a Map in the hot loop. */
+function compactMax(keys: Iterable<number>, size: number): number {
+  let max = -1;
+  for (const key of keys) {
+    if (!(key >= 0 && key <= 0xffff && Number.isInteger(key))) return -1;
+    if (key > max) max = key;
+  }
+  return max < 4 * size + 1024 ? max : -1;
 }
 
 function loadSimpleFont(file: PdfFile, dict: PdfDict): PdfFont {
@@ -1785,8 +1830,14 @@ function loadSimpleFont(file: PdfFile, dict: PdfDict): PdfFont {
 function cidWidth(cid: PdfFont["cid"], code: number): number {
   if (!cid) return 1000;
   if (!cid.identity) return cid.dw;
-  const width = cid.widths.get(code);
-  if (width !== undefined) return width;
+  const table = cid.table;
+  if (table) {
+    const width = code < table.length ? table[code] : NaN;
+    if (width === width) return width;
+  } else {
+    const width = cid.widths.get(code);
+    if (width !== undefined) return width;
+  }
   const ranges = cid.ranges;
   for (let k = 0; k < ranges.length; k += 3) if (code >= ranges[k] && code <= ranges[k + 1]) return ranges[k + 2];
   return cid.dw;
@@ -1799,6 +1850,13 @@ interface TextRun {
   count: number;
   spaces: number;
 }
+
+/** The result of decodeRun: one object, filled in for each call (its caller reads it at once). */
+const RUN: TextRun = { text: "", width: 0, count: 0, spaces: 0 };
+/** The code units of the run being decoded. */
+const UNITS: number[] = [];
+/** Code units (or bytes) turned into a string at a time: String.fromCharCode takes them as arguments, on the stack. */
+const STRING_CHUNK = 4096;
 
 /** Decodes a shown string through its font: Windows-1252 for ordinary simple fonts (no copying), else code by code. */
 function decodeRun(font: PdfFont, raw: string): TextRun {
@@ -1814,10 +1872,17 @@ function decodeRun(font: PdfFont, raw: string): TextRun {
       width += w === undefined || w <= 0 ? (code === 32 ? 250 : font.missing || 500) : w;
       if (table) text += table[code];
     }
-    return { text: table ? text : win1252(raw), width, count: raw.length, spaces };
+    RUN.text = table ? text : win1252(raw);
+    RUN.width = width;
+    RUN.count = raw.length;
+    RUN.spaces = spaces;
+    return RUN;
   }
-  const { codespace, map, cid } = font;
+  const { codespace, map, texts, cid } = font;
+  const table = cid?.table;
+  const utf16 = font.raw === "utf16";
   let count = 0;
+  let units = 0;
   for (let i = 0; i < raw.length; count++) {
     let code = 0;
     let bytes = 0;
@@ -1845,11 +1910,37 @@ function decodeRun(font: PdfFont, raw: string): TextRun {
     }
     i += bytes;
     if (bytes === 1 && code === 32) spaces++;
-    if (map) text += map.get(code) ?? "";
-    else if (font.raw === "utf16") text += bytes > 2 ? String.fromCharCode(code >>> 16, code & 0xffff) : String.fromCharCode(code);
-    width += cidWidth(cid, code);
+    // The code's text, collected as UTF-16 code units (one flat string per run, instead of a concatenation per glyph).
+    if (utf16) {
+      if (bytes > 2) UNITS[units++] = code >>> 16;
+      UNITS[units++] = code & 0xffff;
+    } else {
+      const t = texts ? (code < texts.length ? texts[code] : undefined) : map?.get(code);
+      if (t !== undefined) {
+        if (t.length === 1) UNITS[units++] = t.charCodeAt(0);
+        else for (let k = 0; k < t.length; k++) UNITS[units++] = t.charCodeAt(k);
+      }
+    }
+    if (units >= STRING_CHUNK) {
+      UNITS.length = units;
+      text += String.fromCharCode.apply(null, UNITS);
+      units = 0;
+    }
+    if (table !== undefined && code < table.length) {
+      const w = table[code];
+      width += w === w ? w : cidWidth(cid, code);
+    } else width += cidWidth(cid, code);
   }
-  return { text: font.raw === "bytes" ? win1252(raw) : text, width, count, spaces };
+  if (units === 1) text += String.fromCharCode(UNITS[0]);
+  else if (units) {
+    UNITS.length = units;
+    text += String.fromCharCode.apply(null, UNITS);
+  }
+  RUN.text = font.raw === "bytes" ? win1252(raw) : text;
+  RUN.width = width;
+  RUN.count = count;
+  RUN.spaces = spaces;
+  return RUN;
 }
 
 // ---------- PDF text layout ----------
@@ -1884,7 +1975,14 @@ class PdfTextWriter {
   private readonly parts: string[] = [];
   length = 0;
   private lastChar = "";
-  private last?: { across: number; along: number; alongEnd: number; dx: number; dy: number; size: number };
+  /** The previous run on the page (when `hasLast`): its line (across), where it starts and ends along it, its direction and size. */
+  private hasLast = false;
+  private lastAcross = 0;
+  private lastAlong = 0;
+  private lastAlongEnd = 0;
+  private lastDx = 0;
+  private lastDy = 0;
+  private lastSize = 0;
   private spacing?: number;
   /** A line break the content asked for explicitly (T* with no leading set). */
   breakLine = false;
@@ -1910,32 +2008,37 @@ class PdfTextWriter {
     if (!text) return;
     const along = x0 * dx + y0 * dy;
     const across = y0 * dx - x0 * dy;
-    const last = this.last;
-    if (last) {
-      const h = Math.max(size, last.size, 1);
-      const sameDirection = last.dx * dx + last.dy * dy > 0.99;
-      const down = last.across - across;
+    if (this.hasLast) {
+      const h = Math.max(size, this.lastSize, 1);
+      const sameDirection = this.lastDx * dx + this.lastDy * dy > 0.99;
+      const down = this.lastAcross - across;
       if (!sameDirection || Math.abs(down) > 0.4 * h || this.breakLine) {
         const spacing = this.spacing ?? 1.2 * h;
         const blank = sameDirection && Math.abs(down) > 1.5 * spacing;
         if (sameDirection && !blank && down >= 0.8 * h) this.spacing = Math.min(this.spacing ?? down, down);
         if (this.lastChar !== "\n") this.add(blank ? "\n\n" : "\n");
         else if (blank && !this.parts.at(-1)?.endsWith("\n\n")) this.add("\n");
-      } else if (this.lastChar !== "\n" && !/^\s/.test(text) && !/\s/.test(this.lastChar)) {
-        const gap = along - last.alongEnd;
+      } else if (this.lastChar !== "\n" && !isSpaceChar(text.charCodeAt(0)) && !isSpaceChar(this.lastChar.charCodeAt(0))) {
+        const gap = along - this.lastAlongEnd;
         if (gap > 2 * h) this.add("\t");
-        else if (gap > 0.2 * h || gap < -3 * h || (!exact && moved && along > last.along + 0.5 * h)) this.add(" ");
+        else if (gap > 0.2 * h || gap < -3 * h || (!exact && moved && along > this.lastAlong + 0.5 * h)) this.add(" ");
       }
     }
     this.breakLine = false;
     this.add(text);
-    this.last = { across, along, alongEnd: x1 * dx + y1 * dy, dx, dy, size };
+    this.hasLast = true;
+    this.lastAcross = across;
+    this.lastAlong = along;
+    this.lastAlongEnd = x1 * dx + y1 * dy;
+    this.lastDx = dx;
+    this.lastDy = dy;
+    this.lastSize = size;
   }
 
   /** Starts a new line (between separately read content, e.g. annotations after the page). */
   newline() {
     if (this.length && this.lastChar !== "\n") this.add("\n");
-    this.last = undefined;
+    this.hasLast = false;
   }
 
   text(): string {
@@ -1943,13 +2046,23 @@ class PdfTextWriter {
   }
 }
 
-/** One token of a content stream: whitespace, comment, string start, array bracket, number, name or operator. */
-const TOKEN = /\s+|%[^\r\n]*|\(|<<|>>|<[0-9A-Fa-f\s]*>|\[|\]|[+-]?(?:\d+\.?\d*|\.\d+)|\/[^\s\/\[\]()<>{}%]*|[A-Za-z'"*]+|[^]/y;
+/** True for the characters JavaScript's \s matches (white space), by character code. */
+function isSpaceChar(c: number): boolean {
+  return c === 32 || (c >= 9 && c <= 13) || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+}
+
+/** True for the bytes that end a PDF name or keyword: white space and the delimiters ( ) < > [ ] { } / %. */
+function isPdfDelimiter(c: number): boolean {
+  return c <= 32 || c === 40 || c === 41 || c === 60 || c === 62 || c === 91 || c === 93 || c === 123 || c === 125 || c === 47 || c === 37;
+}
+
 /** The end of an inline image's data. */
 const INLINE_IMAGE_END = /\sEI(?=\s|$)/g;
 /** Deepest q (save state) nesting and Form XObject nesting followed. */
 const MAX_STATE_DEPTH = 64;
 const MAX_FORM_DEPTH = 8;
+/** Numeric operands kept for an operator (the last six matter); a power of two. */
+const MAX_NUMBERS = 32;
 
 interface TextState {
   ctm: Matrix;
@@ -1977,6 +2090,11 @@ interface ContentContext {
 /**
  * Reads the text a content stream draws (Tj, TJ, ', ") with its position, following the text and
  * transformation matrices, and the Form XObjects it draws with Do (at the point of use).
+ *
+ * This is the reader's hot loop (a dense page has tens of thousands of tokens), so it scans the
+ * stream by character code without regular expressions or a token object, keeps the text matrices
+ * as scalars that advance in place, and keeps operands in a few slots: the last numbers (a ring)
+ * and the last string, name or array, which is all an operator reads.
  */
 function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefined, initial: TextState, formDepth = 0): void {
   const { writer, budget } = ctx;
@@ -1987,19 +2105,30 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
   budget.spend(s.length);
   let state: TextState = { ...initial };
   const saved: TextState[] = [];
-  let tm: Matrix = IDENTITY;
-  let tlm: Matrix = IDENTITY;
+  // The text matrix (a b c d e f) and the text line matrix: arrays, so the closures below share them without boxing each value.
+  const tm = [1, 0, 0, 1, 0, 0];
+  const tlm = [1, 0, 0, 1, 0, 0];
   let moved = true;
-  const operands: (string | number | PdfName | (string | number)[])[] = [];
-  let array: (string | number)[] | undefined;
-  const push = (v: string | number) => (array ? array.push(v) : operands.push(v));
-  const num = (i: number) => {
-    const v = operands[operands.length - i];
-    return typeof v === "number" ? v : 0;
-  };
+  const nums: number[] = [];
+  let numCount = 0;
+  let str: string | undefined;
+  let name: string | undefined;
+  /** The elements of the array being read (reused: the first `arrayLength` matter). */
+  const array: (string | number)[] = [];
+  let arrayLength = 0;
+  let inArray = false;
+  /** What the last operand was: 1 a number, 2 a string, 3 a name, 4 an array (0 none). */
+  let lastKind = 0;
+  /** The bytes of a hex string being read. */
+  const bytes: number[] = [];
+  /** The font the last Tf named (fonts are mostly set again and again). */
+  let tfName: string | undefined;
+  let tfFont = DEFAULT_FONT;
+  const num = (i: number) => (i <= numCount ? nums[(numCount - i) & (MAX_NUMBERS - 1)] : 0);
   const moveLine = (tx: number, ty: number) => {
-    tlm = multiply([1, 0, 0, 1, tx, ty], tlm);
-    tm = tlm;
+    tlm[4] = tx * tlm[0] + ty * tlm[2] + tlm[4];
+    tlm[5] = tx * tlm[1] + ty * tlm[3] + tlm[5];
+    for (let i = 0; i < 6; i++) tm[i] = tlm[i];
     moved = true;
   };
   const nextLine = () => {
@@ -2009,35 +2138,212 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
   const show = (raw: string) => {
     const size = state.size || 12;
     const run = decodeRun(state.font, raw);
-    const m = multiply(tm, state.ctm);
+    const ctm = state.ctm;
+    const ta = tm[0], tb = tm[1], tc = tm[2], td = tm[3]; // prettier-ignore
+    let te = tm[4];
+    let tf = tm[5];
+    // The run's start in device space, and the text matrix's axes there (the text direction and the up direction).
+    const x0 = te * ctm[0] + tf * ctm[2] + ctm[4];
+    const y0 = te * ctm[1] + tf * ctm[3] + ctm[5];
+    const ax = ta * ctm[0] + tb * ctm[2];
+    const ay = ta * ctm[1] + tb * ctm[3];
+    const ux = tc * ctm[0] + td * ctm[2];
+    const uy = tc * ctm[1] + td * ctm[3];
     // The text position advances by the glyph widths plus character and word spacing, scaled horizontally.
-    tm = multiply([1, 0, 0, 1, ((run.width / 1000) * size + run.count * state.charSpacing + run.spaces * state.wordSpacing) * state.scale, 0], tm);
-    const end = multiply(tm, state.ctm);
-    const length = Math.hypot(m[0], m[1]) || 1;
-    writer.place(run.text, m[4], m[5], end[4], end[5], m[0] / length, m[1] / length, size * (Math.hypot(m[2], m[3]) || 1), state.font.exact, moved);
+    const advance = ((run.width / 1000) * size + run.count * state.charSpacing + run.spaces * state.wordSpacing) * state.scale;
+    te = tm[4] = advance * ta + te;
+    tf = tm[5] = advance * tb + tf;
+    const x1 = te * ctm[0] + tf * ctm[2] + ctm[4];
+    const y1 = te * ctm[1] + tf * ctm[3] + ctm[5];
+    // Unrotated text (nearly always) needs no square roots: the axes' lengths are the magnitudes of their one component.
+    const length = (ay === 0 ? Math.abs(ax) : Math.hypot(ax, ay)) || 1;
+    const up = (ux === 0 ? Math.abs(uy) : Math.hypot(ux, uy)) || 1;
+    writer.place(run.text, x0, y0, x1, y1, ax / length, ay / length, size * up, state.font.exact, moved);
     moved = false;
   };
-  TOKEN.lastIndex = 0;
-  while (TOKEN.lastIndex < s.length && !writer.full) {
-    const at = TOKEN.lastIndex;
-    const m = TOKEN.exec(s);
-    if (!m) break;
-    const tok = m[0];
-    const c = tok.charCodeAt(0);
-    if (tok === "(") {
-      const literal = readLiteral(s, at);
-      push(literal.value);
-      TOKEN.lastIndex = literal.end;
-    } else if (c === 60 /* < */ && tok !== "<<") push(hexBytes(tok.slice(1, -1)));
-    else if (tok === "[") array = [];
-    else if (tok === "]") {
-      if (array) operands.push(array);
-      array = undefined;
-    } else if ((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) push(Number(tok));
-    else if (c === 47 /* / */) operands.push(new PdfName(tok.slice(1)));
-    else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 39 || c === 34 || c === 42) {
-      const last = operands[operands.length - 1];
-      switch (tok) {
+  const n = s.length;
+  let pos = 0;
+  while (pos < n) {
+    const c = s.charCodeAt(pos);
+    if (c <= 32) {
+      pos++;
+    } else if ((c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46) {
+      // A number: [+-]?digits[.digits] or [+-]?.digits; the digits over a power of ten round exactly as Number() does.
+      let p = pos;
+      let negative = false;
+      if (c === 43) p++;
+      else if (c === 45) {
+        negative = true;
+        p++;
+      }
+      let value = 0;
+      let digits = 0;
+      let scale = 1;
+      let dot = false;
+      for (; p < n; p++) {
+        const d = s.charCodeAt(p);
+        if (d >= 48 && d <= 57) {
+          value = value * 10 + (d - 48);
+          digits++;
+          if (dot) scale *= 10;
+        } else if (d === 46 && !dot) dot = true;
+        else break;
+      }
+      if (!digits) {
+        pos++; // a lone sign or dot
+        continue;
+      }
+      const number = digits > 15 ? Number(s.slice(pos, p)) : negative ? -value / scale : value / scale;
+      pos = p;
+      if (inArray) array[arrayLength++] = number;
+      else {
+        nums[numCount & (MAX_NUMBERS - 1)] = number;
+        numCount++;
+        lastKind = 1;
+      }
+    } else if (c === 40 /* ( */) {
+      const literal = readLiteral(s, pos);
+      pos = literalEnd;
+      if (inArray) array[arrayLength++] = literal;
+      else {
+        str = literal;
+        lastKind = 2;
+      }
+    } else if (c === 47 /* / */) {
+      let p = pos + 1;
+      while (p < n && !isPdfDelimiter(s.charCodeAt(p))) p++;
+      name = s.slice(pos + 1, p);
+      lastKind = 3;
+      pos = p;
+    } else if (c === 60 /* < */) {
+      if (s.charCodeAt(pos + 1) === 60) {
+        pos += 2; // a dictionary (an inline image's or marked content's); its entries are skipped as operands
+        continue;
+      }
+      const end = s.indexOf(">", pos + 1);
+      if (end < 0) {
+        pos++;
+        continue;
+      }
+      // A hex string: two digits per byte, white space allowed, an odd last digit padded with 0.
+      let out = "";
+      let count = 0;
+      let p = pos + 1;
+      // Pairs of digits, as long as they come without white space (nearly always).
+      for (; p + 1 < end; p += 2) {
+        const d1 = s.charCodeAt(p);
+        const d2 = s.charCodeAt(p + 1);
+        const v1 = d1 < 128 ? HEX_VALUE[d1] : -1;
+        const v2 = d2 < 128 ? HEX_VALUE[d2] : -1;
+        if (v1 < 0 || v2 < 0) break;
+        bytes[count++] = v1 * 16 + v2;
+        if (count === STRING_CHUNK) {
+          bytes.length = count;
+          out += String.fromCharCode.apply(null, bytes);
+          count = 0;
+        }
+      }
+      let high = -1;
+      for (; p < end; p++) {
+        const d = s.charCodeAt(p);
+        const v = d < 128 ? HEX_VALUE[d] : -1;
+        if (v < 0) continue;
+        if (high < 0) high = v;
+        else {
+          bytes[count++] = high * 16 + v;
+          high = -1;
+        }
+        if (count === STRING_CHUNK) {
+          bytes.length = count;
+          out += String.fromCharCode.apply(null, bytes);
+          count = 0;
+        }
+      }
+      if (high >= 0) bytes[count++] = high * 16;
+      if (count) {
+        bytes.length = count;
+        out += String.fromCharCode.apply(null, bytes);
+      }
+      pos = end + 1;
+      if (inArray) array[arrayLength++] = out;
+      else {
+        str = out;
+        lastKind = 2;
+      }
+    } else if (c === 91 /* [ */) {
+      arrayLength = 0;
+      inArray = true;
+      pos++;
+    } else if (c === 93 /* ] */) {
+      if (inArray) {
+        inArray = false;
+        lastKind = 4;
+      }
+      pos++;
+    } else if (c === 37 /* % */) {
+      while (pos < n && s.charCodeAt(pos) !== 10 && s.charCodeAt(pos) !== 13) pos++;
+    } else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 39 || c === 34 || c === 42) {
+      let p = pos + 1;
+      for (; p < n; p++) {
+        const d = s.charCodeAt(p);
+        if (!((d >= 65 && d <= 90) || (d >= 97 && d <= 122) || d === 39 || d === 34 || d === 42)) break;
+      }
+      const op = s.slice(pos, p);
+      pos = p;
+      if (writer.full) return;
+      switch (op) {
+        case "Tj":
+          if (lastKind === 2 && str !== undefined) show(str);
+          break;
+        case "TJ":
+          if (lastKind === 4) {
+            for (let i = 0; i < arrayLength; i++) {
+              const part = array[i];
+              if (typeof part === "string") show(part);
+              else {
+                const adjust = (-part / 1000) * (state.size || 12) * state.scale;
+                tm[4] = adjust * tm[0] + tm[4];
+                tm[5] = adjust * tm[1] + tm[5];
+              }
+            }
+          }
+          break;
+        case "Td":
+          moveLine(num(2), num(1));
+          break;
+        case "TD":
+          state.leading = -num(1);
+          moveLine(num(2), num(1));
+          break;
+        case "Tm":
+          for (let i = 0; i < 6; i++) tm[i] = tlm[i] = num(6 - i);
+          moved = true;
+          break;
+        case "T*":
+          nextLine();
+          break;
+        case "'":
+          nextLine();
+          if (lastKind === 2 && str !== undefined) show(str);
+          break;
+        case '"':
+          state.wordSpacing = num(2);
+          state.charSpacing = num(1);
+          nextLine();
+          if (lastKind === 2 && str !== undefined) show(str);
+          break;
+        case "Tf":
+          state.size = num(1);
+          if (name !== tfName) {
+            tfName = name;
+            tfFont = name !== undefined ? fontOf(ctx, resources, name) : DEFAULT_FONT;
+          }
+          state.font = tfFont;
+          break;
+        case "BT":
+          for (let i = 0; i < 6; i++) tm[i] = tlm[i] = IDENTITY[i];
+          moved = true;
+          break;
         case "q":
           if (saved.length < MAX_STATE_DEPTH) saved.push({ ...state });
           break;
@@ -2047,16 +2353,6 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
         case "cm":
           state.ctm = multiply([num(6), num(5), num(4), num(3), num(2), num(1)], state.ctm);
           break;
-        case "BT":
-          tm = tlm = IDENTITY;
-          moved = true;
-          break;
-        case "Tf": {
-          const font = operands[operands.length - 2];
-          state.size = num(1);
-          state.font = font instanceof PdfName ? fontOf(ctx, resources, font.name) : DEFAULT_FONT;
-          break;
-        }
         case "Tc":
           state.charSpacing = num(1);
           break;
@@ -2072,54 +2368,22 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
         case "Ts":
           state.rise = num(1);
           break;
-        case "Td":
-          moveLine(num(2), num(1));
-          break;
-        case "TD":
-          state.leading = -num(1);
-          moveLine(num(2), num(1));
-          break;
-        case "Tm":
-          tm = tlm = [num(6), num(5), num(4), num(3), num(2), num(1)];
-          moved = true;
-          break;
-        case "T*":
-          nextLine();
-          break;
-        case "Tj":
-          if (typeof last === "string") show(last);
-          break;
-        case "'":
-          nextLine();
-          if (typeof last === "string") show(last);
-          break;
-        case '"':
-          state.wordSpacing = num(3);
-          state.charSpacing = num(2);
-          nextLine();
-          if (typeof last === "string") show(last);
-          break;
-        case "TJ":
-          if (Array.isArray(last)) {
-            for (const part of last) {
-              if (typeof part === "string") show(part);
-              else tm = multiply([1, 0, 0, 1, (-part / 1000) * (state.size || 12) * state.scale, 0], tm);
-            }
-          }
-          break;
         case "ID": {
           // Inline image data can contain anything; skip to its "EI".
-          INLINE_IMAGE_END.lastIndex = TOKEN.lastIndex;
+          INLINE_IMAGE_END.lastIndex = pos;
           const end = INLINE_IMAGE_END.exec(s);
-          TOKEN.lastIndex = end ? end.index + end[0].length : s.length;
+          pos = end ? end.index + end[0].length : n;
           break;
         }
         case "Do":
-          if (last instanceof PdfName) drawForm(last.name, ctx, resources, state, formDepth);
+          if (lastKind === 3 && name !== undefined) drawForm(name, ctx, resources, state, formDepth);
           break;
       }
-      operands.length = 0;
-    }
+      numCount = 0;
+      str = undefined;
+      name = undefined;
+      lastKind = 0;
+    } else pos++; // ) > { } and stray bytes
   }
 }
 
@@ -2146,13 +2410,38 @@ const initialState = (): TextState => ({ ctm: IDENTITY, font: DEFAULT_FONT, size
 
 /** Characters of real text (letters, digits, punctuation, underscores of form lines, common symbols). */
 const READABLE = /[\p{L}\p{N}.,;:'"!?()\-–—\/$%&@#*+=€£¥°§•…’“”_|<>[\]{}~^©®™±×÷]+/gu;
+/** The ASCII characters sorted the same way, by code: 1 readable, 2 white space, 0 other. */
+const ASCII_READABLE = Uint8Array.from({ length: 128 }, (_, c) => (isSpaceChar(c) ? 2 : new RegExp(READABLE.source, "u").test(String.fromCharCode(c)) ? 1 : 0));
 
-/** True when extracted text is mostly words, not the gibberish produced by fonts with custom encodings. */
+/**
+ * True when extracted text is mostly words, not the gibberish produced by fonts with custom
+ * encodings: over 90% of its non-space characters are READABLE (and there are at least 20).
+ * ASCII is counted by table; the rest goes through the regular expressions.
+ */
 function looksReadable(text: string): boolean {
-  const compact = text.replace(/\s+/g, "");
-  if (compact.length < 20) return false;
-  const other = compact.replace(READABLE, "").length;
-  return (compact.length - other) / compact.length > 0.9;
+  let readable = 0;
+  let other = 0;
+  let foreign = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c < 128) {
+      const kind = ASCII_READABLE[c];
+      if (kind === 1) readable++;
+      else if (kind === 0) other++;
+    } else {
+      const start = i;
+      while (i + 1 < text.length && text.charCodeAt(i + 1) >= 128) i++;
+      foreign += text.slice(start, i + 1);
+    }
+  }
+  if (foreign) {
+    const compact = foreign.replace(/\s+/g, "");
+    const rest = compact.replace(READABLE, "").length;
+    other += rest;
+    readable += compact.length - rest;
+  }
+  const total = readable + other;
+  return total >= 20 && readable / total > 0.9;
 }
 
 /** Streams that never hold page text: images, fonts, cross-reference and object streams, metadata, embedded files, color data. */
@@ -2162,14 +2451,27 @@ const NOT_TEXT_STREAM =
 /** How far before "stream" a stream's dictionary may start. */
 const DICT_WINDOW = 4096;
 
-/** Ends each line without trailing spaces and keeps at most one blank line in a row (linear time). */
+/** Ends each line without trailing white space, keeps at most one blank line in a row, and trims the whole (one pass). */
 function tidyLines(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const parts: string[] = [];
+  let newlines = 0;
+  const n = text.length;
+  for (let pos = 0; pos <= n; ) {
+    let end = text.indexOf("\n", pos);
+    if (end < 0) end = n;
+    let stop = end;
+    while (stop > pos && isSpaceChar(text.charCodeAt(stop - 1))) stop--;
+    let start = pos;
+    if (!parts.length) while (start < stop && isSpaceChar(text.charCodeAt(start))) start++;
+    if (stop > start) {
+      if (parts.length) parts.push(newlines > 1 ? "\n\n" : "\n");
+      parts.push(start === 0 && stop === n ? text : text.slice(start, stop));
+      newlines = 0;
+    }
+    newlines++;
+    pos = end + 1;
+  }
+  return parts.join("");
 }
 
 /** Most page-tree nodes visited, and the deepest nesting followed. */
