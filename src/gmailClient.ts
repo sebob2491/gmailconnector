@@ -135,7 +135,7 @@ export function parseBatchResponse(
     if (headerEnd < 0) continue;
     const id = /Content-ID:\s*<response-item-(\d+)>/i.exec(part.slice(0, headerEnd))?.[1];
     const http = part.slice(headerEnd).replace(/^\r?\n\r?\n/, "");
-    const status = /^HTTP\/[\d.]+\s+(\d{3})/.exec(http)?.[1];
+    const status = /^HTTP\/[\d.]+\s+(\d{3})(?!\d)/.exec(http)?.[1];
     if (id === undefined || !status || Number(id) >= count) continue;
     const bodyStart = http.search(/\r?\n\r?\n/);
     out[Number(id)] = {
