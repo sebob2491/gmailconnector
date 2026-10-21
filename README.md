@@ -27,8 +27,18 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 ### Differences from the built-in Gmail connector
 
 - New `list_accounts` tool, and an `account` argument on every tool. `list_accounts` also checks each
-  account and says "needs re-link" when its Google access was revoked or has expired, so Claude can tell
-  you which one to link again.
+  account (with a fresh token, so a revoked grant shows up right away) and says "needs re-link" when its
+  Google access was revoked or has expired, so Claude can tell you which one to link again. It lists the
+  other addresses an account can send from (send-as aliases) under `addresses`.
+- The connector knows your own addresses: `reply` with `replyAll` never puts you in Cc, whether an email
+  reached you through an alias, a dotted or `+tagged` form of your Gmail address, or googlemail.com.
+  Emails you sent carry `fromMe: true` in search results, threads and messages, so "did I reply?" has
+  an answer. The send-as list is read once an hour per account, only when something needs it.
+- `includeSignature` on `send_message`, `reply`, `forward` and `create_draft` appends the Gmail
+  signature of the sending address (as Gmail formats it, above any quoted or forwarded text).
+- `reply` takes `attachments` like `send_message`, and `forward` takes extra ones to send along with the
+  original's (the size limits count both). Recipients can be plain addresses or `Ann Lee <ann@example.com>`.
+- An argument name a tool doesn't know (say `quary`) is an error instead of being dropped silently.
 - New `get_attachment` tool: Claude can read attachments. Text, CSV, HTML, calendar invites, Word
   (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images as images; PDFs as extracted
   text (when the PDF has a text layer with standard fonts), otherwise as the PDF file itself for clients
@@ -36,15 +46,20 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   where the text sits on the page (so Word-made PDFs don't break mid-sentence) and filled-in form
   fields included. Spreadsheets keep empty cells in place and show dates as dates; Word tables come
   out row by row. Text files are decoded in their own character set. Very large files (and
-  booby-trapped ones) are read only as far as needed, with a note saying what was left out.
+  booby-trapped ones) are read only as far as needed, with a note saying what was left out. Files that
+  can't be shown (unreadable types over 1 MB, images over 4 MB, anything over 8 MB to read as text) are
+  refused from their listed size and type before anything is downloaded, and the email's own bodies are
+  never decoded just to find an attachment.
 - New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
   promotions older than a week"). They support a dry run that previews what would change, and Claude
   is told to show you that preview first. Up to 500 emails per account per run by default (`maxEmails`
   raises it to 2,000). Only emails that don't already have the change are counted and changed (archiving
   "category:promotions" only touches promotions still in the inbox), so running the same change again
-  continues with the rest. With thread or message IDs, the IDs left over are returned to pass next time.
-  If a run fails partway, the result says how many emails were changed and how to finish.
+  continues with the rest. With thread or message IDs, the IDs left over are returned to pass next time
+  (their count and where they start in your list, when more than 100 remain), and IDs the account doesn't
+  have are listed under `notFound` with a reminder that IDs belong to one account. If a run fails
+  partway, the result says how many emails were changed and how to finish.
 - New `unsubscribe` tool: "unsubscribe me from everything Levi's sends, in both accounts". It looks at the
   newest matching emails, groups them by account and sender, and uses the unsubscribe option senders
   put in their emails' headers: the standard one-click request (sent by the connector, only to public
@@ -53,10 +68,11 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   you the plan first (`dryRun`) and to ask before doing it. Up to 10 senders per run (`maxSenders` up to
   20); the emails you already have stay until you archive or trash them with the bulk tools.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
-- `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
-  Results are compact: one-email threads are shown flat, previews are cleaned of the invisible padding
-  and HTML codes that marketing emails contain, and recipients are listed only when an email wasn't
-  addressed to just you. A 50-email search comes back about half the size of the raw Gmail data.
+- `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`
+  and the subject its first email had. Results are compact: one-email threads are shown flat, previews
+  are cleaned of the invisible padding and HTML codes that marketing emails contain, and recipients are
+  listed only when an email wasn't addressed to just you. A 50-email search comes back about half the
+  size of the raw Gmail data. The search help Claude sees covers Gmail's full operator syntax.
 - `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
   how much was left out). Pass `maxBodyChars: 0` for the full text. Replies and forwards always use the
   whole email.
@@ -161,7 +177,8 @@ app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables
 dashboard are kept when the Worker redeploys.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
-batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, archiving
+batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls (a reply-all
+or a signature adds one settings call per account per hour), `list_accounts` two per account, archiving
 2,000 emails in each of five inboxes about 35, and unsubscribing from 20 senders across five inboxes
 about 35. If Claude ever reports errors like "exceeded CPU" or "too many subrequests", switch the
 Worker to the Workers Paid plan ($5/month), which raises both limits.
