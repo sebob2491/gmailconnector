@@ -82,6 +82,20 @@ function isAscii(value: string): boolean {
   return /^[\x20-\x7e]*$/.test(value);
 }
 
+/** decodeURIComponent that gives back its input, instead of throwing, when a %-escape is malformed. */
+function safeDecodeURIComponent(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+/** Replaces unpaired surrogates, on which encodeURI and encodeURIComponent throw, with U+FFFD. */
+function wellFormed(text: string): string {
+  return text.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
+}
+
 /**
  * Encodes a header value as RFC 2047 encoded-words when it contains non-ASCII text (or when `force`
  * is set, e.g. for an ASCII value too long to fold). Each word is at most 64 characters, so even
@@ -292,7 +306,7 @@ function filenameParams(param: "name" | "filename", filename: string): string {
       .map((piece, i) => `${param}*${i}=${quoteParam(piece)}`)
       .join(`;${CRLF} `);
   }
-  const ext = encodeURIComponent(clean).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  const ext = encodeURIComponent(wellFormed(clean)).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
   const extended =
     ext.length <= 54
       ? `${param}*=UTF-8''${ext}`
@@ -385,7 +399,7 @@ function assignContentIds(html: string, inline: OutgoingAttachment[]): { html: s
   // Longer names first, so "a.png" never matches inside "a.png.png".
   for (const [ref, cids] of [...renames].sort(([a], [b]) => b.length - a.length)) {
     if (cids.length === 1 && cids[0] === ref) continue;
-    const forms = [...new Set([ref, encodeURI(ref), encodeURIComponent(ref), escapeHtml(ref)])].sort((a, b) => b.length - a.length);
+    const forms = [...new Set([ref, encodeURI(wellFormed(ref)), encodeURIComponent(wellFormed(ref)), escapeHtml(ref)])].sort((a, b) => b.length - a.length);
     const re = new RegExp(`cid:(?:${forms.map(escapeRegExp).join("|")})(?=["'\\s)>]|&quot;|$)`, "gi");
     let n = 0;
     out = out.replace(re, () => `cid:${cids[Math.min(n++, cids.length - 1)]}`);
@@ -719,7 +733,7 @@ export function htmlToText(html: string): string {
       return;
     }
     if (/^mailto:/i.test(url)) {
-      if (!label) b.word(alt || decodeURIComponent(url.slice(7).split("?")[0]));
+      if (!label) b.word(alt || safeDecodeURIComponent(url.slice(7).split("?")[0]));
       return;
     }
     if (!label) {

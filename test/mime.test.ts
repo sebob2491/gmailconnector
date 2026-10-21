@@ -121,6 +121,22 @@ test("htmlToText keeps link addresses, including unusual ones", () => {
   assert.equal(htmlToText('<a href="https://x.com">https://x.com</a> <a href="#top">Top</a>'), "https://x.com Top");
 });
 
+test("malformed %-escapes and unpaired surrogates never make link or filename handling throw", () => {
+  // An empty mailto: link shows its address; a bad escape (fuzz repro html-mailto-bad-escape.html) is shown as written.
+  assert.equal(htmlToText('<p>Hi</p><a href="mailto:%zz@x.y"></a>'), "Hi\n\n%zz@x.y");
+  assert.equal(htmlToText('<a href="mailto:caf%C3%A9@x.y?subject=hi"></a> <a href="mailto:%E0%A4%A"></a>'), "café@x.y %E0%A4%A");
+  // A forwarded file or inline image whose name holds an unpaired surrogate is still sent.
+  const raw = buildMime({
+    to: ["a@example.com"],
+    html: '<img src="cid:pic\ud800.png">',
+    attachments: [
+      { content: Buffer.from("x"), filename: "report\ud800.pdf", mimeType: "application/pdf" },
+      { content: Buffer.from("y"), filename: "pic\ud800.png", mimeType: "image/png", inline: true },
+    ],
+  });
+  assert.match(raw, /filename\*=UTF-8''report%EF%BF%BD\.pdf/);
+});
+
 test("htmlToText stays fast on hostile HTML", () => {
   const inputs = {
     "unclosed attributes": '<a href="x" '.repeat(20_000),
