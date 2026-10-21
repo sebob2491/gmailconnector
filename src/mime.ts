@@ -947,8 +947,9 @@ class TextBuilder {
     });
   }
 
+  /** A word as it is (alt text, an address), only without line breaks and control characters. */
   word(s: string) {
-    const clean = s.replace(HTML_CONTROLS, "");
+    const clean = s.replace(/[\t\n\r]+/g, " ").replace(PRE_CONTROLS, "");
     if (clean) this.emit(clean);
   }
 
@@ -1051,7 +1052,8 @@ export class HtmlTextReader {
     const b = this.b;
     this.link = undefined;
     const label = b.textSince(link.start);
-    const url = link.href.trim();
+    // As in browsers, tabs and line breaks in an address are dropped.
+    const url = link.href.replace(/[\t\n\r]/g, "").trim();
     const alt = link.alts.join(" ").trim();
     if (!url || url.startsWith("#") || /^javascript:/i.test(url)) {
       if (!label) b.word(alt);
