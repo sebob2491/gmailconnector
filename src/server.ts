@@ -1127,7 +1127,7 @@ export function createServer(deps: ServerDeps): McpServer {
       .max(2000)
       .optional()
       .describe(
-        "Optional. Most emails to change per account per run (default 500). If more need the change, the result's `more` says how to continue (for IDs, it returns remainingThreadIds/remainingMessageIds).",
+        "Optional. Most emails to change per account per run (default 500). If more need the change, the result's `more` says how to continue (for IDs, it returns remainingThreadIds/remainingMessageIds, or just their count and where they start in your list when more than 100 remain).",
       ),
     dryRun: z
       .boolean()

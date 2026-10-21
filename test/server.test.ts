@@ -2628,3 +2628,46 @@ describe("cheaper attachment reads", () => {
     }
   });
 });
+
+describe("smaller results", () => {
+  test("long lists of remaining IDs come back as a count and where they start", async () => {
+    const ctx = await setup();
+    const ids: string[] = [];
+    for (let i = 0; i < 150; i++) {
+      ids.push(ctx.fake.deliver(ctx.work, crlf([`From: s${i}@x.example`, `To: ${WORK}`, `Subject: M${i}`, "", "x"]), { labelIds: ["INBOX", "UNREAD"] }).id);
+    }
+    const first = await ctx.call("bulk_update", { account: "work", messageIds: [...ids, ids[0]], action: "mark_read", maxEmails: 20 });
+    assert.equal(first.isError, false, first.text);
+    assert.equal(first.json.changed, 20);
+    assert.equal(first.json.remainingMessageIds, undefined);
+    assert.equal(first.json.remainingCount, 130);
+    assert.equal(first.json.remainingHint, "Pass the 130 IDs after the first 20 you gave (duplicates removed) as messageIds next time.");
+    assert.match(first.json.more, /To continue, run it again with messageIds set to the 130 IDs after the first 20 you gave \(duplicates removed\)\./);
+    const rest = await ctx.call("bulk_update", { account: "work", messageIds: ids.slice(20), action: "mark_read" });
+    assert.equal(rest.json.changed, 130);
+    assert.equal(rest.json.remainingCount, undefined);
+
+    const threadIds: string[] = [];
+    for (let i = 0; i < 120; i++) {
+      threadIds.push(ctx.fake.deliver(ctx.work, crlf([`From: t${i}@x.example`, `To: ${WORK}`, `Subject: T${i}`, "", "x"]), { labelIds: ["INBOX"] }).threadId);
+    }
+    const threads = await ctx.call("bulk_update", { account: "work", threadIds, action: "star", maxEmails: 10 });
+    assert.equal(threads.json.remainingThreadIds, undefined);
+    assert.equal(threads.json.remainingCount, 110);
+    assert.match(threads.json.remainingHint, /^Pass the 110 IDs after the first 10 you gave/);
+    // Up to 100 the list itself is returned, as before.
+    const few = await ctx.call("bulk_update", { account: "work", threadIds: threadIds.slice(10), action: "star", maxEmails: 10 });
+    assert.equal(few.json.remainingThreadIds.length, 100);
+    assert.equal(few.json.remainingCount, undefined);
+  });
+
+  test("changing a thread reports how many emails changed and the thread's labels, not each email's", async () => {
+    const { call, fake, work } = await setup();
+    fake.deliver(work, crlf(["From: boss@work.example", `To: ${WORK}`, "Subject: Re: Q3 report", "", "ping"]), { threadId: "wt1", labelIds: ["INBOX"] });
+    const res = await call("label_thread", { account: "work", threadId: "wt1", labelIds: ["STARRED"] });
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED"] });
+    const trashed = await call("trash_thread", { account: "work", threadId: "wt1" });
+    assert.deepEqual(trashed.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED", "TRASH"] });
+  });
+});

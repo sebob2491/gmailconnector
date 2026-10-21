@@ -244,41 +244,61 @@ type Selection = {
   unavailable?: Record<string, unknown>;
 } & (
   | { kind: "query"; /** Changed emails stop matching, so running the change again continues. */ resumable: boolean }
-  | { kind: "threads"; remainingThreadIds: string[]; threadOf: Map<string, string>; /** Given IDs that don't exist in this account. */ notFound: string[] }
+  | {
+      kind: "threads";
+      /** The given thread IDs, duplicates removed. */
+      threadIds: string[];
+      remainingThreadIds: string[];
+      threadOf: Map<string, string>;
+      /** Given IDs that don't exist in this account. */
+      notFound: string[];
+    }
   | { kind: "messages"; remainingMessageIds: string[] }
 );
 
+/** Lists of IDs to pass next time are returned in full up to this many; beyond that, their count and where they start. */
+const REMAINING_LIST_MAX = 100;
+
 /**
  * Says how to continue a bulk change that didn't cover everything: emails beyond maxEmails, and
- * `notDone` emails a failed run didn't get to. ID selections get the IDs to pass next time.
+ * `notDone` emails a failed run didn't get to. ID selections get the IDs to pass next time, or when
+ * there are many, their count and where they start in the given list (which Claude still holds).
+ * `resume` is the instruction itself, for messages that explain how to go on.
  */
-function bulkLeftOver(selection: Selection, max: number, notDone: string[] = []) {
+function bulkLeftOver(selection: Selection, max: number, notDone: string[] = []): { fields: Record<string, unknown>; resume?: string } {
   const limit = `maxEmails can go up to 2,000.`;
   if (selection.kind === "query") {
-    if (!selection.more) return {};
+    if (!selection.more) return { fields: {} };
     return {
-      more: selection.resumable
-        ? `More emails match than the limit of ${max}; each run changes the newest ${max}. Run the same change again to continue (emails already changed no longer match). ${limit}`
-        : `More emails match than the limit of ${max}; each run changes the newest ${max}. Running it again would pick the same emails, so raise maxEmails or narrow the query. ${limit}`,
+      fields: {
+        more: selection.resumable
+          ? `More emails match than the limit of ${max}; each run changes the newest ${max}. Run the same change again to continue (emails already changed no longer match). ${limit}`
+          : `More emails match than the limit of ${max}; each run changes the newest ${max}. Running it again would pick the same emails, so raise maxEmails or narrow the query. ${limit}`,
+      },
     };
   }
-  if (selection.kind === "threads") {
-    const remainingThreadIds = [...new Set([...notDone.map((id) => selection.threadOf.get(id)!), ...selection.remainingThreadIds])];
-    if (!remainingThreadIds.length) return {};
-    return {
-      ...(selection.more
-        ? { more: `These threads hold more than ${max} emails to change; each run changes ${max}. To continue, run it again with threadIds set to remainingThreadIds. ${limit}` }
-        : {}),
-      remainingThreadIds,
-    };
-  }
-  const remainingMessageIds = [...notDone, ...selection.remainingMessageIds];
-  if (!remainingMessageIds.length) return {};
+  const threads = selection.kind === "threads";
+  const given = threads ? selection.threadIds : [...selection.ids, ...selection.remainingMessageIds];
+  const remaining = threads
+    ? [...new Set([...notDone.map((id) => selection.threadOf.get(id)!), ...selection.remainingThreadIds])]
+    : [...notDone, ...selection.remainingMessageIds];
+  if (!remaining.length) return { fields: {} };
+  // What's left is the given list from its first unfinished ID on (duplicates removed), so a long
+  // list needn't be echoed back: Claude has it.
+  const key = threads ? "threadIds" : "messageIds";
+  const field = threads ? "remainingThreadIds" : "remainingMessageIds";
+  const listed = remaining.length <= REMAINING_LIST_MAX;
+  const which = listed ? field : `the ${remaining.length} IDs after the first ${given.indexOf(remaining[0])} you gave (duplicates removed)`;
+  const resume = `run it again with ${key} set to ${which}`;
+  const why = threads
+    ? `These threads hold more than ${max} emails to change; each run changes ${max}.`
+    : `Only ${max} of the given emails are changed per run (maxEmails).`;
   return {
-    ...(selection.more
-      ? { more: `Only ${max} of the given emails are changed per run (maxEmails). To continue, run it again with messageIds set to remainingMessageIds. ${limit}` }
-      : {}),
-    remainingMessageIds,
+    fields: {
+      ...(selection.more ? { more: `${why} To continue, ${resume}. ${limit}` } : {}),
+      ...(listed ? { [field]: remaining } : { remainingCount: remaining.length, remainingHint: `Pass ${which} as ${key} next time.` }),
+    },
+    resume,
   };
 }
 
@@ -1556,7 +1576,7 @@ export class Mailbox {
         }
         if (pending.length > room) remainingThreadIds.push(threadId);
       }
-      return { kind: "threads", ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, notFound, ...unavailable("threadIds", failed) };
+      return { kind: "threads", threadIds, ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, notFound, ...unavailable("threadIds", failed) };
     }
     const ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))];
     return { kind: "messages", ids: ids.slice(0, max), more: ids.length > max, remainingMessageIds: ids.slice(max) };
@@ -1574,7 +1594,7 @@ export class Mailbox {
     const { ids } = selection;
     const missing = (notFound: string[]) => (notFound.length ? { notFound, hint: WRONG_ACCOUNT_HINT } : {});
     const extra = {
-      ...bulkLeftOver(selection, opts.max),
+      ...bulkLeftOver(selection, opts.max).fields,
       ...(selection.unavailable ? { unavailable: selection.unavailable } : {}),
       ...(selection.kind === "threads" ? missing(selection.notFound) : {}),
     };
@@ -1615,16 +1635,14 @@ export class Mailbox {
         if (!changed) throw wrongId ? new MimeError(`${err.message} ${WRONG_ACCOUNT_HINT}`) : err;
         // Part of the change went through: say exactly how much, and how to finish.
         const left = ids.slice(i);
-        const finish =
-          selection.kind === "query"
-            ? "Run the same change again to finish."
-            : `Run it again with ${selection.kind === "threads" ? "threadIds set to remainingThreadIds" : "messageIds set to remainingMessageIds"} to finish.`;
+        const rest = bulkLeftOver(selection, opts.max, left);
+        const finish = rest.resume ? `${rest.resume[0].toUpperCase()}${rest.resume.slice(1)} to finish.` : "Run the same change again to finish.";
         return {
           changed,
           notChanged: left.length,
           error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${wrongId ? `${WRONG_ACCOUNT_HINT} ` : ""}${finish}`,
           ...extra,
-          ...bulkLeftOver(selection, opts.max, left),
+          ...rest.fields,
         };
       }
       changed += chunk.length;
@@ -1640,10 +1658,9 @@ export class Mailbox {
 
   private modifyResult(kind: "messages" | "threads", res: any) {
     if (kind === "messages") return { id: res.id, threadId: res.threadId, labelIds: res.labelIds ?? [] };
-    return {
-      id: res.id,
-      messages: ((res.messages ?? []) as ApiMessage[]).map((m) => ({ id: m.id, labelIds: m.labelIds ?? [] })),
-    };
+    // Listing every message's labels would repeat the same few IDs a hundred times for a long thread.
+    const messages = (res.messages ?? []) as ApiMessage[];
+    return { id: res.id, messagesChanged: messages.length, labelIds: [...new Set(messages.flatMap((m) => m.labelIds ?? []))] };
   }
 }
 
