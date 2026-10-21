@@ -634,6 +634,13 @@ const HIDDEN_TAGS = ["script", "style", "title", "template", "xmp", "iframe", "n
 const HIDDEN_END = new Map(HIDDEN_TAGS.map((tag) => [tag, new RegExp(`</${tag}[\\s/>]`, "gi")]));
 /** HTML's collapsible white space (plus no-break spaces, which emails use as padding). */
 const HTML_SPACE = /[ \t\n\r\f ]+/g;
+/**
+ * C0 control characters that never show (from numeric references like &#1; or stray bytes): all but
+ * tab, line feed, carriage return and form feed, which HTML treats as white space.
+ */
+const HTML_CONTROLS = /[\x00-\x08\x0b\x0e-\x1f\x7f]/g;
+/** The same, with form feed: in preformatted text white space is kept as it is. */
+const PRE_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
 function isHtmlSpace(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 13 || c === 12;
@@ -718,7 +725,7 @@ class TextBuilder {
 
   /** Normal text: runs of white space become one space, which is dropped at line starts. */
   text(raw: string) {
-    const t = decodeEntities(raw).replace(HTML_SPACE, " ");
+    const t = decodeEntities(raw).replace(HTML_CONTROLS, "").replace(HTML_SPACE, " ");
     if (!t) return;
     const lead = t.charCodeAt(0) === 32;
     const trail = t.length > 1 && t.charCodeAt(t.length - 1) === 32;
@@ -730,7 +737,7 @@ class TextBuilder {
 
   /** Preformatted text: spaces and line breaks are kept. */
   pre(raw: string) {
-    const lines = decodeEntities(raw).replace(/\r\n?/g, "\n").replace(/ /g, " ").split("\n");
+    const lines = decodeEntities(raw).replace(PRE_CONTROLS, "").replace(/\r\n?/g, "\n").replace(/ /g, " ").split("\n");
     lines.forEach((line, i) => {
       if (i) this.newline();
       if (line) this.emit(line);
@@ -738,7 +745,8 @@ class TextBuilder {
   }
 
   word(s: string) {
-    if (s) this.emit(s);
+    const clean = s.replace(HTML_CONTROLS, "");
+    if (clean) this.emit(clean);
   }
 
   /** A line break (<br>); more than one blank line in a row is not kept. */

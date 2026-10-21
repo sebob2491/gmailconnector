@@ -396,12 +396,16 @@ export function cleanSnippet(snippet: string | undefined): string | undefined {
   return clean || undefined;
 }
 
+/** C0 control characters other than tab and line breaks; vertical tab and form feed count as line breaks. */
+const CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
 /**
- * Removes invisible padding and collapses the runs of blank space it leaves behind (any Unicode space,
- * and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate cells, including empty ones.
+ * Removes invisible padding and control characters, and collapses the runs of blank space they leave
+ * behind (any Unicode space, and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate
+ * cells, including empty ones.
  */
 export function cleanBody(text: string): string {
-  return stripInvisible(text.replace(/\r\n?/g, "\n"))
+  return stripInvisible(text.replace(/\r\n?/g, "\n").replace(CONTROLS, (c) => (c === "\x0b" || c === "\x0c" ? "\n" : "")))
     .replace(/[^\S\n\t]{2,}/g, " ")
     .split("\n")
     .map((line) => line.trimEnd()) // not /[^\S\n]+\n/, which is quadratic on long runs of tabs

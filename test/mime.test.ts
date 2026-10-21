@@ -115,6 +115,13 @@ test("htmlToText lays text out like a browser", () => {
   assert.equal(htmlToText("<p>if a < b and 1<2</p>"), "if a < b and 1<2");
 });
 
+test("control characters from numeric references or raw bytes are dropped from bodies", () => {
+  assert.equal(htmlToText("a&#1;b&#x1F;c\u0007d &#xF;e\u000bf<pre>g\u0000h\fi</pre>"), "abcd ef\n\nghi");
+  assert.equal(htmlToText('<a href="x&#2;y">&#3;</a>'), "xy");
+  // Tabs and line breaks stay; vertical tab and form feed in plain text are line breaks.
+  assert.equal(cleanBody("a\tb\u0000c\u001b[31md\fpage 2\u000bnext"), "a\tbc[31md\npage 2\nnext");
+});
+
 test("htmlToText decodes entities fully and safely", () => {
   assert.equal(htmlToText("F&uuml;r Sie: Caf&eacute; &Agrave; &rarr; &hearts; &alpha;&Omega; &euro;5 &frac12;"), "Für Sie: Café À → ♥ αΩ €5 ½");
   // Numeric references in the Windows-1252 range, and legacy references without ";".
