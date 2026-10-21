@@ -413,11 +413,32 @@ function unsubscribeText(text: string, max: number, multiline: boolean): string 
   return limitLength(clean.trim(), max).text;
 }
 
+/** Longest List-Unsubscribe value read (real ones are a few hundred characters); the rest is ignored. */
+const MAX_LIST_UNSUBSCRIBE = 8 * 1024;
+
+/** The <…> entries of a header value, found in one pass (the "<" nearest each ">" opens it). */
+function bracketedEntries(value: string): string[] {
+  const out: string[] = [];
+  for (let open = value.indexOf("<"); open >= 0; ) {
+    const close = value.indexOf(">", open + 1);
+    if (close < 0) break;
+    out.push(value.slice(value.lastIndexOf("<", close) + 1, close));
+    open = value.indexOf("<", close + 1);
+  }
+  return out;
+}
+
 export function unsubscribeOptions(listUnsubscribe: string | undefined, listUnsubscribePost: string | undefined): UnsubscribeOptions {
   if (!listUnsubscribe) return {};
+  let value = listUnsubscribe;
+  if (value.length > MAX_LIST_UNSUBSCRIBE) {
+    value = value.slice(0, MAX_LIST_UNSUBSCRIBE);
+    // An entry cut off at the end isn't used (a bracketed one is never complete without its ">").
+    if (!value.includes(">")) value = value.slice(0, value.lastIndexOf(",") + 1);
+  }
   // Entries are <uri>, comma separated; a few senders leave out the angle brackets.
-  const bracketed = [...listUnsubscribe.matchAll(/<([^>]*)>/g)].map((m) => m[1]);
-  const uris = (bracketed.length ? bracketed : listUnsubscribe.split(",")).map((u) => u.trim()).filter(Boolean);
+  const bracketed = bracketedEntries(value);
+  const uris = (bracketed.length ? bracketed : value.split(",")).map((u) => u.trim()).filter(Boolean);
   const out: UnsubscribeOptions = {};
   for (const uri of uris) {
     let url: URL;

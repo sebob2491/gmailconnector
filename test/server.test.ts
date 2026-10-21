@@ -8,7 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
 import { setRetryWait, TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
-import { decodeBase64Url, isPrivateAddress, registrableDomain, sendAsCache, withoutBodyData } from "../src/mailbox.js";
+import { decodeBase64Url, isPrivateAddress, registrableDomain, sendAsCache, unsubscribeOptions, withoutBodyData } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -2256,6 +2256,30 @@ describe("unsubscribe", () => {
     const real = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
     assert.deepEqual(ctx.web.requests.map((r) => r.url), ["https://unsub.five.example/u/x?t=1"]);
     assert.equal(real.json.summary.failed, 4);
+  });
+
+  test("List-Unsubscribe is read in one pass, and only its first 8 KB", () => {
+    const post = "List-Unsubscribe=One-Click";
+    // 100,000 "<" (fuzz repro unsub-header-100k-lt.txt) took 3.3 s with the regex that was used.
+    for (const header of ["<".repeat(100_000), "<a".repeat(50_000), `${"<".repeat(50_000)}>`, ",".repeat(1_000_000)]) {
+      const start = process.cpuUsage();
+      assert.deepEqual(unsubscribeOptions(header, post), {});
+      const used = process.cpuUsage(start);
+      assert.ok((used.user + used.system) / 1000 < 50, `${header.slice(0, 2)}…: ${(used.user + used.system) / 1000} ms`);
+    }
+    // Entries are what lies between the "<" nearest a ">" and that ">"; stray text around them doesn't matter.
+    assert.deepEqual(unsubscribeOptions("junk < <https://news.example.com/u?x=1>, <mailto:u@news.example.com?subject=stop>", post), {
+      link: "https://news.example.com/u?x=1",
+      oneClick: "https://news.example.com/u?x=1",
+      mailto: { to: "u@news.example.com", subject: "stop", body: "unsubscribe" },
+    });
+    // Past 8 KB nothing is read, and an entry cut off there isn't used.
+    const padding = " ".repeat(9000);
+    assert.equal(unsubscribeOptions(`<https://a.example.com/u>${padding}<https://b.example.com/u>`, undefined).link, "https://a.example.com/u");
+    assert.deepEqual(unsubscribeOptions(`${" ".repeat(8000)}<https://cut.example.com/${"u".repeat(500)}>`, undefined), {});
+    assert.deepEqual(unsubscribeOptions(`https://a.example.com/u,${" ".repeat(8000)}https://cut.example.com/${"u".repeat(500)}`, undefined), {
+      link: "https://a.example.com/u",
+    });
   });
 
   test("private addresses are recognised in every IPv6 spelling", () => {
