@@ -1239,6 +1239,42 @@ function withAttachments(from: string, to: string, subject: string, files: { nam
   ]);
 }
 
+test("an Outlook invite's unnamed calendar part is listed as invite.ics", async () => {
+  const { call, fake, personal } = await setup();
+  fake.deliver(
+    personal,
+    crlf([
+      "From: Jane <jane@example.com>",
+      `To: ${PERSONAL}`,
+      "Subject: Q1 planning",
+      'Content-Type: multipart/alternative; boundary="ALT"',
+      "",
+      "--ALT",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "When: Friday 10am",
+      "--ALT",
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      "<p>When: Friday 10am</p>",
+      "--ALT",
+      "Content-Type: text/calendar; charset=utf-8; method=REQUEST",
+      "",
+      "BEGIN:VCALENDAR",
+      "METHOD:REQUEST",
+      "END:VCALENDAR",
+      "--ALT--",
+    ]),
+    { id: "invite" },
+  );
+  const res = await call("get_message", { account: "personal", messageId: "invite" });
+  assert.equal(res.json.plaintextBody, "When: Friday 10am");
+  assert.deepEqual(
+    res.json.attachments.map(({ filename, mimeType, partId }: any) => ({ filename, mimeType, partId })),
+    [{ filename: "invite.ics", mimeType: "text/calendar", partId: "2" }],
+  );
+});
+
 describe("reading attachments", () => {
   const files = [
     { name: "statement.pdf", type: "application/pdf", data: pdf(["BT 72 720 Td (Net pay: $1,234.56 for Sebastian) Tj ET"]) },

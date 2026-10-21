@@ -375,3 +375,41 @@ test("deeply nested MIME trees don't overflow the stack; parts past 64 levels ar
   const out = await formatMessage(msg, "PLAIN_TEXT", "me@example.com", none);
   assert.equal(out.plaintextBody, "");
 });
+
+test("an unnamed text/calendar part is listed as invite.ics, never used as the body", async () => {
+  const leaf = (partId: string, mimeType: string, text: string, extra: Partial<ApiMessagePart> = {}): ApiMessagePart => ({
+    partId,
+    mimeType,
+    headers: [{ name: "Content-Type", value: `${mimeType}; charset=utf-8` }],
+    body: { size: text.length, data: Buffer.from(text).toString("base64url") },
+    ...extra,
+  });
+  const ics = "BEGIN:VCALENDAR\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nSUMMARY:Q1 planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+  const none = async () => "";
+  // Exchange/Outlook: the event is only in the alternative's unnamed text/calendar part.
+  const exchange: ApiMessagePart = {
+    partId: "",
+    mimeType: "multipart/alternative",
+    body: { size: 0 },
+    parts: [leaf("0", "text/plain", "Q1 planning, Friday 10am"), leaf("1", "text/html", "<p>Q1 planning</p>"), leaf("2", "text/calendar", ics)],
+  };
+  const content = await extractContent(exchange, none);
+  assert.equal(content.text, "Q1 planning, Friday 10am");
+  assert.deepEqual(
+    content.attachments.map(({ filename, mimeType, partId }) => ({ filename, mimeType, partId })),
+    [{ filename: "invite.ics", mimeType: "text/calendar", partId: "2" }],
+  );
+  // Google Calendar also attaches invite.ics as a file: the event is listed once.
+  const google: ApiMessagePart = {
+    partId: "",
+    mimeType: "multipart/mixed",
+    body: { size: 0 },
+    parts: [{ ...exchange, partId: "0" }, { partId: "1", mimeType: "application/ics", filename: "invite.ics", headers: [], body: { attachmentId: "ATT1", size: ics.length } }],
+  };
+  const both = await extractContent(google, none);
+  assert.deepEqual(both.attachments.map((a) => `${a.filename} ${a.mimeType} ${a.partId}`), ["invite.ics application/ics 1"]);
+  // A calendar part alone is an attachment, not the body.
+  const only = await extractContent(leaf("", "text/calendar", ics), none);
+  assert.equal(only.text, undefined);
+  assert.equal(only.attachments[0].filename, "invite.ics");
+});

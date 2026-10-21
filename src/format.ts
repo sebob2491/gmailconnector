@@ -250,6 +250,8 @@ export const MAX_MIME_DEPTH = 64;
  * - Other multiparts (mixed, related, …) concatenate their body parts in order, so a body that
  *   Apple Mail splits around an inline attachment is kept whole.
  * - Attached emails (message/rfc822) are attachments; their text never becomes this message's body.
+ * - An unnamed text/calendar part (how Exchange and Outlook send an invitation) is listed as the
+ *   attachment "invite.ics", unless the email also attaches the event as a file (as Google Calendar does).
  * - Parts more than MAX_MIME_DEPTH levels down are ignored.
  * `loadData` fetches bodies Gmail stored out-of-line (large text parts carry only an attachmentId).
  */
@@ -275,6 +277,7 @@ export async function extractContent(
     const present = values.filter((v): v is string => v !== undefined);
     return present.length ? present.join("\n") : undefined;
   };
+  const invites: AttachmentInfo[] = [];
 
   const walk = async (part: ApiMessagePart, embedded: boolean, depth: number): Promise<{ text?: string; html?: string }> => {
     if (depth > MAX_MIME_DEPTH) return {};
@@ -307,11 +310,18 @@ export async function extractContent(
       const content = data ? decodeBody(data, header(part, "Content-Type")) : "";
       return mimeType === "text/plain" ? { text: content } : { html: content };
     }
-    if (part.filename || part.body?.attachmentId) addAttachment(part, "(unnamed)");
+    if (mimeType === "text/calendar" && !part.filename) {
+      addAttachment(part, "invite.ics");
+      invites.push(attachments[attachments.length - 1]);
+    } else if (part.filename || part.body?.attachmentId) addAttachment(part, "(unnamed)");
     return {};
   };
 
   const { text, html } = payload ? await walk(payload, false, 0) : {};
+  const calendarFile = (a: AttachmentInfo) => /^(?:text\/calendar|application\/ics)$/i.test(a.mimeType) || /\.(?:ics|vcs)$/i.test(a.filename);
+  if (invites.length && attachments.some((a) => !invites.includes(a) && calendarFile(a))) {
+    return { text, html, attachments: attachments.filter((a) => !invites.includes(a)) };
+  }
   return { text, html, attachments };
 }
 
