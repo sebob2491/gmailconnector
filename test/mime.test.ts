@@ -9,6 +9,7 @@ import {
   decodeCharset,
   extractContent,
   formatMessage,
+  hideQuotedHistory,
   parseAddressList,
   parseMailboxes,
   recipientsFrom,
@@ -566,4 +567,23 @@ test("dates are ISO 8601 to the second; a missing or broken internalDate falls b
   assert.equal((await at(String(Date.UTC(2026, 9, 20, 21, 9, 45, 123)))).date, "2026-10-20T21:09:45Z");
   assert.equal((await at(undefined)).date, "Tue, 20 Oct 2026 21:09:45 +0000");
   assert.equal((await at("not a time")).date, "Tue, 20 Oct 2026 21:09:45 +0000");
+});
+
+/** A conversation in which every reply quotes everything before it, Gmail style. */
+function quotingThread(count: number): string[] {
+  const bodies: string[] = [];
+  let previous = "";
+  for (let i = 0; i < count; i++) {
+    const own = `Hi team,\r\n\r\nUpdate ${i}: the numbers  for week ${i} are in.\u200b\r\nThanks,\r\nPerson ${i % 7}\r\n`;
+    const quote = previous.split("\r\n").map((line) => (line ? `> ${line}` : ">")).join("\r\n");
+    previous = i ? `${own}\r\nOn Mon, Jan ${(i % 28) + 1}, 2024 at 10:00 AM Person ${(i - 1) % 7} <p@example.com> wrote:\r\n\r\n${quote}` : own;
+    bodies.push(previous);
+  }
+  return bodies;
+}
+
+test("cutting the quoted history before cleaning a body gives the same text as after", () => {
+  for (const body of quotingThread(100)) {
+    assert.equal(cleanBody(hideQuotedHistory(body.replace(/\r\n?/g, "\n"))), hideQuotedHistory(cleanBody(body)));
+  }
 });

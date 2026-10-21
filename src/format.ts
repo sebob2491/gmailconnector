@@ -589,8 +589,10 @@ export async function formatMessage(
   if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {
     const content = await extractContent(p, loadData);
     const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
-    let body = cleanBody(bodyText(content));
+    // The quoted history is cut before cleaning, so the cleaning doesn't run over text that is dropped.
+    let body = bodyText(content).replace(/\r\n?/g, "\n");
     if (opts.hideQuotedHistory && format === "PLAIN_TEXT") body = hideQuotedHistory(body);
+    body = cleanBody(body);
     let shortenedLinks = 0;
     if (opts.shortenLinks && format === "PLAIN_TEXT") ({ text: body, shortened: shortenedLinks } = shortenLinks(body));
     const plain = limitLength(body, max);
