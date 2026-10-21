@@ -1,7 +1,19 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { test } from "node:test";
-import { bareAddress, cleanBody, cleanSnippet, decodeBody, decodeCharset, parseAddressList, parseMailboxes, recipientsFrom } from "../src/format.js";
+import {
+  bareAddress,
+  cleanBody,
+  cleanSnippet,
+  decodeBody,
+  decodeCharset,
+  extractContent,
+  formatMessage,
+  parseAddressList,
+  parseMailboxes,
+  recipientsFrom,
+  type ApiMessagePart,
+} from "../src/format.js";
 import { Base64UrlData, buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
 import { attachmentDataOf } from "../src/mailbox.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
@@ -346,3 +358,20 @@ test("an attachment's base64url text is sliced out of Gmail's JSON without parsi
   assert.equal(latin(attachmentDataOf(enc.encode('{"size": 0}'))), "");
 });
 
+
+/** A text/plain leaf wrapped in `depth` levels of multipart/mixed. */
+function nestedPayload(depth: number, text: string): ApiMessagePart {
+  let part: ApiMessagePart = { partId: "leaf", mimeType: "text/plain", headers: [], body: { size: text.length, data: Buffer.from(text).toString("base64url") } };
+  for (let i = 0; i < depth; i++) part = { partId: String(i), mimeType: "multipart/mixed", headers: [], body: { size: 0 }, parts: [part] };
+  return part;
+}
+
+test("deeply nested MIME trees don't overflow the stack; parts past 64 levels are ignored", async () => {
+  const none = async () => "";
+  assert.equal((await extractContent(nestedPayload(20, "found"), none)).text, "found");
+  assert.equal((await extractContent(nestedPayload(64, "found"), none)).text, "found");
+  assert.equal((await extractContent(nestedPayload(65, "too deep"), none)).text, undefined);
+  const msg = { id: "m", threadId: "t", payload: nestedPayload(20_000, "x") };
+  const out = await formatMessage(msg, "PLAIN_TEXT", "me@example.com", none);
+  assert.equal(out.plaintextBody, "");
+});

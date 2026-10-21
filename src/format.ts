@@ -241,12 +241,16 @@ export interface ExtractedContent {
   attachments: AttachmentInfo[];
 }
 
+/** Parts nested deeper than this are ignored (real emails nest a few levels; this keeps the walk off the stack limit). */
+export const MAX_MIME_DEPTH = 64;
+
 /**
  * Walks a message payload collecting its body text and HTML plus attachments.
  * - Inside multipart/alternative, the first non-empty text/plain and the last HTML version win.
  * - Other multiparts (mixed, related, …) concatenate their body parts in order, so a body that
  *   Apple Mail splits around an inline attachment is kept whole.
  * - Attached emails (message/rfc822) are attachments; their text never becomes this message's body.
+ * - Parts more than MAX_MIME_DEPTH levels down are ignored.
  * `loadData` fetches bodies Gmail stored out-of-line (large text parts carry only an attachmentId).
  */
 export async function extractContent(
@@ -272,20 +276,21 @@ export async function extractContent(
     return present.length ? present.join("\n") : undefined;
   };
 
-  const walk = async (part: ApiMessagePart, embedded: boolean): Promise<{ text?: string; html?: string }> => {
+  const walk = async (part: ApiMessagePart, embedded: boolean, depth: number): Promise<{ text?: string; html?: string }> => {
+    if (depth > MAX_MIME_DEPTH) return {};
     const mimeType = (part.mimeType ?? "").toLowerCase();
     const disposition = (header(part, "Content-Disposition") ?? "").toLowerCase();
     if (mimeType.startsWith("message/")) {
       if (part.body?.attachmentId || part.filename) {
         addAttachment(part, "attached-message.eml");
       } else {
-        for (const child of part.parts ?? []) await walk(child, true);
+        for (const child of part.parts ?? []) await walk(child, true, depth + 1);
       }
       return {};
     }
     if (part.parts?.length) {
       const results: { text?: string; html?: string }[] = [];
-      for (const child of part.parts) results.push(await walk(child, embedded));
+      for (const child of part.parts) results.push(await walk(child, embedded, depth + 1));
       if (mimeType === "multipart/alternative") {
         const texts = results.map((r) => r.text).filter((t): t is string => t !== undefined);
         const htmls = results.map((r) => r.html).filter((h): h is string => h !== undefined);
@@ -306,7 +311,7 @@ export async function extractContent(
     return {};
   };
 
-  const { text, html } = payload ? await walk(payload, false) : {};
+  const { text, html } = payload ? await walk(payload, false, 0) : {};
   return { text, html, attachments };
 }
 
