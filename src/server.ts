@@ -424,6 +424,12 @@ const messageListVisibilityArg = z
 
 const SEARCH_QUERY_HELP = `Optional. A Gmail search, as typed into Gmail's search box; turn natural language into it first. Plain words match anywhere in the email: prefer a few concise keywords, and broaden with OR rather than adding words. "an exact phrase" in quotes matches those words in that order; +word requires that exact word. Operators: from:/to:/cc:/bcc: (an address, part of one, or a name), deliveredto:, list: (a mailing list's address); subject:; after:/before: and newer:/older: with a YYYY/MM/DD date, or newer_than:/older_than: with a period such as 1d, 2w, 1m, 1y; label: with a label's display name (quote names with spaces: label:"Board Prep"; label IDs such as Label_123 match nothing); category: with primary, social, promotions, updates, forums, reservations or purchases; in: with inbox, archive, sent, snoozed, trash, spam or anywhere (Trash and Spam are only searched when the query asks for them); drafts are left out unless the query says in:draft; is: with unread, read, starred, important or muted; has: with attachment, drive, document, spreadsheet, presentation, youtube, userlabels, nouserlabels or a star such as yellow-star; filename: (a name or extension, e.g. filename:pdf); size:, larger:, smaller: with a size such as 10M; rfc822msgid: for a Message-ID header; "word1 AROUND 3 word2" finds the words within 3 words of each other. Terms are ANDed by default; OR (in capitals) or { } means any of them; a leading - excludes a term; ( ) groups terms. Gmail matches whole threads: a thread is returned when any of its emails matches, so -is:starred still returns threads that contain a starred email.`;
 
+/**
+ * Tool arguments as a strict object: an argument name the tool doesn't know (a typo such as `quary`)
+ * is an error that names it, instead of being dropped silently and the tool running without it.
+ */
+const strictArgs = <S extends z.ZodRawShape>(shape: S) => z.strictObject(shape);
+
 export const LOCAL_MANAGE_HINT =
   "To link one, run `node dist/src/index.js accounts add` in the connector's folder (or `gmail-multi-mcp accounts add` after `npm link`), once per Gmail account.";
 
@@ -501,7 +507,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "List linked Gmail accounts",
       description:
         "Lists the Gmail accounts linked to this connector, with their aliases, which one is the default, and each account's `status`. Use the email or alias as the `account` argument of other tools. If an account's status is \"needs re-link\", tell the user and pass on its `hint`: that account won't work until they link it again. The result also says how the user can link or remove accounts. An account's `addresses` lists the other addresses it can send from (send-as aliases), when it has any.",
-      inputSchema: {},
+      inputSchema: strictArgs({}),
       annotations: read,
     },
     async () =>
@@ -542,7 +548,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Search email threads",
       description:
         "Searches email threads in one or all linked Gmail accounts. Without `account` (or with \"all\"), every linked account is searched and the results are merged into one `threads` list, newest first, where each thread's `account` says which inbox it's in: mention it to the user, and pass it back when opening the thread. The pages come in true newest-first order across accounts: a page holds the newest threads of all accounts together and the next page continues where it stopped, so a page can hold fewer than pageSize × accounts threads; an account's problems are listed under `errors`, and `accountsWithMore` says which accounts have more. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: searchAccountArg,
         query: z.string().optional().describe(SEARCH_QUERY_HELP),
         pageSize: z
@@ -558,7 +564,7 @@ export function createServer(deps: ServerDeps): McpServer {
           .enum(["THREAD_VIEW_MINIMAL", "THREAD_VIEW_METADATA_ONLY"])
           .optional()
           .describe("Optional. THREAD_VIEW_MINIMAL (default) includes subject and snippet; THREAD_VIEW_METADATA_ONLY omits them."),
-      },
+      }),
       annotations: read,
     },
     async (args) =>
@@ -575,12 +581,12 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Get email thread",
       description:
         "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads. In PLAIN_TEXT, each reply's quoted copy of earlier messages is hidden when it can be recognised (Gmail, Apple Mail and Outlook quote styles), since those messages are in the result; get_message shows one email in full. With bodies, the thread's `subject` is given once; a message has its own `subject` only when it differs.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         threadId: z.string().describe("Required. The thread ID."),
         messageFormat: messageFormatArg,
         maxBodyChars: maxBodyCharsArg,
-      },
+      }),
       annotations: read,
     },
     async (args) =>
@@ -603,12 +609,12 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Get email message",
       description:
         "Retrieves one email message by ID from one Gmail account, including attachment info and `viewUrl`. For whole conversations use get_thread; for drafts use get_draft.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         messageId: z.string().describe("Required. The message ID."),
         messageFormat: messageFormatArg,
         maxBodyChars: maxBodyCharsArg,
-      },
+      }),
       annotations: read,
     },
     async (args) =>
@@ -629,7 +635,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "List drafts",
       description:
         "Lists draft emails in one or all linked Gmail accounts (grouped by account when several). Returns draft IDs, recipients, dates and `viewUrl`; set view to DRAFT_VIEW_FULL to include subject and plain-text body. Drafts Gmail couldn't return just then are listed under `unavailable`.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: multiAccountArg,
         query: z.string().optional().describe("Optional. Gmail search syntax to filter drafts, e.g. \"subject:proposal\" or \"to:bob@example.com\"."),
         pageSize: z.number().int().min(1).max(50).optional().describe("Optional. Drafts per account (default 20, max 50)."),
@@ -638,7 +644,7 @@ export function createServer(deps: ServerDeps): McpServer {
           .enum(["DRAFT_VIEW_METADATA_ONLY", "DRAFT_VIEW_FULL"])
           .optional()
           .describe("Optional. DRAFT_VIEW_METADATA_ONLY (default) or DRAFT_VIEW_FULL (adds subject and plaintextBody)."),
-      },
+      }),
       annotations: read,
     },
     async (args) =>
@@ -655,12 +661,12 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Get draft",
       description: "Retrieves a draft by ID from one Gmail account, including its `viewUrl` for editing in Gmail.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         draftId: z.string().describe("Required. The draft ID."),
         messageFormat: messageFormatArg,
         maxBodyChars: maxBodyCharsArg,
-      },
+      }),
       annotations: read,
     },
     async (args) =>
@@ -679,7 +685,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Create draft",
       description:
         "Creates a draft email in one Gmail account. To draft a reply, pass `replyToMessageId`: the draft is threaded with that message, addressed to its sender by default, and quotes the original. Returns the draft `id`, `threadId` and `viewUrl`.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         to: addressList("Primary recipients."),
         cc: addressList("Cc recipients."),
@@ -690,7 +696,7 @@ export function createServer(deps: ServerDeps): McpServer {
         includeSignature: includeSignatureArg,
         attachments: attachmentsArg,
         replyToMessageId: z.string().optional().describe("Optional. ID of a message (in the same account) this draft replies to."),
-      },
+      }),
       annotations: write,
     },
     async (args) =>
@@ -706,7 +712,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Update draft",
       description:
         "Updates a draft in one Gmail account with merge semantics: non-empty fields replace the draft's values, omitted fields are kept. Giving only one of body/htmlBody clears the other. Existing attachments are kept unless `attachments` is given (pass an empty list to remove them).",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         draftId: z.string().describe("Required. The draft ID."),
         to: addressList("Primary recipients (replaces existing when non-empty)."),
@@ -719,7 +725,7 @@ export function createServer(deps: ServerDeps): McpServer {
           .array(attachmentArg)
           .optional()
           .describe("Optional. Replaces the draft's attachments. Omit to keep the current ones; [] removes them."),
-      },
+      }),
       annotations: write,
     },
     async (args) =>
@@ -734,7 +740,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Delete draft",
       description: "Permanently deletes a draft from one Gmail account.",
-      inputSchema: { account: accountArg, draftId: z.string().describe("Required. The draft ID.") },
+      inputSchema: strictArgs({ account: accountArg, draftId: z.string().describe("Required. The draft ID.") }),
       annotations: destructive,
     },
     async (args) =>
@@ -752,7 +758,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Send email",
       description:
         "Sends an email immediately from the chosen Gmail account (`account` is required when several are linked). Either pass `draftId` to send an existing draft as is, or give recipients, subject and a body (or attachments). To send within an existing conversation, pass `replyThreadId` or `replyToMessageId` (from the same account). Returns the sent message's `id`, `threadId` and `labelIds`.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: sendAccountArg,
         draftId: z.string().optional().describe("Optional. ID of an existing draft to send; other content fields are then ignored."),
         to: addressList("Primary recipients. Required unless draftId, cc or bcc is given."),
@@ -765,7 +771,7 @@ export function createServer(deps: ServerDeps): McpServer {
         attachments: attachmentsArg,
         replyThreadId: z.string().optional().describe("Optional. Thread ID to send this message in."),
         replyToMessageId: z.string().optional().describe("Optional. Message ID this message replies to (sets threading headers)."),
-      },
+      }),
       annotations: sends,
     },
     async (args) =>
@@ -781,7 +787,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Reply to email",
       description:
         "Replies to a message from the Gmail account that received it (`account` is required when several are linked). Replies to the sender by default, or to everyone with `replyAll`. The original message is quoted below your text and the reply stays in the same thread. To reply to a thread, use get_thread and pass the ID of its latest message. `to`/`cc` replace the computed recipients; the user's own addresses are never included.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: sendAccountArg,
         messageId: z.string().describe("Required. ID of the message to reply to."),
         body: bodyArg,
@@ -792,7 +798,7 @@ export function createServer(deps: ServerDeps): McpServer {
         cc: addressList("Overrides the default Cc recipients."),
         bcc: addressList("Bcc recipients."),
         attachments: attachmentsArg,
-      },
+      }),
       annotations: sends,
     },
     async (args) =>
@@ -808,7 +814,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Forward email",
       description:
         "Forwards a message (with its attachments) from the Gmail account that holds it (`account` is required when several are linked). If its attachments are too large to re-attach here, the error says so and links to the email so the user can forward it in Gmail. Optional comments go above the forwarded content via `forwardText` (plain text) or `htmlBody`.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: sendAccountArg,
         messageId: z.string().describe("Required. ID of the message to forward."),
         to: addressList("Primary recipients."),
@@ -821,7 +827,7 @@ export function createServer(deps: ServerDeps): McpServer {
           .array(attachmentArg)
           .optional()
           .describe("Optional. Attachments to add, sent along with the original's. Together they cannot exceed 25MB (less on the hosted connector)."),
-      },
+      }),
       annotations: sends,
     },
     async (args) =>
@@ -839,7 +845,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "List labels",
       description:
         "Lists labels (system and user) with their IDs for one or all linked Gmail accounts (grouped by account when several). Label IDs differ between accounts.",
-      inputSchema: { account: multiAccountArg },
+      inputSchema: strictArgs({ account: multiAccountArg }),
       annotations: read,
     },
     async (args) =>
@@ -866,14 +872,14 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Create label",
       description:
         "Creates a label in one Gmail account. Nested labels use '/', e.g. 'Projects/Alpha'; missing parent labels are created automatically unless autoCreateParentLabels is false.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         displayName: z.string().describe("Required. Label name; use '/' for nesting."),
         autoCreateParentLabels: z.boolean().optional().describe("Optional. Create missing parent labels. Defaults to true."),
         colorPreset: colorPresetArg,
         labelListVisibility: labelListVisibilityArg,
         messageListVisibility: messageListVisibilityArg,
-      },
+      }),
       annotations: write,
     },
     async (args) =>
@@ -888,14 +894,14 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Update label",
       description: "Renames a label or changes its color/visibility in one Gmail account.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         labelId: z.string().describe("Required. Label ID or current display name."),
         displayName: z.string().optional().describe("Optional. New name."),
         colorPreset: colorPresetArg,
         labelListVisibility: labelListVisibilityArg,
         messageListVisibility: messageListVisibilityArg,
-      },
+      }),
       annotations: write,
     },
     async (args) =>
@@ -910,7 +916,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Delete label",
       description: "Deletes a user label from one Gmail account (messages keep existing, they just lose the label).",
-      inputSchema: { account: accountArg, labelId: z.string().describe("Required. Label ID or display name.") },
+      inputSchema: strictArgs({ account: accountArg, labelId: z.string().describe("Required. Label ID or display name.") }),
       annotations: destructive,
     },
     async (args) =>
@@ -931,11 +937,11 @@ export function createServer(deps: ServerDeps): McpServer {
       name,
       {
         description,
-        inputSchema: {
+        inputSchema: strictArgs({
           account: accountArg,
           [idKey]: z.string().describe(`Required. The ${kind === "messages" ? "message" : "thread"} ID.`),
           labelIds: labelIdsArg,
-        } as { account: typeof accountArg; labelIds: typeof labelIdsArg } & Record<string, z.ZodString>,
+        } as z.ZodRawShape),
         annotations: write,
       },
       async (args: Record<string, any>) =>
@@ -959,12 +965,12 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Add and remove message labels",
       description: "Atomically adds and/or removes labels on one message, e.g. to move it between labels in a single call.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         messageId: z.string().describe("Required. The message ID."),
         addLabelIds: labelIdsArg.optional(),
         removeLabelIds: labelIdsArg.optional(),
-      },
+      }),
       annotations: write,
     },
     async (args) =>
@@ -982,7 +988,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Read attachment",
       description:
         "Reads an email attachment from one Gmail account. Text files, CSV, HTML, calendar invites, Word (.docx), Excel (.xlsx) and PowerPoint (.pptx) come back as text; images come back as images you can see; PDFs come back as text when it can be extracted, otherwise as the PDF file (for clients that read PDFs). Identify the attachment by `partId` or `filename` from get_message/get_thread (with neither, a message's only attachment is used).",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: accountArg,
         messageId: z.string().describe("Required. ID of the message the attachment is on."),
         partId: z.string().optional().describe("Optional. The attachment's partId from get_message/get_thread (preferred)."),
@@ -994,7 +1000,7 @@ export function createServer(deps: ServerDeps): McpServer {
           .min(0)
           .optional()
           .describe("Optional. Longest text to return (default 20000; 0 for as much as can be read, up to 1,000,000 characters)."),
-      },
+      }),
       annotations: read,
     },
     async (args) =>
@@ -1153,13 +1159,13 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Change many emails at once",
       description:
         "Archives, moves to the inbox, marks read/unread, stars/unstars, or adds/removes labels on many emails at once, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. With a query or threads, only emails that don't already have the change are counted and changed. If a run stops partway, the result has `changed` (what went through) and `error`; tell the user both. Run with dryRun: true first, tell the user how many emails will change (with the preview), and only then run it for real.",
-      inputSchema: {
+      inputSchema: strictArgs({
         ...bulkSelection,
         action: z
           .enum(["archive", "move_to_inbox", "mark_read", "mark_unread", "star", "unstar", "add_labels", "remove_labels"])
           .describe("Required. What to do to the selected emails."),
         labelIds: labelIdsArg.optional().describe("Label IDs or names, for add_labels/remove_labels. Labels are per account."),
-      },
+      }),
       annotations: write,
     },
     async (args) => runBulk(args),
@@ -1171,10 +1177,10 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Trash or report many emails",
       description:
         "Moves many emails to Trash, or marks them as spam, in one or every linked account. Select emails with a Gmail search `query` (across all accounts by default) or with `threadIds`/`messageIds` from one account. With a query or threads, only emails that don't already have the change are counted and changed. If a run stops partway, the result has `changed` (what went through) and `error`; tell the user both. Always run with dryRun: true first, show the user how many emails (and which) will be affected, and get their confirmation before running it for real. Trashed emails can be restored from Trash for 30 days.",
-      inputSchema: {
+      inputSchema: strictArgs({
         ...bulkSelection,
         action: z.enum(["trash", "spam"]).describe("Required. trash moves emails to Trash; spam reports them as spam."),
-      },
+      }),
       annotations: destructive,
     },
     async (args) => runBulk(args),
@@ -1274,7 +1280,7 @@ export function createServer(deps: ServerDeps): McpServer {
       title: "Unsubscribe from senders",
       description:
         "Unsubscribes the user from newsletters and store or alert emails, in one or every linked account. Choose the emails with a Gmail search `query` (e.g. \"from:levi.com\" or \"category:promotions newer_than:30d\"; every account by default) or `messageIds` from one account. The newest matching emails are grouped by account and sender, and each sender is unsubscribed once, the way its emails' List-Unsubscribe header offers: `one-click` (the connector sends the sender's standard one-click request), `email` (sends an unsubscribe email from that account; it shows up in Sent), `link` (the sender only offers a web page: give the user the link; the connector never opens links), or `none` (no unsubscribe option: suggest bulk_trash or bulk_update, or a Gmail filter). ALWAYS run with dryRun: true first, show the user the plan (account, sender, method) and get their OK before running it for real. Afterwards, bulk_update (archive) or bulk_trash with the same query can clear the emails already received. Don't use it on spam: unsubscribing confirms the address to spammers, so mark it as spam with bulk_trash instead.",
-      inputSchema: {
+      inputSchema: strictArgs({
         account: z
           .string()
           .optional()
@@ -1289,7 +1295,7 @@ export function createServer(deps: ServerDeps): McpServer {
           .optional()
           .describe("Optional. Most senders to handle per run, across all accounts (default 10, max 20). Senders with the most emails come first."),
         dryRun: z.boolean().optional().describe("Optional. Show the plan for each sender without doing anything."),
-      },
+      }),
       annotations: sends,
     },
     async (args) =>
@@ -1378,10 +1384,10 @@ export function createServer(deps: ServerDeps): McpServer {
       name,
       {
         description,
-        inputSchema: {
+        inputSchema: strictArgs({
           account: accountArg,
           [idKey]: z.string().describe(`Required. The ${kind === "messages" ? "message" : "thread"} ID.`),
-        } as { account: typeof accountArg } & Record<string, z.ZodString>,
+        } as z.ZodRawShape),
         annotations,
       },
       async (args: Record<string, any>) =>

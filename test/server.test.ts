@@ -192,12 +192,24 @@ describe("tool catalogue", () => {
     for (const tool of tools.filter((t) => t.name !== "list_accounts")) {
       assert.ok((tool.inputSchema.properties as Record<string, unknown>).account, `${tool.name} takes an account`);
     }
+    for (const tool of tools) assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} refuses unknown arguments`);
     const labelThread = tools.find((t) => t.name === "label_thread")!;
     assert.deepEqual(labelThread.inputSchema.required?.sort(), ["labelIds", "threadId"]);
   });
 });
 
 describe("accounts", () => {
+  test("a misspelt argument is an error, not silently dropped", async () => {
+    const { call, fake } = await setup();
+    const res = await call("search_threads", { account: "work", quary: "from:boss" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /Invalid arguments for tool search_threads.*quary/s);
+    assert.ok(!fake.requests.some((r) => r.path === "threads"), "nothing was searched");
+    const labelled = await call("label_thread", { account: "work", threadId: "wt1", labels: ["STARRED"] });
+    assert.match(labelled.text, /labels/);
+    assert.equal((await call("list_accounts", { verbose: true })).isError, true);
+  });
+
   test("list_accounts shows every linked account", async () => {
     const { call } = await setup({ defaultAccount: "work" });
     const res = await call("list_accounts");
@@ -428,8 +440,13 @@ describe("sending", () => {
     assert.equal(mime.get("To"), "Bob <bob@example.com>, carol@example.com");
     assert.equal(mime.get("Cc"), '"Doe, Jane" <jane@example.com>');
     assert.equal(mime.get("Bcc"), "Dan <dan@example.com>");
-    for (const tool of ["reply", "create_draft", "forward"] as const) {
-      const r = await call(tool, { account: "work", messageId: "w1", to: ["Ann Lee <ann@example.com>"], body: "x", forwardText: "x" });
+    const named = ["Ann Lee <ann@example.com>"];
+    for (const [tool, args] of [
+      ["reply", { messageId: "w1", to: named, body: "x" }],
+      ["create_draft", { to: named, body: "x" }],
+      ["forward", { messageId: "w1", to: named, forwardText: "x" }],
+    ] as const) {
+      const r = await call(tool, { account: "work", ...args });
       assert.equal(r.isError, false, `${tool}: ${r.text}`);
     }
     assert.equal(inspectMime(fake.sentBy(WORK)[1].raw).get("To"), "Ann Lee <ann@example.com>");
