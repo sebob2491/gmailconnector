@@ -38,46 +38,61 @@ export function header(part: ApiMessagePart | undefined, name: string): string |
   return part?.headers?.find((h) => h.name.toLowerCase() === lower)?.value;
 }
 
+/** Address headers are read up to this length (Gmail's never come near it); the rest is ignored. */
+export const MAX_ADDRESS_HEADER = 64 * 1024;
+
+/** An address header cut to MAX_ADDRESS_HEADER, at the last comma before it so no address is cut in two. */
+function addressHeader(value: string): string {
+  if (value.length <= MAX_ADDRESS_HEADER) return value;
+  const comma = value.lastIndexOf(",", MAX_ADDRESS_HEADER);
+  return value.slice(0, comma > 0 ? comma : MAX_ADDRESS_HEADER);
+}
+
 /** Splits an address-list header on commas that are outside quotes, comments and angle brackets. */
 export function parseAddressList(value: string | undefined): string[] {
   if (!value) return [];
+  const text = addressHeader(value);
   const out: string[] = [];
-  let current = "";
+  let start = 0;
   let quoted = false;
   let angle = 0;
   let paren = 0;
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i];
-    if (ch === "\\" && quoted) {
-      current += ch + (value[++i] ?? "");
-      continue;
-    }
-    if (ch === '"') quoted = !quoted;
-    else if (!quoted && ch === "<") angle++;
-    else if (!quoted && ch === ">") angle = Math.max(0, angle - 1);
-    else if (!quoted && ch === "(") paren++;
-    else if (!quoted && ch === ")") paren = Math.max(0, paren - 1);
-    if (ch === "," && !quoted && !angle && !paren) {
-      if (current.trim()) out.push(current.trim());
-      current = "";
-    } else {
-      current += ch;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (quoted) {
+      if (c === 92 /* \ */) i++;
+      else if (c === 34 /* " */) quoted = false;
+    } else if (c === 34) quoted = true;
+    else if (c === 60 /* < */) angle++;
+    else if (c === 62 /* > */) angle = Math.max(0, angle - 1);
+    else if (c === 40 /* ( */) paren++;
+    else if (c === 41 /* ) */) paren = Math.max(0, paren - 1);
+    else if (c === 44 /* , */ && !angle && !paren) {
+      const item = text.slice(start, i).trim();
+      if (item) out.push(item);
+      start = i + 1;
     }
   }
-  if (current.trim()) out.push(current.trim());
+  const last = text.slice(start).trim();
+  if (last) out.push(last);
   return out;
 }
 
 /**
  * Parses an address-list header (RFC 5322, leniently) into mailboxes. Handles quoted display names
  * (which may contain commas or "<...>"), comments such as `root@host (Cron Daemon)`, and groups such
- * as `undisclosed-recipients:;` or `Team: a@x.com, b@y.com;`, whose names are dropped.
+ * as `undisclosed-recipients:;` or `Team: a@x.com, b@y.com;`, whose names are dropped. Text is taken
+ * in slices between the characters that matter, so the work is linear in the header's length.
  */
 export function parseMailboxes(value: string | undefined): Mailbox[] {
   const out: Mailbox[] = [];
   if (!value) return out;
-  let text = "";
-  let comment = "";
+  const header = addressHeader(value);
+  const n = header.length;
+  let text = ""; // the current mailbox, without comments
+  let comment = ""; // the text of its comments
+  let run = 0; // where the text not yet added to `text` starts
+  let commentRun = 0; // the same inside a comment
   let quoted = false;
   let depth = 0;
   let angle = false;
@@ -87,38 +102,43 @@ export function parseMailboxes(value: string | undefined): Mailbox[] {
     text = "";
     comment = "";
   };
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i];
+  for (let i = 0; i < n; i++) {
+    const c = header.charCodeAt(i);
     if (quoted) {
-      text += ch;
-      if (ch === "\\") text += value[++i] ?? "";
-      else if (ch === '"') quoted = false;
+      if (c === 92 /* \ */) i++;
+      else if (c === 34 /* " */) quoted = false;
     } else if (depth) {
-      if (ch === "\\") comment += value[++i] ?? "";
-      else if (ch === "(") depth++;
-      else if (ch === ")") depth--;
-      else comment += ch;
+      // In a comment: nested parentheses are left out, and a backslash keeps just the character after it.
+      if (c === 92) {
+        comment += header.slice(commentRun, i) + header.charAt(i + 1);
+        commentRun = ++i + 1;
+      } else if (c === 40 /* ( */ || c === 41 /* ) */) {
+        comment += header.slice(commentRun, i);
+        commentRun = i + 1;
+        depth += c === 40 ? 1 : -1;
+        if (!depth) run = i + 1;
+      }
     } else if (angle) {
-      text += ch;
-      if (ch === ">") angle = false;
-    } else if (ch === '"') {
-      quoted = true;
-      text += ch;
-    } else if (ch === "(") {
+      if (c === 62 /* > */) angle = false;
+    } else if (c === 34) quoted = true;
+    else if (c === 40) {
+      text += header.slice(run, i);
       depth = 1;
-    } else if (ch === "<") {
-      angle = true;
-      text += ch;
-    } else if (ch === ":") {
+      commentRun = i + 1;
+    } else if (c === 60 /* < */) angle = true;
+    else if (c === 58 /* : */) {
       // Start of a group: what came before is the group's name, not an address.
       text = "";
       comment = "";
-    } else if (ch === "," || ch === ";") {
+      run = i + 1;
+    } else if (c === 44 /* , */ || c === 59 /* ; */) {
+      text += header.slice(run, i);
       flush();
-    } else {
-      text += ch;
+      run = i + 1;
     }
   }
+  if (depth) comment += header.slice(commentRun);
+  else text += header.slice(run);
   flush();
   return out;
 }

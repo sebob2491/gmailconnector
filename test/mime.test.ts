@@ -378,6 +378,117 @@ test("group syntax and comments parse into real mailboxes", () => {
   ]);
 });
 
+/** parseMailboxes and parseAddressList as they were written before (a character at a time), as references. */
+function referenceAddressList(value: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quoted = false;
+  let angle = 0;
+  let paren = 0;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === "\\" && quoted) {
+      current += ch + (value[++i] ?? "");
+      continue;
+    }
+    if (ch === '"') quoted = !quoted;
+    else if (!quoted && ch === "<") angle++;
+    else if (!quoted && ch === ">") angle = Math.max(0, angle - 1);
+    else if (!quoted && ch === "(") paren++;
+    else if (!quoted && ch === ")") paren = Math.max(0, paren - 1);
+    if (ch === "," && !quoted && !angle && !paren) {
+      if (current.trim()) out.push(current.trim());
+      current = "";
+    } else current += ch;
+  }
+  if (current.trim()) out.push(current.trim());
+  return out;
+}
+
+function referenceMailboxes(value: string): { name?: string; address: string }[] {
+  const unquote = (name: string) => {
+    const trimmed = name.trim();
+    return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"') ? trimmed.slice(1, -1).replace(/\\(.)/g, "$1").trim() : trimmed;
+  };
+  const toMailbox = (text: string, comment: string) => {
+    const segment = text.trim();
+    if (!segment) return undefined;
+    const angle = /<([^<>]*)>\s*$/.exec(segment);
+    const raw = (angle ? angle[1] : segment).trim();
+    const address = raw.includes('"') ? raw : raw.replace(/\s+/g, "");
+    if (!address.includes("@")) return undefined;
+    const name = angle ? unquote(segment.slice(0, angle.index)) : comment.trim();
+    return { address, ...(name ? { name } : {}) };
+  };
+  const out: { name?: string; address: string }[] = [];
+  let text = "";
+  let comment = "";
+  let quoted = false;
+  let depth = 0;
+  let angle = false;
+  const flush = () => {
+    const mailbox = toMailbox(text, comment);
+    if (mailbox) out.push(mailbox);
+    text = "";
+    comment = "";
+  };
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (quoted) {
+      text += ch;
+      if (ch === "\\") text += value[++i] ?? "";
+      else if (ch === '"') quoted = false;
+    } else if (depth) {
+      if (ch === "\\") comment += value[++i] ?? "";
+      else if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      else comment += ch;
+    } else if (angle) {
+      text += ch;
+      if (ch === ">") angle = false;
+    } else if (ch === '"') {
+      quoted = true;
+      text += ch;
+    } else if (ch === "(") depth = 1;
+    else if (ch === "<") {
+      angle = true;
+      text += ch;
+    } else if (ch === ":") {
+      text = "";
+      comment = "";
+    } else if (ch === "," || ch === ";") flush();
+    else text += ch;
+  }
+  flush();
+  return out;
+}
+
+test("address headers parse as before, in linear time, up to 64 KB", () => {
+  let seed = 11;
+  const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+  const tokens = ["a@b.c", "x", " ", "<", ">", "(", ")", '"', "\\", ",", ";", ":", "@", "Doe, J", "<j@x.y>", "(c)", '"q\\"q"', "é", "\r\n "];
+  for (let i = 0; i < 3000; i++) {
+    let header = "";
+    const length = Math.floor(random() * 24);
+    for (let j = 0; j < length; j++) header += tokens[Math.floor(random() * tokens.length)];
+    assert.deepEqual(parseAddressList(header), referenceAddressList(header), JSON.stringify(header));
+    assert.deepEqual(parseMailboxes(header), referenceMailboxes(header), JSON.stringify(header));
+  }
+  for (const header of ["<".repeat(1024 * 1024) + ">", "(".repeat(1024 * 1024) + "a@b.c", '"'.repeat(1024 * 1024), "x ".repeat(512 * 1024) + "<a@b.c>", "a@b.c, ".repeat(150_000)]) {
+    const start = process.cpuUsage();
+    parseMailboxes(header);
+    parseAddressList(header);
+    recipientsFrom(header);
+    const used = process.cpuUsage(start);
+    assert.ok((used.user + used.system) / 1000 < 50, `${JSON.stringify(header.slice(0, 6))}: ${(used.user + used.system) / 1000} ms`);
+  }
+  // Only the first 64 KB is read, and no address is cut in two there.
+  const list = Array.from({ length: 5000 }, (_, i) => `person${i}@example.com`).join(", ");
+  const parsed = parseAddressList(list);
+  assert.ok(parsed.length > 2000 && parsed.length < 5000, `${parsed.length}`);
+  assert.equal(parsed.at(-1), `person${parsed.length - 1}@example.com`);
+});
+
 test("invisible padding is removed, but joiners that are part of words are kept", () => {
   // Preview padding: combining grapheme joiner, no-break space and zero-width non-joiner runs.
   assert.equal(cleanSnippet("Sale ͏ ‌͏ ‌͏ ‌ ends &zwnj;&nbsp;now"), "Sale ends now");
