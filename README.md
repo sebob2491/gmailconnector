@@ -47,7 +47,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   PDFs don't break mid-sentence) and filled-in form fields included. Spreadsheets keep empty cells in
   place and show dates as dates; Word tables come out row by row. Text files are decoded in their own
   character set. Very large files (and booby-trapped ones) are read only as far as needed, with a
-  note saying what was left out.
+  note saying what was left out. Emails list their attachments with file name, type, size and a stable
+  `partId`, which is what `get_attachment` takes (Gmail's attachment IDs, often hundreds of characters
+  long, are left out of results).
   Files that can't be shown (unreadable types over 1 MB, images over 4 MB, anything over 8 MB to read as text) are refused from their listed size and type before anything is downloaded, and the email's own bodies are never decoded just to find an attachment.
 - New `bulk_update` and `bulk_trash` tools: archive, mark read/unread, star, label, trash or report as
   spam many emails at once, across every account, chosen with a Gmail search (e.g. "archive all
@@ -73,22 +75,29 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   senders per run (`maxSenders` up to 20); the emails you already have stay until you archive or trash
   them with the bulk tools.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
+  HTML-only emails are converted the way a browser shows them, without what the sender hid (a
+  newsletter's preview text, mobile-only copies of the content), and tables come out one row per line
+  with tabs between cells, also when Outlook puts a paragraph in every cell.
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`
   and the subject its first email had. Results are compact: one-email threads are shown flat, previews
   are cleaned of the invisible padding and HTML codes that marketing emails contain, and recipients are
   listed only when an email wasn't addressed to just you. A 50-email search comes back about half the
   size of the raw Gmail data. The search help Claude sees covers Gmail's full operator syntax.
 - `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
-  how much was left out). Pass `maxBodyChars: 0` for the full text. Replies and forwards always use the
-  whole email.
+  so, and how much was left out when the body was read whole). Only the start of a long body is read
+  and converted, so a 2 MB newsletter takes a few milliseconds. Pass `maxBodyChars: 0` for the full
+  text. Replies and forwards always use the whole email.
 - `get_message` and `get_thread` cut links longer than 200 characters (almost always marketing tracking
   redirects) to their website, e.g. `https://click.shop.com/…`, with a note saying so. A typical store
   email shrinks from tens of thousands of characters to a few thousand. `messageFormat: "FULL_CONTENT"`
   returns the full links. Drafts are never shortened, so editing one can't break its links.
-- `get_thread` hides each reply's quoted copy of the earlier messages ("On … wrote:" and below), since
-  those messages are in the result anyway. A real 13-email conversation went from about 41,000 to 4,700
-  characters. Replies that answer between quoted lines are left alone, and `get_message` still shows any
-  one email in full. With bodies, the subject is given once for the thread (and on a message only when
+- `get_thread` hides each reply's quoted copy of an earlier message of the thread ("On … wrote:" and
+  below, or Outlook's From/Sent header block, as Gmail, Apple Mail, Outlook and Thunderbird write them
+  in English, German, French, Spanish, Italian, Dutch and other languages), since those messages are in
+  the result anyway. A real 13-email conversation went from about 41,000 to 4,700 characters. Only text
+  that copies an earlier message of the thread is hidden: forwarded emails, quotes of emails from
+  elsewhere and replies that answer between quoted lines are left alone, and `get_message` still shows
+  any one email in full. With bodies, the subject is given once for the thread (and on a message only when
   it changes), and messages don't repeat their preview snippet or the thread ID.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.

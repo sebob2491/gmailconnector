@@ -1,0 +1,15 @@
+FYI, see below.
+
+---------- Forwarded message ---------
+From: Vendor Support <support@vendor.example>
+Date: Tue, Jan 2, 2024 at 4:15 PM
+Subject: Ticket #4521
+To: Sebastian <me@example.com>
+
+
+Hi Sebastian,
+
+We have identified the cause. A fix will ship on Jan 4.
+
+Regards,
+Priya

@@ -8,7 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
 import { setRetryWait, TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
-import { decodeBase64Url, isPrivateAddress, registrableDomain, sendAsCache, withoutBodyData } from "../src/mailbox.js";
+import { decodeBase64Url, isPrivateAddress, registrableDomain, sendAsCache, unsubscribeOptions, withoutBodyData } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -398,7 +398,8 @@ describe("reading", () => {
     assert.equal(msg.htmlBody, undefined);
     assert.equal(msg.attachments[0].filename, "report.pdf");
     assert.equal(msg.attachments[0].mimeType, "application/pdf");
-    assert.ok(msg.attachments[0].id);
+    assert.equal(msg.attachments[0].partId, "1");
+    assert.equal(msg.attachments[0].id, undefined, "Gmail's long attachment IDs aren't listed");
   });
 
   test("get_message FULL_CONTENT includes the HTML body; METADATA_ONLY omits subject", async () => {
@@ -408,6 +409,7 @@ describe("reading", () => {
     const meta = await call("get_message", { account: WORK, messageId: "w1", messageFormat: "METADATA_ONLY" });
     assert.equal(meta.json.subject, undefined);
     assert.equal(meta.json.sender, "Boss <boss@work.example>");
+    assert.match(meta.json.date, /^2026-09-01T12:\d\d:\d\dZ$/, "dates are given to the second");
   });
 });
 
@@ -561,7 +563,7 @@ describe("drafts", () => {
     assert.deepEqual(got.json.toRecipients, ["x@example.com"]);
     assert.equal(got.json.plaintextBody, "See attached.");
     assert.equal(got.json.attachments[0].filename, "invoice.txt");
-    const attId = got.json.attachments[0].id;
+    const attId = personal.messages.get(got.json.messageId)!.payload!.parts!.find((p) => p.filename === "invoice.txt")!.body!.attachmentId;
     assert.equal(Buffer.from(personal.attachments.get(`${got.json.messageId}/${attId}`)!, "base64url").toString(), "invoice-bytes");
 
     await call("update_draft", { account: "personal", draftId: created.json.id, attachments: [] });
@@ -1098,8 +1100,14 @@ describe("cleaner, smaller results", () => {
     });
     const short = await call("get_message", { account: "personal", messageId: "huge" });
     assert.ok(short.json.plaintextBody.length <= 20_000);
-    // 50,000 characters, less the trailing space that cleaning trims, less the 20,000 shown.
-    assert.match(short.json.truncated, /^Body shortened: 29,999 more characters not shown/);
+    // Only the start of a body far over the limit is read, so the note can't say how much more there is.
+    assert.equal(short.json.truncated, "Body shortened; the rest is available with maxBodyChars: 0.");
+    // One read whole says how much was left out: 25,000 characters, less the trailing space, less 20,000.
+    fake.deliver(personal, crlf(["From: news@example.com", `To: ${PERSONAL}`, "Subject: Long", "Content-Type: text/plain", "", "word ".repeat(5_000)]), {
+      id: "long",
+    });
+    const counted = await call("get_message", { account: "personal", messageId: "long" });
+    assert.match(counted.json.truncated, /^Body shortened: 4,999 more characters not shown/);
 
     const custom = await call("get_message", { account: "personal", messageId: "huge", maxBodyChars: 500 });
     assert.equal(custom.json.plaintextBody.length, 500);
@@ -1180,6 +1188,47 @@ describe("cleaner, smaller results", () => {
     assert.match(one.json.plaintextBody, /wrote:\n\n> Can you do Friday\?\n>$/);
   });
 
+  test("get_thread hides Outlook and Apple Mail quotes of earlier messages, but never a forwarded email", async () => {
+    const { call, fake, personal } = await setup();
+    const mail = (id: string, from: string, subject: string, body: string[]) =>
+      fake.deliver(personal, crlf([`From: ${from}`, `To: ${PERSONAL}`, `Subject: ${subject}`, "Content-Type: text/plain; charset=UTF-8", "", ...body]), {
+        id,
+        threadId: "mixed",
+      });
+    mail("m0", "Hans <hans@example.de>", "Treffen", ["Können wir uns am Montag treffen?"]);
+    mail("m1", "Me <me@example.com>", "AW: Treffen", [
+      "Passt, danke!",
+      "",
+      "Von: Hans <hans@example.de>",
+      "Gesendet: Montag, 1. Januar 2024 10:00",
+      "An: Me <me@example.com>",
+      "Betreff: Treffen",
+      "",
+      "Können wir uns am Montag treffen?",
+    ]);
+    // The forwarded email (fuzz repro thread-forward-hidden.txt) isn't in the thread: it stays.
+    mail("m2", "Me <me@example.com>", "Fwd: Ticket #4521", [
+      "FYI, see below.",
+      "",
+      "---------- Forwarded message ---------",
+      "From: Vendor Support <support@vendor.example>",
+      "Date: Tue, Jan 2, 2024 at 4:15 PM",
+      "Subject: Ticket #4521",
+      "To: Sebastian <me@example.com>",
+      "",
+      "",
+      "Hi Sebastian,",
+      "",
+      "We have identified the cause. A fix will ship on Jan 4.",
+    ]);
+    mail("m3", "Hans <hans@example.de>", "Re: Treffen", ["Super.", "", "> Am 01.01.2024 um 10:05 schrieb Me <me@example.com>:", "> ", "> Passt, danke!", "> "]);
+    const thread = await call("get_thread", { account: "personal", threadId: "mixed" });
+    const bodies = thread.json.messages.map((m: any) => m.plaintextBody);
+    assert.equal(bodies[1], "Passt, danke!\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+    assert.match(bodies[2], /---------- Forwarded message ---------\nFrom: Vendor Support[^]*A fix will ship on Jan 4\.$/);
+    assert.equal(bodies[3], "Super.\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+  });
+
   test("long tracking links are cut to their site when reading, but kept in drafts and FULL_CONTENT", async () => {
     const { call, fake, personal } = await setup();
     const tracking = `https://click.mail.shop.example/c2/abc?jwt=${"x".repeat(1500)}`;
@@ -1238,6 +1287,42 @@ function withAttachments(from: string, to: string, subject: string, files: { nam
     "--ATT--",
   ]);
 }
+
+test("an Outlook invite's unnamed calendar part is listed as invite.ics", async () => {
+  const { call, fake, personal } = await setup();
+  fake.deliver(
+    personal,
+    crlf([
+      "From: Jane <jane@example.com>",
+      `To: ${PERSONAL}`,
+      "Subject: Q1 planning",
+      'Content-Type: multipart/alternative; boundary="ALT"',
+      "",
+      "--ALT",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      "When: Friday 10am",
+      "--ALT",
+      "Content-Type: text/html; charset=utf-8",
+      "",
+      "<p>When: Friday 10am</p>",
+      "--ALT",
+      "Content-Type: text/calendar; charset=utf-8; method=REQUEST",
+      "",
+      "BEGIN:VCALENDAR",
+      "METHOD:REQUEST",
+      "END:VCALENDAR",
+      "--ALT--",
+    ]),
+    { id: "invite" },
+  );
+  const res = await call("get_message", { account: "personal", messageId: "invite" });
+  assert.equal(res.json.plaintextBody, "When: Friday 10am");
+  assert.deepEqual(
+    res.json.attachments.map(({ filename, mimeType, partId }: any) => ({ filename, mimeType, partId })),
+    [{ filename: "invite.ics", mimeType: "text/calendar", partId: "2" }],
+  );
+});
 
 describe("reading attachments", () => {
   const files = [
@@ -2171,6 +2256,30 @@ describe("unsubscribe", () => {
     const real = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
     assert.deepEqual(ctx.web.requests.map((r) => r.url), ["https://unsub.five.example/u/x?t=1"]);
     assert.equal(real.json.summary.failed, 4);
+  });
+
+  test("List-Unsubscribe is read in one pass, and only its first 8 KB", () => {
+    const post = "List-Unsubscribe=One-Click";
+    // 100,000 "<" (fuzz repro unsub-header-100k-lt.txt) took 3.3 s with the regex that was used.
+    for (const header of ["<".repeat(100_000), "<a".repeat(50_000), `${"<".repeat(50_000)}>`, ",".repeat(1_000_000)]) {
+      const start = process.cpuUsage();
+      assert.deepEqual(unsubscribeOptions(header, post), {});
+      const used = process.cpuUsage(start);
+      assert.ok((used.user + used.system) / 1000 < 50, `${header.slice(0, 2)}…: ${(used.user + used.system) / 1000} ms`);
+    }
+    // Entries are what lies between the "<" nearest a ">" and that ">"; stray text around them doesn't matter.
+    assert.deepEqual(unsubscribeOptions("junk < <https://news.example.com/u?x=1>, <mailto:u@news.example.com?subject=stop>", post), {
+      link: "https://news.example.com/u?x=1",
+      oneClick: "https://news.example.com/u?x=1",
+      mailto: { to: "u@news.example.com", subject: "stop", body: "unsubscribe" },
+    });
+    // Past 8 KB nothing is read, and an entry cut off there isn't used.
+    const padding = " ".repeat(9000);
+    assert.equal(unsubscribeOptions(`<https://a.example.com/u>${padding}<https://b.example.com/u>`, undefined).link, "https://a.example.com/u");
+    assert.deepEqual(unsubscribeOptions(`${" ".repeat(8000)}<https://cut.example.com/${"u".repeat(500)}>`, undefined), {});
+    assert.deepEqual(unsubscribeOptions(`https://a.example.com/u,${" ".repeat(8000)}https://cut.example.com/${"u".repeat(500)}`, undefined), {
+      link: "https://a.example.com/u",
+    });
   });
 
   test("private addresses are recognised in every IPv6 spelling", () => {

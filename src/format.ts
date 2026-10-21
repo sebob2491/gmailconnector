@@ -1,5 +1,5 @@
-import { Buffer } from "node:buffer";
-import { decodeEntities, htmlToText, isValidAddress, type Mailbox } from "./mime.js";
+import { Buffer, isAscii } from "node:buffer";
+import { decodeEntities, HtmlTextReader, isValidAddress, type Mailbox } from "./mime.js";
 
 /** Subset of the Gmail API Message resource we rely on. */
 export interface ApiMessagePart {
@@ -38,46 +38,61 @@ export function header(part: ApiMessagePart | undefined, name: string): string |
   return part?.headers?.find((h) => h.name.toLowerCase() === lower)?.value;
 }
 
+/** Address headers are read up to this length (Gmail's never come near it); the rest is ignored. */
+export const MAX_ADDRESS_HEADER = 64 * 1024;
+
+/** An address header cut to MAX_ADDRESS_HEADER, at the last comma before it so no address is cut in two. */
+function addressHeader(value: string): string {
+  if (value.length <= MAX_ADDRESS_HEADER) return value;
+  const comma = value.lastIndexOf(",", MAX_ADDRESS_HEADER);
+  return value.slice(0, comma > 0 ? comma : MAX_ADDRESS_HEADER);
+}
+
 /** Splits an address-list header on commas that are outside quotes, comments and angle brackets. */
 export function parseAddressList(value: string | undefined): string[] {
   if (!value) return [];
+  const text = addressHeader(value);
   const out: string[] = [];
-  let current = "";
+  let start = 0;
   let quoted = false;
   let angle = 0;
   let paren = 0;
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i];
-    if (ch === "\\" && quoted) {
-      current += ch + (value[++i] ?? "");
-      continue;
-    }
-    if (ch === '"') quoted = !quoted;
-    else if (!quoted && ch === "<") angle++;
-    else if (!quoted && ch === ">") angle = Math.max(0, angle - 1);
-    else if (!quoted && ch === "(") paren++;
-    else if (!quoted && ch === ")") paren = Math.max(0, paren - 1);
-    if (ch === "," && !quoted && !angle && !paren) {
-      if (current.trim()) out.push(current.trim());
-      current = "";
-    } else {
-      current += ch;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (quoted) {
+      if (c === 92 /* \ */) i++;
+      else if (c === 34 /* " */) quoted = false;
+    } else if (c === 34) quoted = true;
+    else if (c === 60 /* < */) angle++;
+    else if (c === 62 /* > */) angle = Math.max(0, angle - 1);
+    else if (c === 40 /* ( */) paren++;
+    else if (c === 41 /* ) */) paren = Math.max(0, paren - 1);
+    else if (c === 44 /* , */ && !angle && !paren) {
+      const item = text.slice(start, i).trim();
+      if (item) out.push(item);
+      start = i + 1;
     }
   }
-  if (current.trim()) out.push(current.trim());
+  const last = text.slice(start).trim();
+  if (last) out.push(last);
   return out;
 }
 
 /**
  * Parses an address-list header (RFC 5322, leniently) into mailboxes. Handles quoted display names
  * (which may contain commas or "<...>"), comments such as `root@host (Cron Daemon)`, and groups such
- * as `undisclosed-recipients:;` or `Team: a@x.com, b@y.com;`, whose names are dropped.
+ * as `undisclosed-recipients:;` or `Team: a@x.com, b@y.com;`, whose names are dropped. Text is taken
+ * in slices between the characters that matter, so the work is linear in the header's length.
  */
 export function parseMailboxes(value: string | undefined): Mailbox[] {
   const out: Mailbox[] = [];
   if (!value) return out;
-  let text = "";
-  let comment = "";
+  const header = addressHeader(value);
+  const n = header.length;
+  let text = ""; // the current mailbox, without comments
+  let comment = ""; // the text of its comments
+  let run = 0; // where the text not yet added to `text` starts
+  let commentRun = 0; // the same inside a comment
   let quoted = false;
   let depth = 0;
   let angle = false;
@@ -87,38 +102,43 @@ export function parseMailboxes(value: string | undefined): Mailbox[] {
     text = "";
     comment = "";
   };
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i];
+  for (let i = 0; i < n; i++) {
+    const c = header.charCodeAt(i);
     if (quoted) {
-      text += ch;
-      if (ch === "\\") text += value[++i] ?? "";
-      else if (ch === '"') quoted = false;
+      if (c === 92 /* \ */) i++;
+      else if (c === 34 /* " */) quoted = false;
     } else if (depth) {
-      if (ch === "\\") comment += value[++i] ?? "";
-      else if (ch === "(") depth++;
-      else if (ch === ")") depth--;
-      else comment += ch;
+      // In a comment: nested parentheses are left out, and a backslash keeps just the character after it.
+      if (c === 92) {
+        comment += header.slice(commentRun, i) + header.charAt(i + 1);
+        commentRun = ++i + 1;
+      } else if (c === 40 /* ( */ || c === 41 /* ) */) {
+        comment += header.slice(commentRun, i);
+        commentRun = i + 1;
+        depth += c === 40 ? 1 : -1;
+        if (!depth) run = i + 1;
+      }
     } else if (angle) {
-      text += ch;
-      if (ch === ">") angle = false;
-    } else if (ch === '"') {
-      quoted = true;
-      text += ch;
-    } else if (ch === "(") {
+      if (c === 62 /* > */) angle = false;
+    } else if (c === 34) quoted = true;
+    else if (c === 40) {
+      text += header.slice(run, i);
       depth = 1;
-    } else if (ch === "<") {
-      angle = true;
-      text += ch;
-    } else if (ch === ":") {
+      commentRun = i + 1;
+    } else if (c === 60 /* < */) angle = true;
+    else if (c === 58 /* : */) {
       // Start of a group: what came before is the group's name, not an address.
       text = "";
       comment = "";
-    } else if (ch === "," || ch === ";") {
+      run = i + 1;
+    } else if (c === 44 /* , */ || c === 59 /* ; */) {
+      text += header.slice(run, i);
       flush();
-    } else {
-      text += ch;
+      run = i + 1;
     }
   }
+  if (depth) comment += header.slice(commentRun);
+  else text += header.slice(run);
   flush();
   return out;
 }
@@ -182,6 +202,19 @@ export function attachmentCharset(payload: ApiMessagePart | undefined, partId: s
   return undefined;
 }
 
+/** Charsets whose text is all ASCII bytes, read through escape sequences (ISO-2022-JP, HZ, UTF-7). */
+const SEVEN_BIT = /^(?:iso-?2022|csiso2022|hz-|utf-?7)/;
+
+/** East Asian multibyte charsets, in which a few bytes of text can happen to be valid UTF-8 as well. */
+const EAST_ASIAN = /^(?:gb|x-gbk|big5|cn-big5|csbig5|x-x-big5|shift[-_]?jis|x-sjis|sjis|ms_kanji|csshiftjis|windows-(?:31j|936|949|950)|euc-|x-euc|cseuc|ks_c_5601|ksc5601|korean)/;
+
+/** True when `bytes` holds at most `max` bytes outside ASCII. */
+function fewNonAscii(bytes: Uint8Array, max: number): boolean {
+  let n = 0;
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] >= 0x80 && ++n > max) return false;
+  return true;
+}
+
 /** Charsets that mean "UTF-8 if it is valid": senders often label Windows-1252 text as one of these. */
 const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-utf-8"]);
 
@@ -190,7 +223,8 @@ const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-ut
  * UTF-8 whatever the label says. Gmail hands out message bodies already converted to UTF-8 while the
  * part still declares its original charset (e.g. ISO-8859-1), and decoding those as declared turns
  * "—" into "â€”"; text really written in a single-byte or East Asian charset is almost never valid
- * UTF-8. Undeclared, unknown or wrongly declared UTF-8 falls back to Windows-1252. `partial` says the
+ * UTF-8 (except a few characters of East Asian text, which are read as declared when they are valid
+ * there). Undeclared, unknown or wrongly declared UTF-8 falls back to Windows-1252. `partial` says the
  * bytes are cut off, so a split last character doesn't count against UTF-8.
  */
 export function decodeCharset(bytes: Uint8Array, declared?: string, partial = false): string {
@@ -204,7 +238,19 @@ export function decodeCharset(bytes: Uint8Array, declared?: string, partial = fa
       // fall through
     }
   }
-  if (!charset || UTF8_LIKE.has(charset) || bytes.some((b) => b >= 0x80)) {
+  // Plain ASCII reads the same in every charset except the 7-bit ones that switch modes with escapes.
+  const ascii = isAscii(bytes);
+  if (ascii && !(charset && SEVEN_BIT.test(charset))) return utf8();
+  // A few bytes of GBK, Big5, Shift_JIS or EUC text can pass for UTF-8 by chance ("C4 A3" is 模 in GBK and ģ in
+  // UTF-8), while text Gmail converted to UTF-8 has more than a few: up to 8 are read as declared if valid there.
+  if (charset && EAST_ASIAN.test(charset) && fewNonAscii(bytes, 8)) {
+    try {
+      return new TextDecoder(charset, { fatal: true, ignoreBOM: false }).decode(bytes, { stream: partial });
+    } catch {
+      // Not valid in the declared charset (or an unknown name): go on as for any other charset.
+    }
+  }
+  if (!charset || UTF8_LIKE.has(charset) || !ascii) {
     try {
       return utf8();
     } catch {
@@ -226,6 +272,7 @@ export function decodeBody(data: string, contentType?: string): string {
 }
 
 export interface AttachmentInfo {
+  /** Gmail's attachment ID, used to download the file; not shown in results (they're long, and partId is stable). */
   id?: string;
   partId?: string;
   filename: string;
@@ -241,12 +288,19 @@ export interface ExtractedContent {
   attachments: AttachmentInfo[];
 }
 
+/** Parts nested deeper than this are ignored (real emails nest a few levels; this keeps the walk off the stack limit). */
+export const MAX_MIME_DEPTH = 64;
+
 /**
  * Walks a message payload collecting its body text and HTML plus attachments.
  * - Inside multipart/alternative, the first non-empty text/plain and the last HTML version win.
+ * - format=flowed text has its soft line breaks joined (see unflow).
  * - Other multiparts (mixed, related, …) concatenate their body parts in order, so a body that
  *   Apple Mail splits around an inline attachment is kept whole.
  * - Attached emails (message/rfc822) are attachments; their text never becomes this message's body.
+ * - An unnamed text/calendar part (how Exchange and Outlook send an invitation) is listed as the
+ *   attachment "invite.ics", unless the email also attaches the event as a file (as Google Calendar does).
+ * - Parts more than MAX_MIME_DEPTH levels down are ignored.
  * `loadData` fetches bodies Gmail stored out-of-line (large text parts carry only an attachmentId).
  */
 export async function extractContent(
@@ -271,21 +325,23 @@ export async function extractContent(
     const present = values.filter((v): v is string => v !== undefined);
     return present.length ? present.join("\n") : undefined;
   };
+  const invites: AttachmentInfo[] = [];
 
-  const walk = async (part: ApiMessagePart, embedded: boolean): Promise<{ text?: string; html?: string }> => {
+  const walk = async (part: ApiMessagePart, embedded: boolean, depth: number): Promise<{ text?: string; html?: string }> => {
+    if (depth > MAX_MIME_DEPTH) return {};
     const mimeType = (part.mimeType ?? "").toLowerCase();
     const disposition = (header(part, "Content-Disposition") ?? "").toLowerCase();
     if (mimeType.startsWith("message/")) {
       if (part.body?.attachmentId || part.filename) {
         addAttachment(part, "attached-message.eml");
       } else {
-        for (const child of part.parts ?? []) await walk(child, true);
+        for (const child of part.parts ?? []) await walk(child, true, depth + 1);
       }
       return {};
     }
     if (part.parts?.length) {
       const results: { text?: string; html?: string }[] = [];
-      for (const child of part.parts) results.push(await walk(child, embedded));
+      for (const child of part.parts) results.push(await walk(child, embedded, depth + 1));
       if (mimeType === "multipart/alternative") {
         const texts = results.map((r) => r.text).filter((t): t is string => t !== undefined);
         const htmls = results.map((r) => r.html).filter((h): h is string => h !== undefined);
@@ -299,22 +355,109 @@ export async function extractContent(
       if (embedded) return {};
       let data = part.body?.data;
       if (!data && part.body?.attachmentId) data = await loadData(part.body.attachmentId);
-      const content = data ? decodeBody(data, header(part, "Content-Type")) : "";
-      return mimeType === "text/plain" ? { text: content } : { html: content };
+      const contentType = header(part, "Content-Type");
+      const content = data ? decodeBody(data, contentType) : "";
+      if (mimeType !== "text/plain") return { html: content };
+      return { text: FLOWED.test(contentType ?? "") ? unflow(content, DEL_SP.test(contentType ?? "")) : content };
     }
-    if (part.filename || part.body?.attachmentId) addAttachment(part, "(unnamed)");
+    if (mimeType === "text/calendar" && !part.filename) {
+      addAttachment(part, "invite.ics");
+      invites.push(attachments[attachments.length - 1]);
+    } else if (part.filename || part.body?.attachmentId) addAttachment(part, "(unnamed)");
     return {};
   };
 
-  const { text, html } = payload ? await walk(payload, false) : {};
+  const { text, html } = payload ? await walk(payload, false, 0) : {};
+  const calendarFile = (a: AttachmentInfo) => /^(?:text\/calendar|application\/ics)$/i.test(a.mimeType) || /\.(?:ics|vcs)$/i.test(a.filename);
+  if (invites.length && attachments.some((a) => !invites.includes(a) && calendarFile(a))) {
+    return { text, html, attachments: attachments.filter((a) => !invites.includes(a)) };
+  }
   return { text, html, attachments };
+}
+
+const FLOWED = /;\s*format\s*=\s*"?flowed"?\s*(?:;|$)/i;
+const DEL_SP = /;\s*delsp\s*=\s*"?yes"?\s*(?:;|$)/i;
+
+/**
+ * Joins the soft line breaks of format=flowed text (RFC 3676): a line ending in a space continues on the
+ * next line of the same quote depth (with `delSp`, without that space). Quoted lines keep their depth,
+ * as ">" marks; the space added in front of lines that start with ">", "From " or a space is removed;
+ * the signature line "-- " stays a line of its own.
+ */
+export function unflow(text: string, delSp: boolean): string {
+  const out: string[] = [];
+  const marks = (depth: number) => (depth ? `${">".repeat(depth)} ` : "");
+  let paragraph: string | undefined;
+  let paragraphDepth = 0;
+  for (const raw of text.split(/\r?\n/)) {
+    let depth = 0;
+    while (raw.charCodeAt(depth) === 62 /* > */) depth++;
+    let line = raw.charCodeAt(depth) === 32 ? raw.slice(depth + 1) : raw.slice(depth);
+    const flowed = line.endsWith(" ") && line !== "-- ";
+    if (flowed && delSp) line = line.slice(0, -1);
+    // An empty line ends a paragraph even after a soft break (stricter readings would swallow it).
+    if (paragraph !== undefined && depth === paragraphDepth && line) paragraph += line;
+    else {
+      if (paragraph !== undefined) out.push(marks(paragraphDepth) + paragraph);
+      paragraph = line;
+      paragraphDepth = depth;
+    }
+    if (!flowed) {
+      out.push(marks(depth) + paragraph);
+      paragraph = undefined;
+    }
+  }
+  if (paragraph !== undefined) out.push(marks(paragraphDepth) + paragraph);
+  return out.join("\n");
 }
 
 /** The readable body: the plain-text part, or the HTML converted to text when that's missing or blank. */
 export function bodyText(content: { text?: string; html?: string }): string {
-  if (content.text?.trim()) return content.text;
-  if (content.html !== undefined) return htmlToText(content.html);
-  return content.text ?? "";
+  return bodyTextStart(content, 0).text;
+}
+
+/**
+ * The start of the readable body (see bodyText): about `maxChars` characters of it (0: all), and
+ * whether that is all of it. Only that much of the body is converted.
+ */
+export function bodyTextStart(content: { text?: string; html?: string }, maxChars: number): { text: string; complete: boolean } {
+  return bodyReader(content)(maxChars);
+}
+
+/**
+ * Reads the readable body (see bodyText) in steps: each call gives the start of it, about `maxChars`
+ * characters long (0: all of it), converting HTML only as far as it hasn't been already, and never
+ * reading past `maxInput` characters of the part.
+ */
+function bodyReader(
+  content: { text?: string; html?: string },
+  maxInput = Infinity,
+): (maxChars: number) => { text: string; complete: boolean } {
+  const text = content.text;
+  if (text?.trim()) {
+    return (maxChars) => {
+      const limit = Math.min(maxChars || Infinity, maxInput);
+      if (text.length <= limit) return { text, complete: true };
+      const end = isHighSurrogate(text.charCodeAt(limit - 1)) ? limit - 1 : limit;
+      return { text: text.slice(0, end), complete: false };
+    };
+  }
+  if (content.html !== undefined) {
+    const reader = new HtmlTextReader(content.html);
+    return (maxChars) => reader.read(maxChars, maxInput);
+  }
+  return () => ({ text: text ?? "", complete: true });
+}
+
+function isHighSurrogate(c: number): boolean {
+  return c >= 0xd800 && c <= 0xdbff;
+}
+
+/** Gmail's internalDate (milliseconds since 1970) as ISO 8601 to the second, e.g. 2026-10-20T21:09:45Z; undefined if it isn't a time. */
+export function isoTime(internalDate: string | number | undefined): string | undefined {
+  if (internalDate === undefined || internalDate === "") return undefined;
+  const date = new Date(Number(internalDate));
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 export function viewUrl(email: string, fragment: string): string {
@@ -348,12 +491,22 @@ export function cleanSnippet(snippet: string | undefined): string | undefined {
 }
 
 /**
- * Removes invisible padding and collapses the runs of blank space it leaves behind (any Unicode space,
- * and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate cells, including empty ones.
+ * Runs of blank space to collapse: two or more of any space but tab and line feed, except plain spaces
+ * that indent a line (list items, preformatted text, code), which match the first alternative and stay.
+ */
+const BLANK_RUN = /(\n|^) {2,}(?=\S)|[^\S\n\t]{2,}/g;
+
+/** C0 control characters other than tab and line breaks; vertical tab and form feed count as line breaks. */
+const CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+/**
+ * Removes invisible padding and control characters, and collapses the runs of blank space they leave
+ * behind (any Unicode space, and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate
+ * cells, including empty ones; so are the spaces that indent a line.
  */
 export function cleanBody(text: string): string {
-  return stripInvisible(text.replace(/\r\n?/g, "\n"))
-    .replace(/[^\S\n\t]{2,}/g, " ")
+  return stripInvisible(text.replace(/\r\n?/g, "\n").replace(CONTROLS, (c) => (c === "\x0b" || c === "\x0c" ? "\n" : "")))
+    .replace(BLANK_RUN, (run, lineStart: string | undefined) => (lineStart === undefined ? " " : run))
     .split("\n")
     .map((line) => line.trimEnd()) // not /[^\S\n]+\n/, which is quadratic on long runs of tabs
     .join("\n")
@@ -370,34 +523,223 @@ export function attachmentText(text: string): string {
   return text.replace(/^\ufeff/, "").replace(/\0/g, "").replace(/\r\n?/g, "\n");
 }
 
+// ---------- quoted history ----------
+
 /**
- * Where a reply's quoted history starts: "On <date>, <name> wrote:" (possibly wrapped onto a second
- * line, and in a few languages), Outlook's "-----Original Message-----", or its "From:/Sent:" header block.
+ * Verbs of attribution lines ("On <date>, <name> wrote:"), in the languages of common mail programs.
+ * The verb may stand anywhere on the line: "Am Mo., 1. Jan. 2024 um 10:00 Uhr schrieb Hans <…>:".
  */
-const QUOTE_START = new RegExp(
-  [
-    String.raw`^On\b[^\n]{0,300}(?:\n[^\n]{0,300})?\b(?:wrote|schrieb|a écrit|escribió|scrisse|schreef|skrev|napisał)\s?:[ \t]*$`,
-    String.raw`^-{2,}[ \t]*Original Message[ \t]*-{2,}[ \t]*$`,
-    String.raw`^From:[^\n]+\n(?:Sent|Date):[^\n]+\n(?:To|Subject|Cc):`,
-  ].join("|"),
-  "im",
+const ATTRIBUTION_VERB = new RegExp(
+  String.raw`(?<!\p{L})(?:wrote|schrieb|a [ée]crit|escribi[óo]|ha scritto|scrisse|schreef|geschreven|skrev|napisa[łl](?:\(a\)|a)?|pisze|escreveu|kirjoitti|napsal(?:\(a\)|a)?|написал(?:\(а\)|а)?|пишет|yazd[ıi]|írta|έγραψε)(?!\p{L})|写道|작성`,
+  "iu",
 );
+/** Attribution lines that name the sender by address, without a verb (Gmail in Russian, Japanese…). */
+const ENDS_WITH_ADDRESS = /<[^<>\s@]+@[^<>\s]+>\)?\s?[:：]$/;
+
+/** An attribution line: dated (a digit), a verb or the sender's address, ending with ":". */
+function isAttribution(line: string): boolean {
+  return line.length <= 400 && /[:：]$/.test(line) && /\d/.test(line) && (ATTRIBUTION_VERB.test(line) || ENDS_WITH_ADDRESS.test(line));
+}
+
+/** Outlook's "-----Original Message-----" line, also in other languages. */
+const ORIGINAL_MESSAGE =
+  /^-{2,}\s*(?:original message|urspr[üu]ngliche nachricht|message d'origine|mensaje original|messaggio originale|oorspronkelijk bericht|ursprungligt meddelande|oprindelig meddelelse|opprinnelig melding|oryginalna wiadomo[śs][ćc]|mensagem original)\s*-{2,}$/i;
+
+/** The first three lines of an Outlook header block (From:, Sent:/Date:, To:/Subject:/Cc:), in several languages. */
+const OUTLOOK_FROM = /^\*?(?:from|von|de|da|van|fr[åa]n|fra|od|l[äa]hett[äa]j[äa]|felad[óo]|от)\*?[ \t\u00a0]?:/i;
+const OUTLOOK_SENT =
+  /^\*?(?:sent|date|gesendet|datum|envoy[ée]|enviado|enviada|fecha|inviato|data|verzonden|skickat|sendt|wys[łl]ano|l[äa]hetetty|elk[üu]ldve|отправлено)\*?[ \t\u00a0]?:/i;
+const OUTLOOK_TO =
+  /^\*?(?:to|subject|cc|an|betreff|[àa]|objet|para|asunto|oggetto|aan|onderwerp|till|[äa]mne|til|emne|do|temat|dw|kopie|vastaanottaja|aihe|assunto|c[ée]zott|t[áa]rgy|кому|тема)\*?[ \t\u00a0]?:/i;
+/** A line of a header block: a short label and ":". */
+const HEADER_LINE = /^\*?[\p{L}][\p{L}\p{M} .'-]{0,30}\*?[ \t\u00a0]?:/u;
+/** The rule Outlook puts above its header block in plain text. */
+const SEPARATOR_LINE = /^(?:_{10,}|-{10,})$/;
+
+/** A forwarded message's header: Gmail's, Thunderbird's and Apple Mail's, in several languages. */
+const FORWARD_MARKER = new RegExp(
+  [
+    String.raw`^-{3,}\s*(?:forwarded message|weitergeleitete nachricht|message transf[ée]r[ée]|mensaje reenviado|messaggio inoltrato|doorgestuurd bericht|mensagem encaminhada|vidarebefordrat meddelande|videresendt meddelelse|videresendt melding|wiadomo[śs][ćc] przekazana dalej|пересланное сообщение)\s*-{3,}$`,
+    String.raw`^(?:begin forwarded message|anfang der weitergeleiteten nachricht|d[ée]but du message r[ée]exp[ée]di[ée]|inicio del mensaje reenviado|inizio messaggio inoltrato|begin doorgestuurd bericht)\s?:$`,
+  ].join("|"),
+  "i",
+);
+
+/** Where quoted history starts in a reply: the text hidden from `index` on, quoting what starts at `body`. */
+interface QuoteStart {
+  index: number;
+  body: number;
+  /** An attribution line ("On … wrote:"), below which a reply may answer between quoted lines; otherwise an Outlook header. */
+  attribution: boolean;
+}
+
+/** Where the line starting at `start` ends: at its "\n", or the text's end. */
+function lineEnd(text: string, start: number): number {
+  const nl = text.indexOf("\n", start);
+  return nl < 0 ? text.length : nl;
+}
+
+/** White space at the end of a line, as trimEnd sees it (CR included). */
+function isTrailingSpace(c: number): boolean {
+  return c <= 32 || c === 0xa0 || c === 0xfeff || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x202f || c === 0x205f || c === 0x3000;
+}
+
+/** A line without its quote marks (">", nested or spaced) and surrounding blanks. */
+function lineContent(text: string, start: number, end: number): string {
+  let i = start;
+  for (let c = text.charCodeAt(i); i < end && (c === 62 || c === 32 || c === 9 || c === 0xa0); c = text.charCodeAt(++i));
+  let j = end;
+  while (j > i && isTrailingSpace(text.charCodeAt(j - 1))) j--;
+  return text.slice(i, j);
+}
+
+/** The content (see lineContent) of the line after the one ending at `end`, if there is one. */
+function nextLine(text: string, end: number): { start: number; end: number; content: string } | undefined {
+  if (end >= text.length) return undefined;
+  const start = end + 1;
+  const next = lineEnd(text, start);
+  return { start, end: next, content: lineContent(text, start, next) };
+}
+
+/** Where the quoted text below a header block starts: after its header lines and the blank lines that follow. */
+function afterHeaders(text: string, from: number): number {
+  let headers = true;
+  for (let start = from; start < text.length; ) {
+    const end = lineEnd(text, start);
+    const content = lineContent(text, start, end);
+    if (!(headers && HEADER_LINE.test(content))) {
+      headers = false;
+      if (content) return start;
+    }
+    start = end + 1;
+  }
+  return text.length;
+}
+
+/**
+ * Finds where a reply's quoted history starts: an attribution line ("On <date>, <name> wrote:", wrapped
+ * onto a second line or not, inside a quote or not, in several languages), Outlook's
+ * "-----Original Message-----", or its From:/Sent:/To: header block. Nothing is found below a
+ * forwarded message's header: what follows it is the forwarded message, not quoted history.
+ */
+function findQuoteStart(text: string): QuoteStart | undefined {
+  // The line before, when it isn't blank (an attribution may be wrapped onto two lines).
+  let previousStart = -1;
+  let previous = "";
+  for (let start = 0; start <= text.length; ) {
+    const end = lineEnd(text, start);
+    const content = lineContent(text, start, end);
+    if (content) {
+      if (FORWARD_MARKER.test(content)) return undefined;
+      if (ORIGINAL_MESSAGE.test(content)) return { index: start, body: afterHeaders(text, end + 1), attribution: false };
+      if (OUTLOOK_FROM.test(content)) {
+        const sent = nextLine(text, end);
+        const to = sent && nextLine(text, sent.end);
+        if (sent && to && OUTLOOK_SENT.test(sent.content) && OUTLOOK_TO.test(to.content)) {
+          const index = previous && SEPARATOR_LINE.test(previous) ? previousStart : start;
+          return { index, body: afterHeaders(text, start), attribution: false };
+        }
+      }
+      const last = content.charCodeAt(content.length - 1);
+      if (last === 58 /* : */ || last === 0xff1a /* ： */) {
+        if (isAttribution(content)) return { index: start, body: end + 1, attribution: true };
+        if (previous && isAttribution(`${previous} ${content}`)) return { index: previousStart, body: end + 1, attribution: true };
+      }
+    }
+    previousStart = start;
+    previous = content;
+    start = end + 1;
+  }
+  return undefined;
+}
+
+/** Characters that leave a line looking empty: white space and the invisible padding stripInvisible removes. */
+function isBlank(c: number): boolean {
+  return c === 32 || c === 9 || c === 13 || c === 0xa0 || c === 0xfeff || (c >= 0x2000 && c <= 0x200f) || c === 0x3000 || c === 0xad || c === 0x34f || (c >= 0x2060 && c <= 0x206f);
+}
+
+/** Whether a reply answers between the quoted lines from `from` on (some lines start with ">", others don't). */
+function answersBetweenQuotes(text: string, from: number): boolean {
+  let quoted = false;
+  let unquoted = false;
+  for (let i = from; i < text.length; ) {
+    // The first character on the line that isn't blank.
+    let c = text.charCodeAt(i);
+    while (i < text.length && isBlank(c)) c = text.charCodeAt(++i);
+    if (i >= text.length) break;
+    if (c !== 10) {
+      if (c === 62 /* > */) quoted = true;
+      else unquoted = true;
+      if (quoted && unquoted) return true;
+    }
+    const nl = text.indexOf("\n", i);
+    if (nl < 0) break;
+    i = nl + 1;
+  }
+  return false;
+}
+
+/** Text as compared between a quote and the message it may be quoting: lower-case words, no links or punctuation. */
+function quoteWords(text: string): string {
+  const words = text.replace(/\b(?:https?:\/\/|www\.|mailto:)\S*/gi, " ").toLowerCase();
+  if (/^[\x00-\x7f]*$/.test(words)) return words.replace(/[^a-z0-9]+/g, " ").trim();
+  return stripInvisible(words).normalize("NFC").replace(/[^\p{L}\p{N}\p{M}]+/gu, " ").trim();
+}
+
+/** How much of a message's start (raw characters, and words) is compared with quotes. */
+const KEY_SOURCE = 1000;
+const KEY_LENGTH = 200;
+
+/** The start of a message as compared with quotes in later replies (see hideQuotedHistory). */
+export interface QuoteKey {
+  /** The message's first words (see quoteWords), at most KEY_LENGTH characters. */
+  start: string;
+  /** Whether that is the whole message. */
+  whole: boolean;
+}
+
+/** A message's QuoteKey, from its readable body (the start of it is enough). */
+export function quoteKey(body: string): QuoteKey {
+  const words = quoteWords(body.slice(0, KEY_SOURCE));
+  return { start: words.slice(0, KEY_LENGTH), whole: body.length <= KEY_SOURCE && words.length <= KEY_LENGTH };
+}
+
+/**
+ * Whether quoted text (its first words `quote`; `whole` if that is all of it) is a copy of the message
+ * `key` describes: it holds the message's first words, or, for a short message, is exactly it; or the
+ * quote, two words or more, is all there is and the message starts with it (a quote cut down to its
+ * first lines).
+ */
+function quotes(quote: string, whole: boolean, key: QuoteKey): boolean {
+  const start = key.start;
+  if (!start || !quote) return false;
+  if (start.length >= 24) {
+    if (quote.includes(start.slice(0, 48))) return true;
+  } else if (key.whole && quote === start) return true;
+  return whole && quote.includes(" ") && start.startsWith(quote) && (start.length === quote.length || start[quote.length] === " ");
+}
 
 export const QUOTE_HIDDEN = "[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]";
 
 /**
- * Removes the trailing quoted history from a reply, for thread views where the quoted messages are
- * already shown. Only cuts when everything after the marker is quote: all lines start with ">", or
- * none do (a top-posted reply). A mix means the sender answered between quoted lines, so it's kept.
+ * Removes a reply's quoted history, for thread views, where the messages it quotes are shown anyway:
+ * only when the quoted text is a copy of one of the `earlier` messages of the thread (their QuoteKeys),
+ * so a forwarded email or a quote of a message from elsewhere stays. Below an attribution line ("On …
+ * wrote:"), it is kept when the reply answers between quoted lines; below an Outlook header (nobody
+ * answers between the lines of one), it is cut whatever the lines look like. Lines may end in CRLF.
  */
-export function hideQuotedHistory(text: string): string {
-  const match = QUOTE_START.exec(text);
-  // Real "On … wrote:" lines carry a date or time; "On Monday the team wrote:" in prose doesn't count.
-  if (!match || (/^on\b/i.test(match[0]) && !/\d/.test(match[0]))) return text;
-  const after = text.slice(match.index + match[0].length).split("\n").filter((l) => l.trim());
-  const quoted = after.filter((l) => l.trimStart().startsWith(">")).length;
-  if (quoted && quoted < after.length) return text;
-  return `${text.slice(0, match.index).trimEnd()}\n\n${QUOTE_HIDDEN}`.trimStart();
+export function hideQuotedHistory(text: string, earlier: readonly QuoteKey[] = []): string {
+  if (!earlier.length) return text;
+  const found = findQuoteStart(text);
+  if (!found) return text;
+  if (found.attribution && answersBetweenQuotes(text, found.body)) return text;
+  const quote = quoteWords(text.slice(found.body, found.body + KEY_SOURCE));
+  const whole = text.length - found.body <= KEY_SOURCE;
+  // Most replies quote the message just before them: look there first.
+  for (let i = earlier.length - 1; i >= 0; i--) {
+    if (quotes(quote, whole, earlier[i])) return `${text.slice(0, found.index).trimEnd()}\n\n${QUOTE_HIDDEN}`.trimStart();
+  }
+  return text;
 }
 
 /** Links longer than this are nearly always tracking redirects; reading views cut them to their site. */
@@ -421,9 +763,66 @@ export const DEFAULT_MAX_BODY_CHARS = 20_000;
 export function limitLength(text: string, max: number): { text: string; omitted: number } {
   if (!max || text.length <= max) return { text, omitted: 0 };
   let end = max;
-  const code = text.charCodeAt(end - 1);
-  if (code >= 0xd800 && code <= 0xdbff) end--; // don't split a surrogate pair
+  if (isHighSurrogate(text.charCodeAt(end - 1))) end--; // don't split a surrogate pair
   return { text: text.slice(0, end), omitted: text.length - end };
+}
+
+/**
+ * The start of a body read only partway, without a link it ends inside: cut short, the link would be
+ * shown as it is instead of being shortened (it is read whole when more is read).
+ */
+function withoutCutLink(text: string): string {
+  let i = text.length;
+  for (let c = text.charCodeAt(i - 1); i > 0 && !(c <= 32 || c === 0xa0 || c === 0x3000 || (c >= 0x2000 && c <= 0x200b)); c = text.charCodeAt(--i - 1));
+  return /https?:\/\//i.test(text.slice(i)) ? text.slice(0, i) : text;
+}
+
+/**
+ * Bodies are read this far past the characters shown (1.5 times as many), since cleaning and cutting
+ * links shrink them; the rest would be cut anyway.
+ */
+const READ_AHEAD = 1.5;
+
+/** With a limit on characters shown, at most this many times as many characters of a body part are read. */
+const MAX_READ_FACTOR = 64;
+
+/**
+ * The body as shown in results: line ends normalized, the quoted history cut (`hide`), cleaned, long
+ * links cut (`shorten`). With a limit (`max`), only the start of the body is read: READ_AHEAD times
+ * `max` characters, then more for as long as cleaning and cutting links leave no more than `max`, so
+ * whatever fits within the limit comes out exactly as if all of it had been read (up to MAX_READ_FACTOR
+ * times `max` characters of the part, which only markup or padding without text ever needs).
+ * `complete` says whether everything was read (or everything not read was quoted history being hidden).
+ */
+function readableBody(
+  content: ExtractedContent,
+  max: number,
+  opts: { hide: boolean; shorten: boolean; earlier: readonly QuoteKey[] },
+): { text: string; shortened: number; complete: boolean } {
+  const read = bodyReader(content, max ? max * MAX_READ_FACTOR + 65_536 : Infinity);
+  let budget = max ? Math.ceil(max * READ_AHEAD) : 0;
+  let previous = -1;
+  for (;;) {
+    const start = read(budget);
+    const stuck = start.text.length === previous; // nothing more can be read
+    previous = start.text.length;
+    let text = start.complete || stuck ? start.text : withoutCutLink(start.text);
+    let complete = start.complete;
+    // The quoted history is cut (CRLF line ends and all) before cleaning, so the cleaning doesn't run
+    // over text that is dropped.
+    if (opts.hide) {
+      const cut = hideQuotedHistory(text, opts.earlier);
+      if (cut !== text) complete = true;
+      text = cut;
+    }
+    text = cleanBody(text);
+    let shortened = 0;
+    if (opts.shorten) ({ text, shortened } = shortenLinks(text));
+    if (complete || text.length > max || stuck) return { text, shortened, complete };
+    // Read on: in proportion to how much cleaning took away, at least a quarter more, at most four times as much.
+    const wanted = (budget * (max + 1) * 1.1) / Math.max(text.length, 1);
+    budget = Math.ceil(Math.min(budget * 4, Math.max(budget * 1.25, wanted)));
+  }
 }
 
 export interface FormatOptions {
@@ -434,7 +833,10 @@ export interface FormatOptions {
    * may be edited and saved again (drafts), since the cut links would replace the real ones.
    */
   shortenLinks?: boolean;
-  /** In PLAIN_TEXT, hide a reply's quoted history (for thread views, where it's shown anyway). */
+  /**
+   * In PLAIN_TEXT, hide a reply's quoted copy of earlier messages of its thread, which a thread view
+   * shows anyway (see formatThread; a message formatted on its own has no earlier messages).
+   */
   hideQuotedHistory?: boolean;
 }
 
@@ -451,13 +853,19 @@ export interface FormattedMessage {
   labelIds?: string[];
   plaintextBody?: string;
   htmlBody?: string;
-  attachments?: AttachmentInfo[];
+  /** The attachments as listed in results: without Gmail's attachment ID (get_attachment takes the partId). */
+  attachments?: Omit<AttachmentInfo, "id">[];
   raw?: string;
   /** Set when a body was shortened; says how to get the rest. */
   truncated?: string;
   /** Set when long links were cut; says how to get them. */
   linksShortened?: string;
   viewUrl: string;
+}
+
+/** Whether a format shows bodies, which then have to be read. */
+function showsBody(format: MessageFormat): boolean {
+  return format === "FULL_CONTENT" || format === "PLAIN_TEXT";
 }
 
 export async function formatMessage(
@@ -467,6 +875,35 @@ export async function formatMessage(
   loadData: (attachmentId: string) => Promise<string>,
   opts: FormatOptions = {},
 ): Promise<FormattedMessage> {
+  return formatContent(msg, format, email, showsBody(format) ? await extractContent(msg.payload, loadData) : undefined, opts, []);
+}
+
+/**
+ * Formats the messages of a thread, in order. With hideQuotedHistory (in PLAIN_TEXT), each reply's
+ * quoted copy of an earlier message of the thread is hidden, as that message is in the result; any
+ * other quote (a forwarded email, a message from elsewhere) stays, and the first message keeps its
+ * quote. `loader` gives each message's loadData (see extractContent). Bodies are fetched in parallel.
+ */
+export async function formatThread(
+  messages: ApiMessage[],
+  format: MessageFormat,
+  email: string,
+  loader: (messageId: string) => (attachmentId: string) => Promise<string>,
+  opts: FormatOptions = {},
+): Promise<FormattedMessage[]> {
+  const contents = showsBody(format) ? await Promise.all(messages.map((m) => extractContent(m.payload, loader(m.id)))) : [];
+  const keys = opts.hideQuotedHistory && format === "PLAIN_TEXT" ? contents.map((c) => quoteKey(bodyTextStart(c, KEY_SOURCE).text)) : [];
+  return messages.map((m, i) => formatContent(m, format, email, contents[i], opts, keys.slice(0, i)));
+}
+
+function formatContent(
+  msg: ApiMessage,
+  format: MessageFormat,
+  email: string,
+  content: ExtractedContent | undefined,
+  opts: FormatOptions,
+  earlier: readonly QuoteKey[],
+): FormattedMessage {
   const url = viewUrl(email, `all/${msg.id}`);
   if (format === "RAW") {
     return { id: msg.id, threadId: msg.threadId, labelIds: msg.labelIds, raw: decodeBody(msg.raw ?? ""), viewUrl: url };
@@ -484,17 +921,19 @@ export async function formatMessage(
   const bcc = parseAddressList(header(p, "Bcc"));
   if (cc.length) out.ccRecipients = cc;
   if (bcc.length) out.bccRecipients = bcc;
-  out.date = msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : header(p, "Date");
+  out.date = isoTime(msg.internalDate) ?? header(p, "Date");
   out.labelIds = msg.labelIds ?? [];
 
-  if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {
-    const content = await extractContent(p, loadData);
+  if (content) {
     const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
-    let body = cleanBody(bodyText(content));
-    if (opts.hideQuotedHistory && format === "PLAIN_TEXT") body = hideQuotedHistory(body);
-    let shortenedLinks = 0;
-    if (opts.shortenLinks && format === "PLAIN_TEXT") ({ text: body, shortened: shortenedLinks } = shortenLinks(body));
-    const plain = limitLength(body, max);
+    const reading = format === "PLAIN_TEXT";
+    const body = readableBody(content, max, {
+      hide: Boolean(opts.hideQuotedHistory && reading),
+      shorten: Boolean(opts.shortenLinks && reading),
+      earlier,
+    });
+    const shortenedLinks = body.shortened;
+    const plain = limitLength(body.text, max);
     out.plaintextBody = plain.text;
     let omitted = plain.omitted;
     if (format === "FULL_CONTENT" && content.html !== undefined) {
@@ -502,7 +941,10 @@ export async function formatMessage(
       out.htmlBody = html.text;
       omitted = Math.max(omitted, html.omitted);
     }
-    if (omitted) {
+    if (!body.complete) {
+      // Only the start of the body was read, so how much more there is isn't known.
+      out.truncated = "Body shortened; the rest is available with maxBodyChars: 0.";
+    } else if (omitted) {
       out.truncated =
         `Body shortened: ${omitted.toLocaleString("en-US")} more characters not shown. ` +
         `Fetch it with get_message, get_thread or get_draft and maxBodyChars: 0 for the full text.`;
@@ -512,7 +954,7 @@ export async function formatMessage(
         `${shortenedLinks} long link${shortenedLinks === 1 ? " was" : "s were"} cut to ${shortenedLinks === 1 ? "its" : "their"} website (https://site/…). ` +
         `For the full links, call again with messageFormat FULL_CONTENT (and maxBodyChars: 0 if the body was also shortened).`;
     }
-    if (content.attachments.length) out.attachments = content.attachments;
+    if (content.attachments.length) out.attachments = content.attachments.map(({ id: _id, ...listed }) => listed);
   }
   return out;
 }
