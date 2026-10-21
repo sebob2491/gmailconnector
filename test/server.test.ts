@@ -8,6 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
+import { sendAsCache } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -39,6 +40,7 @@ async function setup(
 ): Promise<Ctx> {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-test-"));
   tmpDirs.push(dir);
+  sendAsCache.clear(); // kept per process, like in a Worker isolate
   const store = new AccountStore(dir);
   const fake = new FakeGmail();
   const personal = fake.addMailbox(PERSONAL, "rt-personal");
@@ -1983,3 +1985,150 @@ describe("cheaper forwarding", () => {
   });
 });
 
+
+describe("send-as awareness", () => {
+  const SIGNATURE = '<div dir="ltr">Me<br><a href="https://work.example">https://work.example</a></div>';
+  const sendAsCalls = (fake: FakeGmail) => fake.requests.filter((r) => r.path === "settings/sendAs").length;
+
+  test("reply-all never includes the user's own addresses: aliases, dots, +tags and googlemail", async () => {
+    const { call, fake, personal } = await setup();
+    personal.sendAs = [
+      { sendAsEmail: PERSONAL, isPrimary: true, isDefault: true },
+      { sendAsEmail: "me@mydomain.example", displayName: "Me" },
+    ];
+    fake.deliver(
+      personal,
+      crlf([
+        "From: Alice <alice@example.com>",
+        "To: Me.Personal@Gmail.com, mepersonal@gmail.com, bob@example.com",
+        "Cc: me.personal+tag@gmail.com, me.personal@googlemail.com, Me <me@mydomain.example>, carol@example.com",
+        "Subject: Variants",
+        "Message-ID: <v1@example.com>",
+        "Content-Type: text/plain",
+        "",
+        "hi",
+      ]),
+      { id: "v1", threadId: "vt1" },
+    );
+    const res = await call("reply", { account: "personal", messageId: "v1", body: "ok", replyAll: true });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(PERSONAL)[0].raw);
+    assert.equal(mime.get("To"), "Alice <alice@example.com>");
+    assert.equal(mime.get("Cc"), "bob@example.com, carol@example.com");
+    assert.equal(sendAsCalls(fake), 1, "one settings call for a cold account");
+    await call("reply", { account: "personal", messageId: "v1", body: "again", replyAll: true });
+    assert.equal(sendAsCalls(fake), 1, "the send-as list is cached");
+    assert.equal(inspectMime(fake.sentBy(PERSONAL)[1].raw).get("Cc"), "bob@example.com, carol@example.com");
+
+    // An email the user sent from an alias is answered to its recipients, not to the alias.
+    fake.deliver(personal, crlf(["From: Me <me@mydomain.example>", "To: dana@example.com", "Cc: me.personal@gmail.com", "Subject: Mine", "", "x"]), { id: "v2" });
+    await call("reply", { account: "personal", messageId: "v2", body: "ps", replyAll: true });
+    const own = inspectMime(fake.sentBy(PERSONAL)[2].raw);
+    assert.equal(own.get("To"), "dana@example.com");
+    assert.equal(own.get("Cc"), undefined);
+
+    // Without the settings (a failed call), the primary address and its Gmail variants still never appear.
+    const other = await setup();
+    other.fake.intercept = (_method, path) => (path === "settings/sendAs" ? 403 : undefined);
+    other.fake.deliver(
+      other.personal,
+      crlf(["From: alice@example.com", "To: Me.Personal+x@gmail.com, bob@example.com", "Cc: me@mydomain.example", "Subject: V", "", "hi"]),
+      { id: "v3" },
+    );
+    const fallback = await other.call("reply", { account: "personal", messageId: "v3", body: "ok", replyAll: true });
+    assert.equal(fallback.isError, false, fallback.text);
+    assert.equal(inspectMime(other.fake.sentBy(PERSONAL)[0].raw).get("Cc"), "bob@example.com, me@mydomain.example");
+  });
+
+  test("emails the user sent carry fromMe, from an alias too once the send-as list is known", async () => {
+    const { call, fake, personal } = await setup();
+    personal.sendAs = [{ sendAsEmail: PERSONAL, isPrimary: true, isDefault: true }, { sendAsEmail: "me@mydomain.example" }];
+    fake.deliver(personal, crlf(["From: Me <Me.Personal+work@gmail.com>", "To: alice@example.com", "Subject: Re: Lunch?", "", "Noon?"]), {
+      id: "p2",
+      threadId: "pt1",
+      labelIds: ["SENT"],
+    });
+    fake.deliver(personal, crlf(["From: me@mydomain.example", "To: alice@example.com", "Subject: Re: Lunch?", "", "Or one?"]), {
+      id: "p3",
+      threadId: "pt1",
+      labelIds: ["SENT"],
+    });
+    const fromMe = (res: any) => res.json.threads.find((t: any) => t.id === "pt1").messages.map((m: any) => m.fromMe);
+    assert.deepEqual(fromMe(await call("search_threads", { account: "personal" })), [undefined, true, undefined]);
+    assert.equal(sendAsCalls(fake), 0, "search never asks for the send-as list");
+    // Once something fetched the list (here list_accounts), emails sent from an alias count too.
+    await call("list_accounts");
+    assert.equal(sendAsCalls(fake), 2);
+    assert.deepEqual(fromMe(await call("search_threads", { account: "personal" })), [undefined, true, true]);
+    assert.equal(sendAsCalls(fake), 2);
+    const thread = await call("get_thread", { account: "personal", threadId: "pt1" });
+    assert.deepEqual(thread.json.messages.map((m: any) => m.fromMe), [undefined, true, true]);
+    const msg = await call("get_message", { account: "personal", messageId: "p3" });
+    const keys = Object.keys(msg.json);
+    assert.equal(keys[keys.indexOf("sender") + 1], "fromMe", "right after the sender");
+    assert.equal((await call("get_message", { account: "personal", messageId: "p1" })).json.fromMe, undefined);
+  });
+
+  test("list_accounts lists send-as addresses and checks the grant itself, not a cached token", async () => {
+    const { call, fake, work } = await setup();
+    work.sendAs = [{ sendAsEmail: WORK, isPrimary: true, isDefault: true }, { sendAsEmail: "team@work.example", displayName: "Team" }];
+    assert.equal((await call("get_thread", { account: "work", threadId: "wt1" })).isError, false);
+    const before = fake.tokenCalls;
+    const first = await call("list_accounts");
+    assert.equal(first.isError, false, first.text);
+    assert.deepEqual(first.json.accounts.find((a: any) => a.email === WORK).addresses, ["team@work.example"]);
+    assert.equal(first.json.accounts.find((a: any) => a.email === PERSONAL).addresses, undefined);
+    assert.equal(fake.tokenCalls, before + 2, "a fresh token per account");
+    // The work account's access token is cached and still valid, but Google has revoked the grant.
+    fake.revoked.add("rt-work");
+    fake.requests.length = 0;
+    const second = await call("list_accounts");
+    const status = Object.fromEntries(second.json.accounts.map((a: any) => [a.email, a.status]));
+    assert.deepEqual(status, { [PERSONAL]: "ok", [WORK]: "needs re-link" });
+    assert.ok(fake.requests.every((r) => r.email === PERSONAL), "nothing else is tried on the revoked account");
+  });
+
+  test("includeSignature puts the account's Gmail signature below the text and above any quote", async () => {
+    const { call, fake, work } = await setup();
+    work.sendAs = [{ sendAsEmail: WORK, isPrimary: true, isDefault: true, signature: SIGNATURE }];
+    const sigHtml = `<br><br><div dir="ltr" class="gmail_signature" data-smartmail="gmail_signature">${SIGNATURE}</div>`;
+    const sigText = "-- \nMe\nhttps://work.example";
+
+    await call("send_message", { account: "work", to: ["x@example.com"], subject: "s", body: "Hello", includeSignature: true });
+    const sent = inspectMime(fake.sentBy(WORK)[0].raw);
+    assert.deepEqual(
+      sent.parts.map((p) => [p.type, p.text]),
+      [
+        ["text/plain", `Hello\n\n${sigText}`],
+        ["text/html", `Hello${sigHtml}`],
+      ],
+    );
+
+    await call("reply", { account: "work", messageId: "w1", htmlBody: "<p>Thanks</p>", includeSignature: true });
+    const reply = inspectMime(fake.sentBy(WORK)[1].raw);
+    assert.match(reply.parts[0].text, new RegExp(`^Thanks\\n\\n${sigText}\\n\\nOn Tue, 2 Sep 2026 09:00:00 \\+0000, Boss <boss@work\\.example> wrote:\\n> Please review`));
+    assert.ok(reply.parts[1].text.startsWith(`<p>Thanks</p>${sigHtml}<br><div class="gmail_quote">`), reply.parts[1].text);
+
+    await call("forward", { account: "work", messageId: "w1", to: ["y@example.com"], forwardText: "FYI", includeSignature: true });
+    const fwd = inspectMime(fake.sentBy(WORK)[2].raw);
+    assert.match(fwd.parts[0].text, new RegExp(`^FYI\\n\\n${sigText}\\n\\n---------- Forwarded message ---------\\nFrom: Boss`));
+    assert.ok(fwd.parts[1].text.startsWith(`FYI${sigHtml}<br><br><div class="gmail_quote">`), fwd.parts[1].text);
+
+    const draft = await call("create_draft", { account: "work", to: ["z@example.com"], subject: "d", body: "Draft", includeSignature: true });
+    assert.equal(draft.isError, false, draft.text);
+    const stored = inspectMime(fake.requests.find((r) => r.path === "drafts" && r.method === "POST")!.body.raw);
+    assert.equal(stored.parts[0].text, `Draft\n\n${sigText}`);
+
+    // No signature in Gmail: nothing is added, and the email stays plain text.
+    sendAsCache.clear();
+    work.sendAs = [{ sendAsEmail: WORK, isPrimary: true, isDefault: true, signature: "" }];
+    await call("send_message", { account: "work", to: ["x@example.com"], subject: "s", body: "Hello", includeSignature: true });
+    assert.deepEqual(inspectMime(fake.sentBy(WORK)[3].raw).parts.map((p) => [p.type, p.text]), [["text/plain", "Hello"]]);
+    // Without a send-as entry of its own, the account gets the default entry's signature.
+    sendAsCache.clear();
+    work.sendAs = [{ sendAsEmail: "team@work.example", isDefault: true, signature: "<b>Team</b>" }];
+    await call("send_message", { account: "work", to: ["x@example.com"], subject: "s", body: "Hello", includeSignature: true });
+    assert.equal(inspectMime(fake.sentBy(WORK)[4].raw).parts[0].text, "Hello\n\n-- \nTeam");
+    assert.equal(sendAsCalls(fake), 3);
+  });
+});

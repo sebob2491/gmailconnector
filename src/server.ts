@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js";
-import { AccountError, describeAccount, findAccount, type AccountSource, type LinkedAccount } from "./accounts.js";
+import { AccountError, describeAccount, findAccount, sameEmail, type AccountSource, type LinkedAccount } from "./accounts.js";
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, type FetchLike } from "./google.js";
 import { attachmentResult, FileTooLargeError, kindOf, readOffice, readPdf, readTextFile, sniffType, type ReadResult } from "./attachments.js";
@@ -26,7 +26,8 @@ const INSTRUCTIONS = `This server connects several Gmail accounts at once.
 - Call list_accounts to see which accounts are linked (email + optional alias like "work").
 - search_threads, list_drafts and list_labels cover every linked account when \`account\` is omitted. search_threads merges the results into one list, newest first, and each thread's \`account\` says which inbox it's in; list_drafts and list_labels group results by account.
 - Message, thread, draft and label IDs belong to one account. When you act on an ID, pass the same \`account\` that returned it.
-- send_message, reply and forward require \`account\` whenever more than one account is linked. If the user has not said which address to send from, ask them.`;
+- send_message, reply and forward require \`account\` whenever more than one account is linked. If the user has not said which address to send from, ask them.
+- Emails the user sent carry the SENT label and \`fromMe: true\`; use them to answer "did I reply?".`;
 
 /** Resolves the `account` argument of a tool call to one or more mailboxes. */
 export class AccountRouter {
@@ -40,7 +41,8 @@ export class AccountRouter {
     private mailboxOptions: MailboxOptions = {},
   ) {}
 
-  private mailbox(account: LinkedAccount): Mailbox {
+  /** The mailbox of a linked account (one per account and grant, kept for the router's lifetime). */
+  mailboxFor(account: LinkedAccount): Mailbox {
     const key = `${account.email}\n${account.refreshToken}`;
     let mb = this.mailboxes.get(key);
     if (!mb) {
@@ -63,21 +65,21 @@ export class AccountRouter {
     if (ref?.trim().toLowerCase() === "all") {
       throw new AccountError('This tool works on one account at a time; "all" is only valid for search/list tools.');
     }
-    if (ref?.trim()) return this.mailbox(findAccount(data, ref));
-    if (data.accounts.length === 1) return this.mailbox(data.accounts[0]);
+    if (ref?.trim()) return this.mailboxFor(findAccount(data, ref));
+    if (data.accounts.length === 1) return this.mailboxFor(data.accounts[0]);
     const choices = data.accounts.map(describeAccount).join(", ");
     if (opts.sending) {
       throw new AccountError(
         `More than one Gmail account is linked, so \`account\` is required when sending. Choose one of: ${choices}.`,
       );
     }
-    if (data.defaultAccount) return this.mailbox(findAccount(data, data.defaultAccount));
+    if (data.defaultAccount) return this.mailboxFor(findAccount(data, data.defaultAccount));
     throw new AccountError(`More than one Gmail account is linked; pass \`account\` (one of: ${choices}).`);
   }
 
   async many(ref: string | undefined): Promise<Mailbox[]> {
     if (ref?.trim() && ref.trim().toLowerCase() !== "all") return [await this.one(ref)];
-    return (await this.load()).accounts.map((a) => this.mailbox(a));
+    return (await this.load()).accounts.map((a) => this.mailboxFor(a));
   }
 }
 
@@ -284,6 +286,10 @@ const bodyArg = z
   .optional()
   .describe("Optional. Plain text body. Do NOT format with Markdown; use htmlBody for rich text. If htmlBody is also given, this is the plain-text alternative.");
 const htmlBodyArg = z.string().optional().describe("Optional. HTML body for rich-text formatting (valid HTML tags).");
+const includeSignatureArg = z
+  .boolean()
+  .optional()
+  .describe("Optional. Append the account's Gmail signature (the one set in Gmail's settings for that address) below your text. Defaults to false.");
 const labelIdsArg = z
   .array(z.string())
   .describe("Label IDs or display names, e.g. INBOX, STARRED, UNREAD, IMPORTANT, or a user label such as \"Receipts\". Labels are per account; see list_labels.");
@@ -400,24 +406,26 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "List linked Gmail accounts",
       description:
-        "Lists the Gmail accounts linked to this connector, with their aliases, which one is the default, and each account's `status`. Use the email or alias as the `account` argument of other tools. If an account's status is \"needs re-link\", tell the user and pass on its `hint`: that account won't work until they link it again. The result also says how the user can link or remove accounts.",
+        "Lists the Gmail accounts linked to this connector, with their aliases, which one is the default, and each account's `status`. Use the email or alias as the `account` argument of other tools. If an account's status is \"needs re-link\", tell the user and pass on its `hint`: that account won't work until they link it again. The result also says how the user can link or remove accounts. An account's `addresses` lists the other addresses it can send from (send-as aliases), when it has any.",
       inputSchema: {},
       annotations: read,
     },
     async () =>
       run(async () => {
         const data = await store.load();
-        // Getting an access token shows whether Google still accepts the account's authorization
-        // (tokens are cached, so this is usually free).
+        // A fresh access token shows whether Google still accepts the account's authorization: the
+        // cached one keeps working for up to an hour after the user revokes the connector's access.
+        // The other addresses an account can send from come from its send-as settings (cached).
         const statuses = await Promise.all(
           data.accounts.map(async (a) => {
             try {
-              await tokens.get(a);
-              return { status: "ok" };
+              await tokens.get(a, true);
             } catch (err) {
               if (err instanceof AuthError && err.code === "invalid_grant") return { status: "needs re-link", hint: err.message };
               return { status: "couldn't check", error: (err as Error).message };
             }
+            const addresses = (await router.mailboxFor(a).sendAs()).map((e) => e.sendAsEmail).filter((address) => !sameEmail(address, a.email));
+            return { status: "ok", ...(addresses.length ? { addresses } : {}) };
           }),
         );
         return {
@@ -577,6 +585,7 @@ export function createServer(deps: ServerDeps): McpServer {
         subject: z.string().optional().describe("Optional. Subject line."),
         body: bodyArg,
         htmlBody: htmlBodyArg,
+        includeSignature: includeSignatureArg,
         attachments: attachmentsArg,
         replyToMessageId: z.string().optional().describe("Optional. ID of a message (in the same account) this draft replies to."),
       },
@@ -650,6 +659,7 @@ export function createServer(deps: ServerDeps): McpServer {
         subject: z.string().optional().describe("Optional. Subject line."),
         body: bodyArg,
         htmlBody: htmlBodyArg,
+        includeSignature: includeSignatureArg,
         attachments: attachmentsArg,
         replyThreadId: z.string().optional().describe("Optional. Thread ID to send this message in."),
         replyToMessageId: z.string().optional().describe("Optional. Message ID this message replies to (sets threading headers)."),
@@ -674,6 +684,7 @@ export function createServer(deps: ServerDeps): McpServer {
         messageId: z.string().describe("Required. ID of the message to reply to."),
         body: bodyArg,
         htmlBody: htmlBodyArg,
+        includeSignature: includeSignatureArg,
         replyAll: z.boolean().optional().describe("Optional. Reply to all recipients. Defaults to false."),
         to: addressList("Overrides the default reply recipients."),
         cc: addressList("Overrides the default Cc recipients."),
@@ -702,6 +713,7 @@ export function createServer(deps: ServerDeps): McpServer {
         bcc: addressList("Bcc recipients."),
         forwardText: z.string().optional().describe("Optional. Plain text comments above the forwarded message. Do NOT format with Markdown."),
         htmlBody: z.string().optional().describe("Optional. HTML comments above the forwarded message."),
+        includeSignature: includeSignatureArg,
       },
       annotations: sends,
     },

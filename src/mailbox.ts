@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { sameMailbox } from "./accounts.js";
 import { GmailApiError, GmailClient, type BatchResult } from "./gmailClient.js";
 import { AuthError } from "./google.js";
 import {
@@ -49,6 +50,8 @@ export interface ComposeInput {
   body?: string;
   htmlBody?: string;
   attachments?: AttachmentInput[];
+  /** Append the account's Gmail signature (see Mailbox.signature). */
+  includeSignature?: boolean;
 }
 
 export type ThreadView = "THREAD_VIEW_MINIMAL" | "THREAD_VIEW_METADATA_ONLY";
@@ -446,8 +449,46 @@ export function attachmentDataOf(json: Uint8Array): Uint8Array {
   return Buffer.from((JSON.parse(new TextDecoder().decode(json)) as { data?: string }).data ?? "", "latin1");
 }
 
+// ---------- send-as addresses ----------
+
+/** One of the addresses an account can send from (users.settings.sendAs). */
+export interface SendAsEntry {
+  sendAsEmail: string;
+  displayName?: string;
+  /** Gmail's signature for this address, as HTML. */
+  signature?: string;
+  isPrimary?: boolean;
+  isDefault?: boolean;
+  treatAsAlias?: boolean;
+  verificationStatus?: string;
+}
+
+const SEND_AS_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Each account's send-as list, kept for an hour per isolate (like access tokens), so that reply-all,
+ * signatures and list_accounts cost one settings call per cold account. Keyed by the address and a
+ * fingerprint of the account's grant, so a re-linked account is read again. Exported for tests.
+ */
+export const sendAsCache = new Map<string, { entries: SendAsEntry[]; expiresAt: number }>();
+
+/** A short one-way fingerprint of a secret (two FNV-1a style rounds), for use in a cache key. */
+function fingerprint(secret: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x5bd1e995;
+  for (let i = 0; i < secret.length; i++) {
+    const c = secret.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ c, 0x01000193) ^ (h2 >>> 13);
+  }
+  return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+}
+
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
+  /** A send-as lookup in progress, so one tool call never asks twice. */
+  private sendAsLookup?: Promise<SendAsEntry[]>;
+
   constructor(
     readonly client: GmailClient,
     private readonly options: MailboxOptions = {},
@@ -455,6 +496,79 @@ export class Mailbox {
 
   get email(): string {
     return this.client.email;
+  }
+
+  // ---------- the user's own addresses ----------
+
+  private get sendAsKey(): string {
+    return `${this.email.toLowerCase()}\n${fingerprint(this.client.account.refreshToken)}`;
+  }
+
+  /** The send-as list, if it is in the cache. */
+  private cachedSendAs(): SendAsEntry[] | undefined {
+    const hit = sendAsCache.get(this.sendAsKey);
+    if (!hit) return undefined;
+    if (hit.expiresAt <= Date.now()) {
+      sendAsCache.delete(this.sendAsKey);
+      return undefined;
+    }
+    return hit.entries;
+  }
+
+  /**
+   * The addresses this account can send from (users.settings.sendAs), the primary first. One settings
+   * call per account and hour per isolate; if it fails for any reason, just the primary address.
+   */
+  async sendAs(): Promise<SendAsEntry[]> {
+    const cached = this.cachedSendAs();
+    if (cached) return cached;
+    this.sendAsLookup ??= this.client
+      .request("GET", "settings/sendAs")
+      .then((res) => {
+        const listed = ((res?.sendAs ?? []) as Partial<SendAsEntry>[]).filter(
+          (e): e is SendAsEntry => typeof e.sendAsEmail === "string" && e.sendAsEmail.includes("@"),
+        );
+        // The account's own entry comes first; it is made up if the list somehow lacks it.
+        const own =
+          listed.find((e) => sameMailbox(e.sendAsEmail, this.email)) ??
+          ({ sendAsEmail: this.email, isPrimary: true, isDefault: !listed.some((e) => e.isDefault) } satisfies SendAsEntry);
+        const entries = [own, ...listed.filter((e) => e !== own)];
+        sendAsCache.set(this.sendAsKey, { entries, expiresAt: Date.now() + SEND_AS_TTL_MS });
+        return entries;
+      })
+      .catch((): SendAsEntry[] => [{ sendAsEmail: this.email, isPrimary: true, isDefault: true }])
+      .finally(() => {
+        this.sendAsLookup = undefined;
+      });
+    return this.sendAsLookup;
+  }
+
+  /** The addresses known to be the user's without asking Gmail: the primary, plus any cached send-as ones. */
+  private ownAddresses(): string[] {
+    return [this.email, ...(this.cachedSendAs() ?? []).map((e) => e.sendAsEmail)];
+  }
+
+  /** True when the address is one of the user's own (see ownAddresses; Gmail dot and +tag variants count). */
+  private isMine(address: string): boolean {
+    return this.ownAddresses().some((own) => sameMailbox(own, address));
+  }
+
+  /** The signature Gmail adds for this account: its own send-as entry's, or the default entry's when its own has none. */
+  async signature(): Promise<string> {
+    const entries = await this.sendAs();
+    const own = entries.find((e) => sameMailbox(e.sendAsEmail, this.email))?.signature?.trim();
+    return own || (entries.find((e) => e.isDefault)?.signature?.trim() ?? "");
+  }
+
+  /** Adds `fromMe: true` (right after `sender`) to an email the user sent from any of their addresses. */
+  private markFromMe<T extends { sender?: string }>(msg: T): T & { fromMe?: true } {
+    if (!msg.sender || !this.isMine(bareAddress(msg.sender))) return msg;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(msg)) {
+      out[key] = value;
+      if (key === "sender") out.fromMe = true;
+    }
+    return out as T & { fromMe: true };
   }
 
   private loader(messageId: string) {
@@ -513,7 +627,7 @@ export class Mailbox {
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
       const recent = messages.slice(-THREAD_PREVIEW_MESSAGES);
-      const summaries = (await Promise.all(recent.map((m) => this.format(m, format)))).map((m) => this.searchSummary(m));
+      const summaries = (await Promise.all(recent.map((m) => this.format(m, format)))).map((m) => this.markFromMe(this.searchSummary(m)));
       const link = viewUrl(this.email, `all/${id}`);
       // Most threads hold one email: show it flat instead of a thread wrapping a one-item list.
       if (summaries.length === 1) {
@@ -546,7 +660,9 @@ export class Mailbox {
     });
     const messages = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT"));
     // The first message keeps any quote: what it quotes isn't in this thread.
-    const formatted = await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts)));
+    const formatted = (
+      await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts)))
+    ).map((m) => this.markFromMe(m));
     const base = {
       id: thread.id as string,
       viewUrl: viewUrl(this.email, `all/${thread.id}`),
@@ -576,7 +692,7 @@ export class Mailbox {
     const msg: ApiMessage = await this.client.request("GET", `messages/${checkId(messageId, "message")}`, {
       query: { format: apiFormat(format), metadataHeaders: apiFormat(format) === "metadata" ? METADATA_HEADERS : undefined },
     });
-    return this.format(msg, format, opts);
+    return this.markFromMe(await this.format(msg, format, opts));
   }
 
   /**
@@ -642,20 +758,25 @@ export class Mailbox {
     return this.client.request(method, path, { upload });
   }
 
-  /** Threading headers and default recipients for replying to `messageId`. */
+  /**
+   * Threading headers and default recipients for replying to `messageId`. The user's own addresses
+   * never end up among the recipients: for reply-all that means every send-as address (one settings
+   * call per cold account); otherwise the primary address and whatever send-as list is cached.
+   */
   async replyContext(messageId: string, replyAll = false) {
     const original = await this.getRawMessage(messageId, "full");
     const p = original.payload;
-    const self = this.email.toLowerCase();
     const from = header(p, "From") ?? "";
     const toHeader = header(p, "To");
     const ccHeader = header(p, "Cc");
+    const own = replyAll ? [this.email, ...(await this.sendAs()).map((e) => e.sendAsEmail)] : this.ownAddresses();
+    const mine = (address: string) => own.some((a) => sameMailbox(a, address));
     // Derived recipients skip anything that isn't a real address (e.g. "undisclosed-recipients:;").
-    const sentBySelf = bareAddress(from) === self;
+    const sentBySelf = mine(bareAddress(from));
     const to = sentBySelf ? recipientsFrom(toHeader) : recipientsFrom(header(p, "Reply-To") || from);
     const toAddresses = to.map((m) => m.address);
     const cc = replyAll
-      ? recipientsFrom(sentBySelf ? ccHeader : [toHeader, ccHeader].filter(Boolean).join(", "), [self, ...toAddresses])
+      ? recipientsFrom(sentBySelf ? ccHeader : [toHeader, ccHeader].filter(Boolean).join(", "), toAddresses).filter((m) => !mine(m.address))
       : [];
     const content = await extractContent(p, this.loader(original.id));
     return {
@@ -674,19 +795,36 @@ export class Mailbox {
     };
   }
 
+  /**
+   * The user's own text and HTML for an email, with the account's Gmail signature appended when asked
+   * for: in the HTML as Gmail marks it up, in the text after a "-- " line. A signature gives even a
+   * plain-text email an HTML part, so its formatting and links survive.
+   */
+  private async bodies(input: { body?: string; htmlBody?: string; includeSignature?: boolean }): Promise<{ text: string; html?: string }> {
+    const text = input.body ?? (input.htmlBody ? htmlToText(input.htmlBody) : "");
+    const signature = input.includeSignature ? await this.signature() : "";
+    if (!signature) return { text, html: input.htmlBody };
+    const html = input.htmlBody ?? escapeHtml(text).replace(/\n/g, "<br>");
+    return {
+      text: [text, `-- \n${htmlToText(signature)}`].filter(Boolean).join("\n\n"),
+      html: `${html}<br><br><div dir="ltr" class="gmail_signature" data-smartmail="gmail_signature">${signature}</div>`,
+    };
+  }
+
+  /** Puts the quoted original (attribution and all) below the user's own text and HTML. */
   private withQuote(
-    input: ComposeInput,
+    own: { text: string; html?: string },
     quote: { attribution: string; text: string; html?: string },
-  ): { text?: string; html?: string } {
+  ): { text: string; html?: string } {
     const quotedText = `${quote.attribution}\n${quote.text
       .split(/\r?\n/)
       .map((line) => `> ${line}`)
       .join("\n")}`;
-    const text = `${input.body ?? (input.htmlBody ? htmlToText(input.htmlBody) : "")}\n\n${quotedText}`;
-    if (!input.htmlBody) return { text };
+    const text = `${own.text}\n\n${quotedText}`;
+    if (!own.html) return { text };
     const quotedHtml = quote.html ?? escapeHtml(quote.text).replace(/\n/g, "<br>");
     const html =
-      `${input.htmlBody}<br><div class="gmail_quote"><div class="gmail_attr">${escapeHtml(quote.attribution)}<br></div>` +
+      `${own.html}<br><div class="gmail_quote"><div class="gmail_attr">${escapeHtml(quote.attribution)}<br></div>` +
       `<blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px #ccc solid;padding-left:1ex">${quotedHtml}</blockquote></div>`;
     return { text, html };
   }
@@ -701,13 +839,14 @@ export class Mailbox {
     if (!to.length && !input.cc?.length && !input.bcc?.length) {
       throw new MimeError("Provide at least one recipient in to, cc or bcc (or a draftId).");
     }
+    const own = await this.bodies(input);
     const msg: OutgoingMessage = {
       to,
       cc: input.cc,
       bcc: input.bcc,
       subject: input.subject,
-      text: input.body,
-      html: input.htmlBody,
+      text: own.text,
+      html: own.html,
       attachments: toAttachments(input.attachments),
     };
     let threadId = input.replyThreadId;
@@ -738,7 +877,7 @@ export class Mailbox {
   async reply(input: ComposeInput & { messageId: string; replyAll?: boolean }) {
     if (!input.body && !input.htmlBody) throw new MimeError("Provide body or htmlBody for the reply.");
     const ctx = await this.replyContext(input.messageId, input.replyAll);
-    const { text, html } = this.withQuote(input, ctx.quote);
+    const { text, html } = this.withQuote(await this.bodies(input), ctx.quote);
     const mime = buildMimeChunks({
       to: input.to?.length ? input.to : ctx.to,
       cc: input.cc?.length ? input.cc : ctx.cc,
@@ -761,6 +900,7 @@ export class Mailbox {
     bcc?: string[];
     forwardText?: string;
     htmlBody?: string;
+    includeSignature?: boolean;
   }) {
     if (!input.to?.length && !input.cc?.length && !input.bcc?.length) {
       throw new MimeError("Provide at least one recipient in to, cc or bcc.");
@@ -777,12 +917,12 @@ export class Mailbox {
       ["Cc", header(p, "Cc")],
     ];
     const present = meta.filter((m): m is [string, string] => Boolean(m[1]));
-    const intro = input.forwardText ?? (input.htmlBody ? htmlToText(input.htmlBody) : "");
+    const own = await this.bodies({ body: input.forwardText, htmlBody: input.htmlBody, includeSignature: input.includeSignature });
     const text =
-      `${intro}\n\n---------- Forwarded message ---------\n` +
+      `${own.text}\n\n---------- Forwarded message ---------\n` +
       present.map(([k, v]) => `${k}: ${v}`).join("\n") +
       `\n\n${origText}`;
-    const introHtml = input.htmlBody ?? escapeHtml(input.forwardText ?? "").replace(/\n/g, "<br>");
+    const introHtml = own.html ?? escapeHtml(own.text).replace(/\n/g, "<br>");
     const html =
       `${introHtml}<br><br><div class="gmail_quote">---------- Forwarded message ---------<br>` +
       present.map(([k, v]) => `${k}: ${escapeHtml(v)}<br>`).join("") +
@@ -895,19 +1035,20 @@ export class Mailbox {
   }
 
   async createDraft(input: ComposeInput & { replyToMessageId?: string }) {
+    const own = await this.bodies(input);
     const msg: OutgoingMessage = {
       to: input.to,
       cc: input.cc,
       bcc: input.bcc,
       subject: input.subject,
-      text: input.body,
-      html: input.htmlBody,
+      text: own.text,
+      html: own.html,
       attachments: toAttachments(input.attachments),
     };
     let threadId: string | undefined;
     if (input.replyToMessageId) {
       const ctx = await this.replyContext(input.replyToMessageId);
-      Object.assign(msg, this.withQuote(input, ctx.quote));
+      Object.assign(msg, this.withQuote(own, ctx.quote));
       msg.inReplyTo = ctx.inReplyTo;
       msg.references = ctx.references;
       msg.subject = input.subject || ctx.subject;

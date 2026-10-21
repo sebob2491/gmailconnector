@@ -20,6 +20,8 @@ export interface FakeMailbox {
   attachments: Map<string, string>; // `${messageId}/${attachmentId}` -> base64url data
   sent: { metadata: any; raw: string; message: ApiMessage }[];
   pageSize?: number;
+  /** The account's send-as settings; when unset, just the primary address. */
+  sendAs?: { sendAsEmail: string; displayName?: string; signature?: string; isPrimary?: boolean; isDefault?: boolean }[];
 }
 
 export interface RecordedRequest {
@@ -429,6 +431,9 @@ export class FakeGmail {
     }
 
     if (path === "profile") return json(200, { emailAddress: mb.email });
+    if (path === "settings/sendAs" && method === "GET") {
+      return json(200, { sendAs: mb.sendAs ?? [{ sendAsEmail: mb.email, isPrimary: true, isDefault: true }] });
+    }
     return json(400, { error: { message: `fake: unhandled ${method} ${path}` } });
   };
 
