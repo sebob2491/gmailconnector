@@ -409,6 +409,7 @@ describe("reading", () => {
     const meta = await call("get_message", { account: WORK, messageId: "w1", messageFormat: "METADATA_ONLY" });
     assert.equal(meta.json.subject, undefined);
     assert.equal(meta.json.sender, "Boss <boss@work.example>");
+    assert.match(meta.json.date, /^2026-09-01T12:\d\d:\d\dZ$/, "dates are given to the second");
   });
 });
 

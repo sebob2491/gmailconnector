@@ -333,6 +333,13 @@ export function bodyText(content: { text?: string; html?: string }): string {
   return content.text ?? "";
 }
 
+/** Gmail's internalDate (milliseconds since 1970) as ISO 8601 to the second, e.g. 2026-10-20T21:09:45Z; undefined if it isn't a time. */
+export function isoTime(internalDate: string | number | undefined): string | undefined {
+  if (internalDate === undefined || internalDate === "") return undefined;
+  const date = new Date(Number(internalDate));
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
 export function viewUrl(email: string, fragment: string): string {
   return `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#${fragment}`;
 }
@@ -501,7 +508,7 @@ export async function formatMessage(
   const bcc = parseAddressList(header(p, "Bcc"));
   if (cc.length) out.ccRecipients = cc;
   if (bcc.length) out.bccRecipients = bcc;
-  out.date = msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : header(p, "Date");
+  out.date = isoTime(msg.internalDate) ?? header(p, "Date");
   out.labelIds = msg.labelIds ?? [];
 
   if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {

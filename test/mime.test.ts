@@ -413,3 +413,12 @@ test("an unnamed text/calendar part is listed as invite.ics, never used as the b
   assert.equal(only.text, undefined);
   assert.equal(only.attachments[0].filename, "invite.ics");
 });
+
+test("dates are ISO 8601 to the second; a missing or broken internalDate falls back to the Date header", async () => {
+  const none = async () => "";
+  const payload: ApiMessagePart = { partId: "", mimeType: "text/plain", headers: [{ name: "Date", value: "Tue, 20 Oct 2026 21:09:45 +0000" }], body: { size: 0 } };
+  const at = (internalDate?: string) => formatMessage({ id: "m", threadId: "t", internalDate, payload }, "METADATA_ONLY", "me@example.com", none);
+  assert.equal((await at(String(Date.UTC(2026, 9, 20, 21, 9, 45, 123)))).date, "2026-10-20T21:09:45Z");
+  assert.equal((await at(undefined)).date, "Tue, 20 Oct 2026 21:09:45 +0000");
+  assert.equal((await at("not a time")).date, "Tue, 20 Oct 2026 21:09:45 +0000");
+});
