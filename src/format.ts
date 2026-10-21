@@ -185,6 +185,16 @@ export function attachmentCharset(payload: ApiMessagePart | undefined, partId: s
 /** Charsets whose text is all ASCII bytes, read through escape sequences (ISO-2022-JP, HZ, UTF-7). */
 const SEVEN_BIT = /^(?:iso-?2022|csiso2022|hz-|utf-?7)/;
 
+/** East Asian multibyte charsets, in which a few bytes of text can happen to be valid UTF-8 as well. */
+const EAST_ASIAN = /^(?:gb|x-gbk|big5|cn-big5|csbig5|x-x-big5|shift[-_]?jis|x-sjis|sjis|ms_kanji|csshiftjis|windows-(?:31j|936|949|950)|euc-|x-euc|cseuc|ks_c_5601|ksc5601|korean)/;
+
+/** True when `bytes` holds at most `max` bytes outside ASCII. */
+function fewNonAscii(bytes: Uint8Array, max: number): boolean {
+  let n = 0;
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] >= 0x80 && ++n > max) return false;
+  return true;
+}
+
 /** Charsets that mean "UTF-8 if it is valid": senders often label Windows-1252 text as one of these. */
 const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-utf-8"]);
 
@@ -193,7 +203,8 @@ const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-ut
  * UTF-8 whatever the label says. Gmail hands out message bodies already converted to UTF-8 while the
  * part still declares its original charset (e.g. ISO-8859-1), and decoding those as declared turns
  * "—" into "â€”"; text really written in a single-byte or East Asian charset is almost never valid
- * UTF-8. Undeclared, unknown or wrongly declared UTF-8 falls back to Windows-1252. `partial` says the
+ * UTF-8 (except a few characters of East Asian text, which are read as declared when they are valid
+ * there). Undeclared, unknown or wrongly declared UTF-8 falls back to Windows-1252. `partial` says the
  * bytes are cut off, so a split last character doesn't count against UTF-8.
  */
 export function decodeCharset(bytes: Uint8Array, declared?: string, partial = false): string {
@@ -210,6 +221,15 @@ export function decodeCharset(bytes: Uint8Array, declared?: string, partial = fa
   // Plain ASCII reads the same in every charset except the 7-bit ones that switch modes with escapes.
   const ascii = isAscii(bytes);
   if (ascii && !(charset && SEVEN_BIT.test(charset))) return utf8();
+  // A few bytes of GBK, Big5, Shift_JIS or EUC text can pass for UTF-8 by chance ("C4 A3" is 模 in GBK and ģ in
+  // UTF-8), while text Gmail converted to UTF-8 has more than a few: up to 8 are read as declared if valid there.
+  if (charset && EAST_ASIAN.test(charset) && fewNonAscii(bytes, 8)) {
+    try {
+      return new TextDecoder(charset, { fatal: true, ignoreBOM: false }).decode(bytes, { stream: partial });
+    } catch {
+      // Not valid in the declared charset (or an unknown name): go on as for any other charset.
+    }
+  }
   if (!charset || UTF8_LIKE.has(charset) || !ascii) {
     try {
       return utf8();

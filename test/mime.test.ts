@@ -324,6 +324,18 @@ test("bodies Gmail already converted to UTF-8 aren't decoded twice; real legacy 
   assert.equal(decodeBody(Buffer.from("café", "utf8").toString("base64url"), "text/plain; charset=windows-1252"), "café");
 });
 
+test("a few bytes of East Asian text that also pass as UTF-8 are read as declared; converted text stays UTF-8", () => {
+  // C4 A3 is 模 in GBK and ģ in UTF-8; C2 A9 is ﾂｩ in Shift_JIS and © in UTF-8.
+  assert.equal(decodeCharset(Buffer.from([0xc4, 0xa3]), "gb2312"), "模");
+  assert.equal(decodeCharset(Buffer.from([0xc2, 0xa9]), "Shift_JIS"), "ﾂｩ");
+  // A Japanese sentence Gmail delivered as UTF-8 under its original ISO-2022-JP or Shift_JIS label.
+  const sentence = "お世話になっております。来週の打ち合わせの件、承知いたしました。";
+  assert.equal(decodeCharset(Buffer.from(sentence, "utf8"), "ISO-2022-JP"), sentence);
+  assert.equal(decodeCharset(Buffer.from(sentence, "utf8"), "shift_jis"), sentence);
+  // An em dash (3 bytes) in converted English text isn't valid GBK, so it stays UTF-8.
+  assert.equal(decodeCharset(Buffer.from("Q4 — done", "utf8"), "gbk"), "Q4 — done");
+});
+
 test("attachments re-attached from Gmail's base64url text come out byte for byte as when decoded and encoded again", () => {
   /** What re-attaching produced before: decode the file, then base64 in 76-character lines. */
   const reference = (bytes: Buffer) => (bytes.toString("base64").match(/.{1,76}/g) ?? [""]).join("\r\n");
