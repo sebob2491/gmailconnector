@@ -1148,6 +1148,7 @@ class PdfFile {
   private readonly objectStreams = new Map<number, { text: string; first: number; offsets: number[] }>();
   private readonly cache = new Map<number, PdfValue | PdfStream | null>();
   private readonly decoded = new Map<number, string | null>();
+  private readonly cmaps = new Map<number, CMap | null>();
   private resolving = 0;
   root?: PdfDict;
 
@@ -1288,10 +1289,10 @@ class PdfFile {
   }
 
   /**
-   * A stream's decoded content (one character per byte), within the file's unpacking budget;
-   * undefined for filters other than Flate, damaged data or a stream too large to unpack.
+   * A stream's decoded content (one character per byte), within the file's unpacking budget and
+   * `maxBytes`; undefined for filters other than Flate, damaged data or a stream too large to unpack.
    */
-  decode(stream: PdfStream, num?: number): string | undefined {
+  decode(stream: PdfStream, num?: number, maxBytes = MAX_PART_BYTES): string | undefined {
     if (num !== undefined && this.decoded.has(num)) return this.decoded.get(num) ?? undefined;
     const filters = [this.get(stream.dict.get("Filter"))].flat().map((f) => nameOf(f as PdfValue));
     let data: Uint8Array = this.buf.subarray(stream.start, stream.end);
@@ -1300,18 +1301,555 @@ class PdfFile {
       try {
         for (const filter of filters) {
           if (!filter) continue;
-          if (this.budget.partBytes <= 0) throw new RangeError("budget");
-          data = inflate(data, "deflate", this.budget.partBytes);
+          const limit = Math.min(maxBytes, this.budget.partBytes);
+          if (limit <= 0) throw new RangeError("budget");
+          data = inflate(data, "deflate", limit);
           this.budget.spend(data.length);
         }
         result = latin1(data);
       } catch (err) {
-        if (isOverLimit(err)) this.budget.cut(this.budget.partBytes <= 0 ? FILE_TOO_LARGE : PDF_PART_TOO_LARGE);
+        // Only the file's own limits are worth a note; a stream past the caller's (a font's CMap) is just left out.
+        if (isOverLimit(err) && this.budget.partBytes <= maxBytes) this.budget.cut(this.budget.partBytes <= 0 ? FILE_TOO_LARGE : PDF_PART_TOO_LARGE);
       }
     }
     if (num !== undefined) this.decoded.set(num, result ?? null);
     return result;
   }
+
+  /** A CMap stream (a font's /ToUnicode, or a composite font's /Encoding), parsed once per object; undefined when missing or unusable. */
+  cmap(value: PdfValue | undefined): CMap | undefined {
+    if (!(value instanceof PdfRef)) return undefined;
+    const cached = this.cmaps.get(value.num);
+    if (cached !== undefined) return cached ?? undefined;
+    const stream = this.stream(value);
+    const text = stream && this.decode(stream, value.num, MAX_CMAP_BYTES);
+    let result: CMap | undefined;
+    if (text !== undefined && text.length <= MAX_CMAP_BYTES) {
+      this.budget.spend(text.length);
+      result = parseCMap(text);
+    }
+    this.cmaps.set(value.num, result ?? null);
+    return result;
+  }
+}
+
+// ---------- PDF fonts ----------
+
+/** Most text of one CMap that is parsed (inflated), mappings kept from it, and codes one bfrange may span. */
+const MAX_CMAP_BYTES = 2 * 1024 * 1024;
+const MAX_CMAP_ENTRIES = 200_000;
+const MAX_CMAP_SPAN = 65_536;
+/** Most entries read from an encoding's /Differences array, and from a CID font's /W widths (single widths, and wide ranges). */
+const MAX_DIFFERENCES = 1_024;
+const MAX_CID_WIDTHS = 65_536;
+const MAX_CID_RANGES = 64;
+
+/** The text of each byte in Windows-1252 (WinAnsiEncoding), PDF's common single-byte text encoding. */
+const WIN1252 = win1252Decoder.decode(Uint8Array.from({ length: 256 }, (_, i) => i));
+
+/** Glyph names of the printable ASCII characters, in order. */
+const ASCII_NAMES = [
+  "space exclam quotedbl numbersign dollar percent ampersand quotesingle parenleft parenright asterisk plus comma hyphen period slash",
+  "zero one two three four five six seven eight nine colon semicolon less equal greater question at",
+  [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"].join(" "),
+  "bracketleft backslash bracketright asciicircum underscore grave",
+  [..."abcdefghijklmnopqrstuvwxyz"].join(" "),
+  "braceleft bar braceright asciitilde",
+].join(" ");
+/** Glyph names of U+00A0–U+00FF, in order. */
+const LATIN1_NAMES =
+  "space exclamdown cent sterling currency yen brokenbar section dieresis copyright ordfeminine guillemotleft logicalnot hyphen registered macron " +
+  "degree plusminus twosuperior threesuperior acute mu paragraph periodcentered cedilla onesuperior ordmasculine guillemotright onequarter onehalf threequarters questiondown " +
+  "Agrave Aacute Acircumflex Atilde Adieresis Aring AE Ccedilla Egrave Eacute Ecircumflex Edieresis Igrave Iacute Icircumflex Idieresis " +
+  "Eth Ntilde Ograve Oacute Ocircumflex Otilde Odieresis multiply Oslash Ugrave Uacute Ucircumflex Udieresis Yacute Thorn germandbls " +
+  "agrave aacute acircumflex atilde adieresis aring ae ccedilla egrave eacute ecircumflex edieresis igrave iacute icircumflex idieresis " +
+  "eth ntilde ograve oacute ocircumflex otilde odieresis divide oslash ugrave uacute ucircumflex udieresis yacute thorn ydieresis";
+/** Glyph names of Windows-1252's bytes 0x80–0x9F, in order ("." where the byte has no character). */
+const WIN1252_NAMES =
+  "Euro . quotesinglbase florin quotedblbase ellipsis dagger daggerdbl circumflex perthousand Scaron guilsinglleft OE . Zcaron . " +
+  ". quoteleft quoteright quotedblleft quotedblright bullet endash emdash tilde trademark scaron guilsinglright oe . zcaron Ydieresis";
+/** Glyph names of MacRomanEncoding's bytes 0x80–0xFF, in order. */
+const MACROMAN_NAMES =
+  "Adieresis Aring Ccedilla Eacute Ntilde Odieresis Udieresis aacute agrave acircumflex adieresis atilde aring ccedilla eacute egrave " +
+  "ecircumflex edieresis iacute igrave icircumflex idieresis ntilde oacute ograve ocircumflex odieresis otilde uacute ugrave ucircumflex udieresis " +
+  "dagger degree cent sterling section bullet paragraph germandbls registered copyright trademark acute dieresis notequal AE Oslash " +
+  "infinity plusminus lessequal greaterequal yen mu partialdiff summation product pi integral ordfeminine ordmasculine Omega ae oslash " +
+  "questiondown exclamdown logicalnot radical florin approxequal Delta guillemotleft guillemotright ellipsis space Agrave Atilde Otilde OE oe " +
+  "endash emdash quotedblleft quotedblright quoteleft quoteright divide lozenge ydieresis Ydieresis fraction currency guilsinglleft guilsinglright fi fl " +
+  "daggerdbl periodcentered quotesinglbase quotedblbase perthousand Acircumflex Ecircumflex Aacute Edieresis Egrave Iacute Icircumflex Idieresis Igrave Oacute Ocircumflex " +
+  "apple Ograve Uacute Ucircumflex Ugrave dotlessi circumflex tilde macron breve dotaccent ring cedilla hungarumlaut ogonek caron";
+/** StandardEncoding's bytes above 0xA0 that have a glyph, as "byte name" pairs (its ASCII range is read as Windows-1252). */
+const STANDARD_NAMES =
+  "A1 exclamdown A2 cent A3 sterling A4 fraction A5 yen A6 florin A7 section A8 currency A9 quotesingle AA quotedblleft AB guillemotleft " +
+  "AC guilsinglleft AD guilsinglright AE fi AF fl B1 endash B2 dagger B3 daggerdbl B4 periodcentered B6 paragraph B7 bullet B8 quotesinglbase " +
+  "B9 quotedblbase BA quotedblright BB guillemotright BC ellipsis BD perthousand BF questiondown C1 grave C2 acute C3 circumflex C4 tilde " +
+  "C5 macron C6 breve C7 dotaccent C8 dieresis CA ring CB cedilla CD hungarumlaut CE ogonek CF caron D0 emdash E1 AE E3 ordfeminine " +
+  "E8 Lslash E9 Oslash EA OE EB ordmasculine F1 ae F5 dotlessi F8 lslash F9 oslash FA oe FB germandbls";
+/** Other common glyph names: ligatures, typographic marks, accents and the symbols MacRomanEncoding names. */
+const OTHER_GLYPHS: Record<string, string> = {
+  fi: "\ufb01", fl: "\ufb02", ff: "\ufb00", ffi: "\ufb03", ffl: "\ufb04", fraction: "\u2044", minus: "\u2212", dotlessi: "\u0131", Lslash: "\u0141",
+  lslash: "\u0142", caron: "\u02c7", breve: "\u02d8", dotaccent: "\u02d9", ring: "\u02da", ogonek: "\u02db", hungarumlaut: "\u02dd",
+  nbspace: "\u00a0", nonbreakingspace: "\u00a0", sfthyphen: "\u00ad", softhyphen: "\u00ad", quotereversed: "\u201b", notequal: "\u2260",
+  infinity: "\u221e", lessequal: "\u2264", greaterequal: "\u2265", partialdiff: "\u2202", summation: "\u2211", product: "\u220f", pi: "\u03c0",
+  integral: "\u222b", Omega: "\u03a9", radical: "\u221a", approxequal: "\u2248", Delta: "\u2206", lozenge: "\u25ca", apple: "\uf8ff",
+  arrowleft: "\u2190", arrowup: "\u2191", arrowright: "\u2192", arrowdown: "\u2193",
+};
+
+let glyphs: Map<string, string> | undefined;
+let macRoman: string[] | undefined;
+let standard: string[] | undefined;
+
+/** Glyph name → text, from the lists above (built on first use). */
+function glyphList(): Map<string, string> {
+  if (glyphs) return glyphs;
+  const list = (glyphs = new Map<string, string>());
+  const define = (names: string, from: number, source?: string) =>
+    names.split(" ").forEach((name, i) => {
+      if (name !== "." && !list.has(name)) list.set(name, source ? source[from + i] : String.fromCharCode(from + i));
+    });
+  define(ASCII_NAMES, 0x20);
+  define(LATIN1_NAMES, 0xa0);
+  define(WIN1252_NAMES, 0x80, WIN1252);
+  for (const [name, text] of Object.entries(OTHER_GLYPHS)) list.set(name, text);
+  return list;
+}
+
+/**
+ * The text of a glyph name: the Adobe Glyph List subset above, uniXXXX (several in a row for
+ * ligatures), uXXXX[XX], variants like "a.sc" and ligatures like "f_f_i"; undefined for names
+ * that say nothing about the character (g12, cid7, glyph3, index9, …).
+ */
+function glyphText(name: string): string | undefined {
+  const known = glyphList().get(name);
+  if (known !== undefined) return known;
+  const m = /^(?:uni((?:[0-9A-Fa-f]{4})+)|u([0-9A-Fa-f]{4,6}))$/.exec(name);
+  if (m?.[1]) {
+    let out = "";
+    for (let i = 0; i < m[1].length; i += 4) out += String.fromCharCode(parseInt(m[1].slice(i, i + 4), 16));
+    return out;
+  }
+  if (m?.[2]) {
+    const code = parseInt(m[2], 16);
+    return code <= 0x10ffff && !(code >= 0xd800 && code <= 0xdfff) ? String.fromCodePoint(code) : undefined;
+  }
+  const dot = name.indexOf(".");
+  if (dot > 0) return glyphText(name.slice(0, dot));
+  if (name.includes("_")) {
+    const parts = name.split("_").map((part) => (part ? glyphText(part) : undefined));
+    return parts.every((part) => part !== undefined) ? parts.join("") : undefined;
+  }
+  return undefined;
+}
+
+/** The text of each byte in MacRomanEncoding or StandardEncoding; undefined for WinAnsiEncoding (Windows-1252) and unknown names. */
+function baseEncoding(name: string | undefined): string[] | undefined {
+  if (name === "MacRomanEncoding") {
+    if (!macRoman) {
+      macRoman = Array.from(WIN1252);
+      MACROMAN_NAMES.split(" ").forEach((glyph, i) => (macRoman![0x80 + i] = glyphText(glyph) ?? ""));
+    }
+    return macRoman;
+  }
+  if (name === "StandardEncoding") {
+    if (!standard) {
+      standard = Array.from(WIN1252);
+      const pairs = STANDARD_NAMES.split(" ");
+      for (let i = 0; i < pairs.length; i += 2) standard[parseInt(pairs[i], 16)] = glyphText(pairs[i + 1]) ?? "";
+    }
+    return standard;
+  }
+  return undefined;
+}
+
+/**
+ * The text of each byte under a simple font's /Encoding: a base encoding's table, with the glyph
+ * names of a /Differences array applied on top; undefined when Windows-1252 (the fast path) is right.
+ */
+function encodingTable(file: PdfFile, encoding: PdfValue | PdfStream | undefined): string[] | undefined {
+  if (!isDict(encoding)) return baseEncoding(nameOf(encoding));
+  const base = baseEncoding(nameOf(file.get(encoding.get("BaseEncoding"))));
+  const differences = file.array(encoding.get("Differences"));
+  if (!differences?.length) return base;
+  const table = Array.from(base ?? WIN1252);
+  let code = 0;
+  let changed = false;
+  for (const item of differences.slice(0, MAX_DIFFERENCES)) {
+    if (typeof item === "number") code = Math.trunc(item);
+    else if (item instanceof PdfName) {
+      const text = glyphText(item.name);
+      if (text !== undefined && code >= 0 && code < 256 && table[code] !== text) {
+        table[code] = text;
+        changed = true;
+      }
+      code++;
+    }
+  }
+  return changed || base ? table : undefined;
+}
+
+/** A CMap's codespace (ranges by code length in bytes, index 1–4, as lo, hi, lo, hi, …) and its code → text mappings. */
+interface CMap {
+  codespace: number[][];
+  map: Map<number, string>;
+}
+
+/**
+ * The UTF-16BE text of a CMap destination string whose hex digits sit at [start, end), with the
+ * given value and digit count. <0000> is what some producers write for glyphs without a character
+ * (it means "none", not a NUL).
+ */
+function cmapText(s: string, value: number, digits: number, start: number, end: number): string {
+  if (digits === 0 || (digits <= 4 && value === 0)) return "";
+  if (digits <= 4) return String.fromCharCode(digits % 2 ? value * 16 : value);
+  const hex = s.slice(start, end).replace(/[^0-9A-Fa-f]/g, "");
+  let out = "";
+  for (let i = 0; i < hex.length; i += 4) out += String.fromCharCode(parseInt(hex.slice(i, i + 4).padEnd(4, "0"), 16));
+  return out;
+}
+
+/** Hex digit values by character code (-1 for other characters). */
+const HEX_VALUE = new Int8Array(128).fill(-1);
+for (let i = 0; i < 16; i++) HEX_VALUE["0123456789ABCDEF".charCodeAt(i)] = HEX_VALUE["0123456789abcdef".charCodeAt(i)] = i;
+
+/** The sections of a CMap that matter here. */
+const enum CMapSection {
+  Other,
+  Codespace,
+  Char,
+  Range,
+}
+
+/**
+ * Parses a CMap (PostScript-like text): codespacerange, bfchar and bfrange sections, the latter
+ * as "<lo> <hi> <dst>" (dst's last code unit counts up) or "<lo> <hi> [<dst> …]"; destinations are
+ * UTF-16BE. Bounded by MAX_CMAP_BYTES of text and MAX_CMAP_ENTRIES mappings; ranges with lo > hi
+ * or over MAX_CMAP_SPAN codes are skipped. Damaged input never throws: what was read so far is kept.
+ * Hand-written scanning (no regular expressions, no per-token allocation): large CMaps are hostile.
+ */
+function parseCMap(s: string): CMap {
+  const codespace: number[][] = [[], [], [], [], []];
+  const map = new Map<number, string>();
+  const n = Math.min(s.length, MAX_CMAP_BYTES);
+  let entries = 0;
+  let section = CMapSection.Other;
+  // Up to three pending hex operands of the entry being read: value (of the first 8 digits), digit count and, for destinations, where the digits are.
+  let k = 0;
+  let v0 = 0, d0 = 0; // prettier-ignore
+  let v1 = 0, d1 = 0, s1 = 0, e1 = 0; // prettier-ignore
+  let v2 = 0, d2 = 0, s2 = 0, e2 = 0; // prettier-ignore
+  let array: string[] | undefined;
+  const addRange = (lo: number, hi: number, dst: string | string[]) => {
+    if (hi < lo || hi - lo >= MAX_CMAP_SPAN) return;
+    const last = Math.min(hi, lo + (MAX_CMAP_ENTRIES - entries) - 1);
+    if (Array.isArray(dst)) {
+      for (let c = lo, i = 0; c <= last && i < dst.length; c++, i++) map.set(c, dst[i]);
+    } else if (!dst) {
+      for (let c = lo; c <= last; c++) map.set(c, "");
+    } else {
+      const head = dst.slice(0, -1);
+      const unit = dst.charCodeAt(dst.length - 1);
+      for (let c = lo, i = 0; c <= last; c++, i++) map.set(c, head ? head + String.fromCharCode(unit + i) : String.fromCharCode(unit + i));
+    }
+    entries += last - lo + 1;
+  };
+  let pos = 0;
+  while (pos < n && entries < MAX_CMAP_ENTRIES) {
+    const c = s.charCodeAt(pos);
+    if (c <= 32) {
+      pos++;
+    } else if (c === 60 /* < */) {
+      if (s.charCodeAt(pos + 1) === 60) {
+        pos += 2;
+        continue;
+      }
+      let value = 0;
+      let count = 0;
+      let i = pos + 1;
+      for (; i < n; i++) {
+        const d = s.charCodeAt(i);
+        const v = d < 128 ? HEX_VALUE[d] : -1;
+        if (v < 0) {
+          if (d === 62 /* > */) break;
+          continue;
+        }
+        if (count < 8) value = value * 16 + v;
+        count++;
+      }
+      const start = pos + 1;
+      pos = i + 1;
+      if (array) {
+        array.push(cmapText(s, value, count, start, i));
+        continue;
+      }
+      if (k === 0) {
+        v0 = value;
+        d0 = count;
+      } else if (k === 1) {
+        v1 = value;
+        d1 = count;
+        s1 = start;
+        e1 = i;
+      } else {
+        v2 = value;
+        d2 = count;
+        s2 = start;
+        e2 = i;
+      }
+      k++;
+      // Codes with an odd number of digits end in an implied 0, like PDF hex strings.
+      if (section === CMapSection.Char) {
+        if (k === 2) {
+          if (d0 > 0 && d0 <= 8) {
+            map.set(d0 % 2 ? v0 * 16 : v0, cmapText(s, v1, d1, s1, e1));
+            entries++;
+          }
+          k = 0;
+        }
+      } else if (section === CMapSection.Range) {
+        if (k === 3) {
+          if (d0 > 0 && d0 <= 8 && d1 <= 8) addRange(d0 % 2 ? v0 * 16 : v0, d1 % 2 ? v1 * 16 : v1, cmapText(s, v2, d2, s2, e2));
+          k = 0;
+        }
+      } else if (section === CMapSection.Codespace) {
+        if (k === 2) {
+          const bytes = Math.ceil(d0 / 2);
+          if (bytes >= 1 && bytes <= 4 && d1 <= 8) codespace[bytes].push(d0 % 2 ? v0 * 16 : v0, d1 % 2 ? v1 * 16 : v1);
+          k = 0;
+        }
+      } else k = 0;
+    } else if (c === 91 /* [ */) {
+      if (section === CMapSection.Range && k === 2) array = [];
+      pos++;
+    } else if (c === 93 /* ] */) {
+      if (array && d0 > 0 && d0 <= 8 && d1 <= 8) addRange(d0 % 2 ? v0 * 16 : v0, d1 % 2 ? v1 * 16 : v1, array);
+      array = undefined;
+      k = 0;
+      pos++;
+    } else if (c === 47 /* / */) {
+      PDF_NAME.lastIndex = pos;
+      const name = pdfName(PDF_NAME.exec(s)![1]);
+      pos = PDF_NAME.lastIndex;
+      if (array) array.push(glyphText(name) ?? "");
+      else if (section === CMapSection.Char && k === 1) {
+        if (d0 > 0 && d0 <= 8) {
+          map.set(d0 % 2 ? v0 * 16 : v0, glyphText(name) ?? "");
+          entries++;
+        }
+        k = 0;
+      }
+    } else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+      let i = pos + 1;
+      while (i < n && ((s.charCodeAt(i) >= 65 && s.charCodeAt(i) <= 90) || (s.charCodeAt(i) >= 97 && s.charCodeAt(i) <= 122))) i++;
+      const word = s.slice(pos, i);
+      pos = i;
+      if (word.startsWith("begin")) {
+        const name = word.slice(5);
+        section = name === "bfchar" ? CMapSection.Char : name === "bfrange" ? CMapSection.Range : name === "codespacerange" ? CMapSection.Codespace : CMapSection.Other;
+      } else if (word.startsWith("end")) section = CMapSection.Other;
+      else continue;
+      array = undefined;
+      k = 0;
+    } else if (c === 40 /* ( */) pos = readLiteral(s, pos).end;
+    else if (c === 37 /* % */) {
+      while (pos < n && s.charCodeAt(pos) !== 10 && s.charCodeAt(pos) !== 13) pos++;
+    } else pos++;
+  }
+  return { codespace, map };
+}
+
+/**
+ * What text extraction needs from a font: how a string's bytes split into character codes, the
+ * text of each code, and glyph widths (in 1/1000 em) for placing runs.
+ */
+interface PdfFont {
+  /** A composite (Type0) font: codes are two bytes, or what `codespace` says. */
+  composite: boolean;
+  /** Composite fonts: codespace ranges by code length in bytes (index 1–4), when codes aren't simply two bytes. */
+  codespace?: number[][];
+  /** The shortest code length in `codespace`, used for bytes that match no range. */
+  shortest?: number;
+  /** Composite fonts: the text of each code, from the ToUnicode CMap; codes it lacks give nothing. */
+  map?: Map<number, string>;
+  /**
+   * Composite fonts without a ToUnicode CMap: codes are UTF-16BE ("utf16", the Uni*-UCS2/UTF16
+   * encodings), or unknown but kept as bytes like before ("bytes", Identity orderings; the
+   * readability check then rejects the result); otherwise (another ordering) nothing comes out.
+   */
+  raw?: "utf16" | "bytes";
+  /** Simple fonts: the text of each byte, when the encoding isn't WinAnsi (Windows-1252) or a ToUnicode CMap says more. */
+  table?: string[];
+  /** Simple fonts: /Widths from /FirstChar, and the width of codes outside them. */
+  first: number;
+  widths: number[];
+  missing: number;
+  /** Composite fonts: widths by CID (/W, single widths and ranges as first, last, width, …) and the default (/DW); CID = code for Identity encodings. */
+  cid?: { widths: Map<number, number>; ranges: number[]; dw: number; identity: boolean };
+  /** False when widths are guessed (fonts without /Widths, e.g. the standard 14), so run ends are estimates. */
+  exact: boolean;
+}
+
+const DEFAULT_FONT: PdfFont = { composite: false, first: 0, widths: [], missing: 500, exact: false };
+
+/** The font a content stream's Tf names, through the (inherited) /Resources /Font dictionary; one decoder per font object. */
+function fontOf(ctx: ContentContext, resources: PdfDict | undefined, name: string): PdfFont {
+  const file = ctx.file;
+  const entry = file?.dict(resources?.get("Font"))?.get(name);
+  const key = entry instanceof PdfRef ? entry.num : isDict(entry) ? entry : undefined;
+  if (!file || key === undefined) return DEFAULT_FONT;
+  let font = ctx.fonts.get(key);
+  if (!font) {
+    const dict = file.dict(entry);
+    font = dict ? loadFont(file, dict) : DEFAULT_FONT;
+    ctx.fonts.set(key, font);
+  }
+  return font;
+}
+
+/** Reads a font dictionary; a damaged font never fails the page (its text comes out as before: bytes as Windows-1252). */
+function loadFont(file: PdfFile, dict: PdfDict): PdfFont {
+  const composite = nameOf(dict.get("Subtype")) === "Type0";
+  try {
+    return composite ? loadCompositeFont(file, dict) : loadSimpleFont(file, dict);
+  } catch {
+    return composite ? { ...DEFAULT_FONT, composite: true, raw: "bytes" } : DEFAULT_FONT;
+  }
+}
+
+function loadCompositeFont(file: PdfFile, dict: PdfDict): PdfFont {
+  const descendant = file.dict(file.array(dict.get("DescendantFonts"))?.[0]);
+  const encoding = file.get(dict.get("Encoding"));
+  const encodingName = nameOf(encoding) ?? (isStream(encoding) ? "" : "Identity-H");
+  const identity = encodingName === "Identity-H" || encodingName === "Identity-V";
+  const toUnicode = file.cmap(dict.get("ToUnicode"));
+  const font: PdfFont = { ...DEFAULT_FONT, composite: true, map: toUnicode?.map };
+  // Codes are two bytes under the Identity encodings; otherwise the encoding CMap's codespace says, or the ToUnicode CMap's.
+  const codespace = identity ? undefined : isStream(encoding) ? file.cmap(dict.get("Encoding"))?.codespace : toUnicode?.codespace;
+  if (codespace?.some((ranges) => ranges.length)) {
+    font.codespace = codespace;
+    font.shortest = codespace.findIndex((ranges) => ranges.length);
+  }
+  if (!toUnicode) {
+    const ordering = file.get(file.dict(descendant?.get("CIDSystemInfo"))?.get("Ordering"));
+    if (/^Uni\w+-(UCS2|UTF16)-[HV]$/.test(encodingName)) font.raw = "utf16";
+    else if (!(ordering instanceof PdfString) || ordering.bytes === "Identity") font.raw = "bytes";
+  }
+  // Glyph widths by CID: /W holds "c [w1 w2 …]" and "cfirst clast w" entries; /DW is the width of the rest.
+  const dw = file.get(descendant?.get("DW"));
+  const w = file.array(descendant?.get("W"));
+  const cid = { widths: new Map<number, number>(), ranges: [] as number[], dw: typeof dw === "number" && dw >= 0 ? dw : 1000, identity };
+  for (let i = 0; w && i < w.length && cid.widths.size < MAX_CID_WIDTHS; ) {
+    const first = w[i];
+    const next = file.get(w[i + 1]);
+    if (typeof first !== "number") break;
+    if (Array.isArray(next)) {
+      next.slice(0, MAX_CID_WIDTHS - cid.widths.size).forEach((width, k) => typeof width === "number" && cid.widths.set(first + k, width));
+      i += 2;
+    } else if (typeof next === "number") {
+      const width = w[i + 2];
+      if (typeof width !== "number") break;
+      if (next - first < 1024) for (let c = first; c <= next && cid.widths.size < MAX_CID_WIDTHS; c++) cid.widths.set(c, width);
+      else if (cid.ranges.length < 3 * MAX_CID_RANGES) cid.ranges.push(first, next, width);
+      i += 3;
+    } else break;
+  }
+  font.cid = cid;
+  font.exact = identity && (cid.widths.size > 0 || cid.ranges.length > 0 || typeof dw === "number");
+  return font;
+}
+
+function loadSimpleFont(file: PdfFile, dict: PdfDict): PdfFont {
+  let widths = file.array(dict.get("Widths"))?.map((w) => (typeof w === "number" ? w : 0)) ?? [];
+  // Type 3 glyph widths are in glyph space, which /FontMatrix maps to text space.
+  const matrix = nameOf(dict.get("Subtype")) === "Type3" ? toMatrix(file.get(dict.get("FontMatrix"))) : undefined;
+  if (matrix) widths = widths.map((w) => w * matrix[0] * 1000);
+  const first = dict.get("FirstChar");
+  const missing = file.dict(dict.get("FontDescriptor"))?.get("MissingWidth");
+  // A ToUnicode CMap says what the codes mean best; the encoding fills in the codes it lacks.
+  const toUnicode = file.cmap(dict.get("ToUnicode"));
+  let table = encodingTable(file, file.get(dict.get("Encoding")));
+  if (toUnicode?.map.size) {
+    table = Array.from(table ?? WIN1252);
+    for (const [code, text] of toUnicode.map) if (code >= 0 && code < 256) table[code] = text;
+  }
+  return {
+    composite: false,
+    table,
+    first: typeof first === "number" ? first : 0,
+    widths,
+    missing: typeof missing === "number" && missing > 0 ? missing : widths.length ? 0 : 500,
+    exact: widths.length > 0,
+  };
+}
+
+/** The width of a CID font's glyph (1/1000 em). */
+function cidWidth(cid: PdfFont["cid"], code: number): number {
+  if (!cid) return 1000;
+  if (!cid.identity) return cid.dw;
+  const width = cid.widths.get(code);
+  if (width !== undefined) return width;
+  const ranges = cid.ranges;
+  for (let k = 0; k < ranges.length; k += 3) if (code >= ranges[k] && code <= ranges[k + 1]) return ranges[k + 2];
+  return cid.dw;
+}
+
+/** A shown string decoded: its text, the sum of its glyph widths (1/1000 em), its number of codes, and of single-byte spaces (which word spacing applies to). */
+interface TextRun {
+  text: string;
+  width: number;
+  count: number;
+  spaces: number;
+}
+
+/** Decodes a shown string through its font: Windows-1252 for ordinary simple fonts (no copying), else code by code. */
+function decodeRun(font: PdfFont, raw: string): TextRun {
+  let width = 0;
+  let spaces = 0;
+  let text = "";
+  if (!font.composite) {
+    const { table } = font;
+    for (let i = 0; i < raw.length; i++) {
+      const code = raw.charCodeAt(i);
+      if (code === 32) spaces++;
+      const w = font.widths[code - font.first];
+      width += w === undefined || w <= 0 ? (code === 32 ? 250 : font.missing || 500) : w;
+      if (table) text += table[code];
+    }
+    return { text: table ? text : win1252(raw), width, count: raw.length, spaces };
+  }
+  const { codespace, map, cid } = font;
+  let count = 0;
+  for (let i = 0; i < raw.length; count++) {
+    let code = 0;
+    let bytes = 0;
+    if (!codespace) {
+      code = raw.charCodeAt(i) * 256 + (raw.charCodeAt(i + 1) || 0);
+      bytes = 2;
+    } else {
+      let value = 0;
+      for (let n = 1; n <= 4 && i + n <= raw.length && !bytes; n++) {
+        value = value * 256 + raw.charCodeAt(i + n - 1);
+        const ranges = codespace[n];
+        for (let k = 0; k < ranges.length; k += 2) {
+          if (value >= ranges[k] && value <= ranges[k + 1]) {
+            code = value;
+            bytes = n;
+            break;
+          }
+        }
+      }
+      if (!bytes) {
+        // No range matches: the shortest code length, as readers do.
+        bytes = font.shortest ?? 1;
+        for (let n = 0; n < bytes; n++) code = code * 256 + (raw.charCodeAt(i + n) || 0);
+      }
+    }
+    i += bytes;
+    if (bytes === 1 && code === 32) spaces++;
+    if (map) text += map.get(code) ?? "";
+    else if (font.raw === "utf16") text += bytes > 2 ? String.fromCharCode(code >>> 16, code & 0xffff) : String.fromCharCode(code);
+    width += cidWidth(cid, code);
+  }
+  return { text: font.raw === "bytes" ? win1252(raw) : text, width, count, spaces };
 }
 
 // ---------- PDF text layout ----------
@@ -1334,18 +1872,6 @@ function multiply(m: Matrix, n: Matrix): Matrix {
 function toMatrix(value: PdfValue | PdfStream | undefined): Matrix | undefined {
   return Array.isArray(value) && value.length === 6 && value.every((v) => typeof v === "number") ? (value as Matrix) : undefined;
 }
-
-/** What text placement needs from a font: glyph widths (in 1/1000 em) and whether codes are two bytes. */
-interface FontMetrics {
-  first: number;
-  widths: number[];
-  missing: number;
-  twoByte: boolean;
-  /** False when widths are guessed (fonts without /Widths, e.g. the standard 14), so run ends are estimates. */
-  exact: boolean;
-}
-
-const DEFAULT_FONT: FontMetrics = { first: 0, widths: [], missing: 500, twoByte: false, exact: false };
 
 /**
  * Collects a page's text runs as lines. A run starts a new line only when the baseline moves by
@@ -1427,7 +1953,7 @@ const MAX_FORM_DEPTH = 8;
 
 interface TextState {
   ctm: Matrix;
-  font: FontMetrics;
+  font: PdfFont;
   size: number;
   charSpacing: number;
   wordSpacing: number;
@@ -1444,45 +1970,8 @@ interface ContentContext {
   /** Forms already drawn on this page (each is read once per page), and forms being drawn (recursion). */
   formsOnPage: Set<number>;
   formsActive: Set<number>;
-  fonts: Map<PdfDict, FontMetrics>;
-}
-
-function fontMetrics(ctx: ContentContext, resources: PdfDict | undefined, name: string): FontMetrics {
-  const file = ctx.file;
-  const font = file?.dict(file.dict(resources?.get("Font"))?.get(name));
-  if (!file || !font) return DEFAULT_FONT;
-  let metrics = ctx.fonts.get(font);
-  if (!metrics) {
-    const widths = file.array(font.get("Widths"))?.map((w) => (typeof w === "number" ? w : 0)) ?? [];
-    const first = font.get("FirstChar");
-    const missing = file.dict(font.get("FontDescriptor"))?.get("MissingWidth");
-    metrics = {
-      first: typeof first === "number" ? first : 0,
-      widths,
-      missing: typeof missing === "number" && missing > 0 ? missing : widths.length ? 0 : 500,
-      twoByte: nameOf(font.get("Subtype")) === "Type0",
-      exact: widths.length > 0,
-    };
-    ctx.fonts.set(font, metrics);
-  }
-  return metrics;
-}
-
-/** How far a string advances the text position, in text space units (glyph widths plus character and word spacing). */
-function advanceOf(state: TextState, raw: string): number {
-  const { font } = state;
-  const size = state.size || 12;
-  let width = 0;
-  let spaces = 0;
-  for (let i = 0; i < raw.length; i++) {
-    const code = raw.charCodeAt(i);
-    if (code === 32) spaces++;
-    if (font.twoByte) continue;
-    const w = font.widths[code - font.first];
-    width += w === undefined || w <= 0 ? (code === 32 ? 250 : font.missing || 500) : w;
-  }
-  if (font.twoByte) width = (raw.length / 2) * 1000;
-  return ((width / 1000) * size + raw.length * state.charSpacing + spaces * state.wordSpacing) * state.scale;
+  /** Fonts already read, by object number (or the dictionary itself, for fonts written into the resources). */
+  fonts: Map<number | PdfDict, PdfFont>;
 }
 
 /**
@@ -1519,11 +2008,13 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
   };
   const show = (raw: string) => {
     const size = state.size || 12;
+    const run = decodeRun(state.font, raw);
     const m = multiply(tm, state.ctm);
-    tm = multiply([1, 0, 0, 1, advanceOf(state, raw), 0], tm);
+    // The text position advances by the glyph widths plus character and word spacing, scaled horizontally.
+    tm = multiply([1, 0, 0, 1, ((run.width / 1000) * size + run.count * state.charSpacing + run.spaces * state.wordSpacing) * state.scale, 0], tm);
     const end = multiply(tm, state.ctm);
     const length = Math.hypot(m[0], m[1]) || 1;
-    writer.place(win1252(raw), m[4], m[5], end[4], end[5], m[0] / length, m[1] / length, size * (Math.hypot(m[2], m[3]) || 1), state.font.exact, moved);
+    writer.place(run.text, m[4], m[5], end[4], end[5], m[0] / length, m[1] / length, size * (Math.hypot(m[2], m[3]) || 1), state.font.exact, moved);
     moved = false;
   };
   TOKEN.lastIndex = 0;
@@ -1563,7 +2054,7 @@ function runContent(s: string, ctx: ContentContext, resources: PdfDict | undefin
         case "Tf": {
           const font = operands[operands.length - 2];
           state.size = num(1);
-          state.font = font instanceof PdfName ? fontMetrics(ctx, resources, font.name) : DEFAULT_FONT;
+          state.font = font instanceof PdfName ? fontOf(ctx, resources, font.name) : DEFAULT_FONT;
           break;
         }
         case "Tc":
@@ -1800,7 +2291,7 @@ function readPageTree(file: PdfFile, budget: Budget): ReadResult | undefined {
   const tree = pageTree(file);
   const count = file.get(file.dict(file.root!.get("Pages"))?.get("Count"));
   const pages: string[] = [];
-  const fonts = new Map<PdfDict, FontMetrics>();
+  const fonts = new Map<number | PdfDict, PdfFont>();
   let multi = typeof count === "number" && count > 1;
   let total = 0;
   let stopped = false;
@@ -1899,11 +2390,12 @@ function readInFileOrder(bytes: Uint8Array, budget: Budget): ReadResult | undefi
 }
 
 /**
- * Best-effort text extraction for PDFs whose fonts use standard encodings (most generated
- * statements, receipts and letters), in reading order: pages as the page tree orders them, lines
- * from text positions, form XObjects where they are drawn. Stops once `maxChars` are collected.
- * Returns undefined when nothing readable comes out, e.g. for scanned pages or fonts with custom
- * glyph encodings. PDFs whose page tree can't be used (encrypted, damaged) are read in file order.
+ * Best-effort text extraction for PDFs with a text layer: fonts with standard encodings, and
+ * embedded fonts with ToUnicode CMaps (most generated statements, receipts and letters), in
+ * reading order: pages as the page tree orders them, lines from text positions, form XObjects
+ * where they are drawn. Stops once `maxChars` are collected. Returns undefined when nothing
+ * readable comes out, e.g. for scanned pages or fonts whose codes can't be mapped to characters.
+ * PDFs whose page tree can't be used (encrypted, damaged) are read in file order.
  */
 export async function readPdf(bytes: Uint8Array, opts: ReadOptions = {}): Promise<ReadResult | undefined> {
   const budget = new Budget(opts.maxChars);

@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { attachmentCharset, attachmentText } from "../src/format.js";
 import { attachmentResult, decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
-import { docx, docxOf, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, xlsx, xlsxOf, zip, zipOf } from "./files.js";
+import { cmapOf, docx, docxOf, fontResources, hex4, hexString, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
   const file = pdf([
@@ -560,4 +560,204 @@ test("crafted page trees and object streams stay fast", async () => {
     assert.ok(r.ms < 200, `${name}: ${r.ms.toFixed(0)} ms`);
     assert.ok(r.value?.text, `${name}: no text`);
   }
+});
+
+// ---------- PDF fonts ----------
+
+/** Glyph codes of the composite test fonts: the character code plus 0x100, and three special glyphs. */
+const LIGATURE = 0x201;
+const EMOJI = 0x202;
+const NOTHING = 0x203;
+const glyphCodes = (text: string) =>
+  hexString([...text].map((ch) => (ch === "ﬃ" ? LIGATURE : ch === "😀" ? EMOJI : ch === "\0" ? NOTHING : ch.charCodeAt(0) + 0x100)));
+/** A ToUnicode CMap for those codes, using every form: bfchar, bfrange counting up, and bfrange with an array. */
+const glyphCMap = () =>
+  cmapOf({
+    bfchar: [
+      [hex4(0x120), "0020"],
+      [hex4(0x12e), "002E"],
+      [hex4(0x12c), "002C"],
+      [hex4(0x13a), "003A"],
+      [hex4(0x121), "0021"],
+      [hex4(LIGATURE), "006600660069"],
+      [hex4(EMOJI), "D83DDE00"],
+      [hex4(NOTHING), "0000"],
+    ],
+    bfrange: [
+      [hex4(0x141), hex4(0x15a), "0041"],
+      [hex4(0x161), hex4(0x17a), "0061"],
+      [hex4(0x130), hex4(0x139), Array.from({ length: 10 }, (_, i) => hex4(0x30 + i))],
+    ],
+  });
+
+test("Type0 fonts with ToUnicode CMaps come out as text", async () => {
+  const content = [
+    `BT /F1 12 Tf 72 700 Td ${glyphCodes("Invoice 2024: oﬃce supplies, total 42.00 😀")} Tj ET`,
+    // In a TJ array a negative adjustment moves right (a word gap), a positive one kerns; <0000> glyphs show nothing.
+    `BT /F1 12 Tf 72 680 Td [${glyphCodes("Thank")} -300 ${glyphCodes("you")} 40 ${glyphCodes("\0!")}] TJ ET`,
+  ].join("\n");
+  const file = pdf([content], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(glyphCMap()) }) }));
+  // The ligature glyph maps to three characters, the emoji glyph to a surrogate pair.
+  assert.equal((await readPdf(file))!.text, "Invoice 2024: office supplies, total 42.00 😀\nThank you!");
+});
+
+test("composite fonts with other encodings: mixed-width codespaces, and codes that are UCS-2", async () => {
+  // A Shift-JIS-like codespace: one-byte codes up to 0x80, two-byte codes from 0x8140; the ToUnicode CMap covers both.
+  const mixed = cmapOf({
+    codespace: [
+      ["00", "80"],
+      ["8140", "FFFF"],
+    ],
+    bfrange: [["41", "5A", "0041"]],
+    bfchar: [
+      ["20", "0020"],
+      ["8140", "3042"],
+      ["8141", "3044"],
+    ],
+  });
+  const ucs2 = hexString(Array.from("Payment received 😀".split(""), (unit) => unit.charCodeAt(0)));
+  const content = ["BT /F1 12 Tf 72 700 Td <4142434445464748494A20814081414B4C4D> Tj ET", `BT /F2 12 Tf 72 680 Td ${ucs2} Tj ET`].join("\n");
+  const file = pdf([content], [], (b) => ({
+    F1: b.type0Font({ encoding: "/90ms-RKSJ-H", ordering: "Japan1", toUnicode: b.cmap(mixed) }),
+    // A predefined Unicode CMap and no ToUnicode: the codes themselves are UTF-16BE.
+    F2: b.type0Font({ encoding: "/UniJIS-UCS2-H", ordering: "Japan1" }),
+  }));
+  assert.equal((await readPdf(file))!.text, "ABCDEFGHIJ あいKLM\nPayment received 😀");
+});
+
+test("simple fonts: /Differences, MacRoman, Standard and ToUnicode encodings", async () => {
+  const toUnicode = cmapOf({ codespace: [["00", "FF"]], bfchar: [["01", "0048"], ["02", "0069"]], bfrange: [["03", "05", "0061"]] });
+  const lines = [
+    // Differences on a WinAnsi base: AGL names, uniXXXX, uXXXXX, a ligature of parts, a variant; /g12 says nothing (the base stays).
+    "/F1 12 Tf (Caf\\202 \\203 \\310 \\311 \\312 \\313 \\314 \\315 \\316 \\317 \\320 \\321 \\200 summary) Tj",
+    "/F2 12 Tf (caf\\216\\312\\245 \\320 \\336 bullets) Tj",
+    "/F3 12 Tf (\\256 \\267 \\320 \\244 and \\252quotes\\272) Tj",
+    "/F4 12 Tf (\\001\\002 \\003\\004\\005 there) Tj",
+    "/F5 12 Tf (na\\357ve \\223quoted\\224) Tj",
+  ];
+  const content = `BT 72 700 Td 16 TL ${lines.join(" T* ")} ET`;
+  const file = pdf([content], [], (b) => ({
+    F1: b.simpleFont({ encoding: "<< /Differences [128 /Euro 130 /eacute /quoteright 200 /endash /emdash /bullet /fi /fl /uni00E9 /u1F600 /g12 /f_f_i /a.sc] >>" }),
+    F2: b.simpleFont({ encoding: "/MacRomanEncoding" }),
+    F3: b.simpleFont({ subtype: "Type1", base: "Times-Roman", encoding: "/StandardEncoding" }),
+    F4: b.simpleFont({ toUnicode: b.cmap(toUnicode) }),
+    F5: b.simpleFont({ encoding: "<< /BaseEncoding /WinAnsiEncoding >>" }),
+  }));
+  assert.equal(
+    (await readPdf(file))!.text,
+    [
+      "Café ’ – — • ﬁ ﬂ é 😀 Ï ffi a € summary",
+      "café • – ﬁ bullets",
+      "ﬁ • — ⁄ and “quotes”",
+      "Hi abc there",
+      "naïve “quoted”",
+    ].join("\n"),
+  );
+});
+
+test("mixed fonts on one line keep their word spacing (CID widths from /W and /DW)", async () => {
+  const b = new PdfBuilder();
+  // The composite font's widths: capitals 700 (a range), lower case 500 (a list), digits 550, the period 300, the rest 250 (a wide range beats /DW).
+  const w = `321 346 700 353 [${Array(26).fill(500).join(" ")}] 304 313 550 302 [300] 0 65535 250`;
+  const cmap = b.cmap(glyphCMap());
+  const cid = b.type0Font({ toUnicode: cmap, w, dw: 1000 });
+  const fixed = b.type0Font({ toUnicode: cmap, dw: 600, base: "Inter-Mono" });
+  const simple = b.simpleFont({ widths: Array.from({ length: 95 }, (_, i) => (i === 0 ? 300 : 600)).join(" ") });
+  const cidWidth = (ch: string) => (/[A-Z]/.test(ch) ? 700 : /[a-z]/.test(ch) ? 500 : /[0-9]/.test(ch) ? 550 : ch === "." ? 300 : 250);
+  const width = (text: string, of: (ch: string) => number) => [...text].reduce((sum, ch) => sum + (of(ch) * 12) / 1000, 0);
+  const at = (x: number, y: number, font: string, shown: string) => `BT /${font} 12 Tf 1 0 0 1 ${x.toFixed(3)} ${y} Tm ${shown} Tj ET`;
+  // Line 1: a word drawn glyph by glyph (each Td moving by the glyph's width, as Skia does), a word in a simple font, a number.
+  let x = 72;
+  const glyphs = [..."Invoice"].map((ch, i) => {
+    const op = i === 0 ? `BT /F1 12 Tf 1 0 0 1 72 700 Tm ${glyphCodes(ch)} Tj` : `${width("Invoice"[i - 1], cidWidth).toFixed(3)} 0 Td ${glyphCodes(ch)} Tj`;
+    x += width(ch, cidWidth);
+    return op;
+  });
+  const line1 = [`${glyphs.join(" ")} ET`, at(x + 3.5, 700, "F2", "(total)"), at(x + 3.5 + width("total", (ch) => (ch === " " ? 300 : 600)) + 3.5, 700, "F1", glyphCodes("42.00"))];
+  // Line 2: runs that start exactly where the previous one ends are joined; /DW gives the mono font's widths.
+  x = 72;
+  const line2 = [at(x, 684, "F1", glyphCodes("Pre")), at((x += width("Pre", cidWidth)), 684, "F2", "(paid)")];
+  x += width("paid", () => 600) + 3.5;
+  line2.push(at(x, 684, "F3", glyphCodes("now")), at(x + width("now", () => 600), 684, "F1", glyphCodes(".")));
+  // The fonts are inherited from the page tree node.
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content([...line1, ...line2].join("\n")))} >>`);
+  const file = b.build(pageTree(b, [page], ` /Resources << /Font << ${fontResources({ F1: cid, F2: simple, F3: fixed })} >> >>`));
+  assert.equal((await readPdf(file))!.text, "Invoice total 42.00\nPrepaid now.");
+});
+
+test("composite fonts without a ToUnicode CMap report no readable text, not gibberish", async () => {
+  const codes = hexString([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 36, 37, 38, 39, 40, 41, 42]);
+  // Identity-H with glyph indexes: the bytes say nothing about the characters.
+  assert.equal(await pdfText(pdf([`BT /F1 12 Tf 72 700 Td ${codes} Tj ET`], [], (b) => ({ F1: b.type0Font() }))), undefined);
+  // A CID-keyed font with a known character collection: its text would need that collection's tables.
+  assert.equal(await pdfText(pdf([`BT /F1 12 Tf 72 700 Td ${codes} Tj ET`], [], (b) => ({ F1: b.type0Font({ ordering: "Japan1" }) }))), undefined);
+  // Next to a readable font, such a font's text is left out rather than shown as gibberish.
+  const mixed = pdf([`BT /F2 12 Tf 72 700 Td (Readable text in a plain font.) Tj ET BT /F1 12 Tf 72 680 Td ${codes} Tj ET`], [], (b) => ({
+    F1: b.type0Font({ ordering: "Japan1" }),
+    F2: b.simpleFont({ encoding: "/WinAnsiEncoding" }),
+  }));
+  assert.equal(await pdfText(mixed), "Readable text in a plain font.");
+});
+
+test("hostile ToUnicode CMaps stay fast and bounded", async () => {
+  const letters = Array.from({ length: 26 }, (_, i) => [hex4(0x161 + i), hex4(0x61 + i)] as [string, string]);
+  letters.push([hex4(0x120), "0020"]);
+  const sentence = (offset: number) => hexString([..."the quick brown fox jumps over the lazy dog"].map((ch) => ch.charCodeAt(0) + offset));
+  const cases: Record<string, { cmap: string; codes: string }> = {
+    "100,000 bfchar entries": {
+      cmap: cmapOf({ bfchar: [...letters, ...Array.from({ length: 100_000 }, (_, i) => [hex4(0x1000 + (i % 0xe000)), "0041"] as [string, string])] }),
+      codes: sentence(0x100),
+    },
+    // Each range maps every code c to U+0001 + c (so the letters still come out right); the mappings kept are capped.
+    "a bfrange over every code, 1,000 times": {
+      cmap: cmapOf({ bfchar: letters, bfrange: Array.from({ length: 1000 }, () => ["0000", "FFFF", "0001"] as [string, string, string]) }),
+      codes: sentence(-1),
+    },
+    "ranges with lo > hi and over 65,536 codes": {
+      cmap: cmapOf({
+        bfchar: letters,
+        bfrange: [
+          ["FFFF", "0000", "0041"],
+          ["00000000", "7FFFFFFF", "0041"],
+          ["0100", "0010", "0042"],
+        ],
+      }),
+      codes: sentence(0x100),
+    },
+    "damaged syntax": {
+      cmap: cmapOf({ bfchar: letters, junk: "beginbfrange <01> [ <02> endbfrange <<< ]] /x (stray) 42 ] [ >> <0102> <01> /uni0041 beginbfchar" }),
+      codes: sentence(0x100),
+    },
+  };
+  for (const [name, { cmap, codes }] of Object.entries(cases)) {
+    const file = pdf([`BT /F1 12 Tf 72 700 Td ${codes} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap) }) }));
+    // The first read includes warming up the parser (about 30 ms here for 100,000 entries); the second is what it costs.
+    const cold = await timed(() => readPdf(file));
+    const warm = await timed(() => readPdf(file));
+    assert.equal(cold.value?.text, "the quick brown fox jumps over the lazy dog", name);
+    assert.ok(cold.ms < 200, `${name}: ${cold.ms.toFixed(0)} ms`);
+    assert.ok(warm.ms < 50, `${name}: ${warm.ms.toFixed(0)} ms warm`);
+  }
+  // A CMap that inflates to 3 MB is past the limit: its font is unreadable, the page (and the rest) is still read, with no note.
+  const huge = cmapOf({ bfchar: letters, junk: "% ".padEnd(3 * 1024 * 1024, "x") });
+  const file = pdf([`q BT /F1 12 Tf ET Q BT 72 700 Td (Readable text in the default font.) Tj ET BT /F1 12 Tf 72 680 Td ${sentence(0x100)} Tj ET`], [], (b) => ({
+    F1: b.type0Font({ toUnicode: b.cmap(huge) }),
+  }));
+  const r = await timed(() => readPdf(file));
+  assert.equal(r.value, undefined);
+  assert.ok(r.ms < 100, `3 MB CMap: ${r.ms.toFixed(0)} ms`);
+  const unused = pdf(["q BT /F1 12 Tf ET Q BT 72 700 Td (Readable text in the default font.) Tj ET"], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(huge) }) }));
+  assert.deepEqual(await readPdf(unused), { text: "Readable text in the default font." });
+});
+
+test("PDFs with ordinary WinAnsi fonts read as before", async () => {
+  const shown = "(Caf\\351 \\223quoted\\224 \\200 5 \\226 dash) Tj";
+  const content = `BT 72 700 Td 16 TL /F1 12 Tf ${shown} T* /F2 12 Tf ${shown} T* /F3 12 Tf ${shown} T* /F9 12 Tf ${shown} ET`;
+  const file = pdf([content], [], (b) => ({
+    F1: b.simpleFont({ encoding: "/WinAnsiEncoding", widths: Array(224).fill(500).join(" ") }),
+    F2: b.simpleFont({ subtype: "Type1", base: "Helvetica" }),
+    F3: b.simpleFont({ subtype: "TrueType", base: "ABCDEF+Calibri", extra: " /FontDescriptor << /Type /FontDescriptor /Flags 32 >>" }),
+  }));
+  const line = "Café “quoted” € 5 – dash";
+  assert.equal((await readPdf(file))!.text, [line, line, line, line].join("\n"));
 });

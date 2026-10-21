@@ -121,6 +121,45 @@ export class PdfBuilder {
     return this.add("/Filter /FlateDecode", deflateSync(Buffer.from(text, "latin1")));
   }
 
+  /** A CMap stream (a font's /ToUnicode, or a composite font's /Encoding), compressed. */
+  cmap(text: string): number {
+    return this.add("/Filter /FlateDecode", deflateSync(Buffer.from(text, "latin1")));
+  }
+
+  /**
+   * A composite (Type0) font with a CIDFontType2 descendant, the way producers embed TrueType
+   * subsets: Identity-H unless `encoding` says otherwise; `toUnicode` names a CMap object; `w` is
+   * the /W array's content and `dw` the default width; `ordering` is the CIDSystemInfo ordering.
+   */
+  type0Font(opts: { toUnicode?: number; encoding?: string; w?: string; dw?: number; ordering?: string; base?: string } = {}): number {
+    const base = opts.base ?? "Inter-Regular";
+    const descriptor = this.add(
+      `<< /Type /FontDescriptor /FontName /${base} /Flags 4 /FontBBox [-700 -300 2500 1100] /ItalicAngle 0 /Ascent 969 /Descent -241 /CapHeight 727 /StemV 39 >>`,
+    );
+    const descendant = this.add(
+      `<< /Type /Font /Subtype /CIDFontType2 /BaseFont /${base} /FontDescriptor ${refs(descriptor)} /CIDToGIDMap /Identity` +
+        ` /CIDSystemInfo << /Registry (Adobe) /Ordering (${opts.ordering ?? "Identity"}) /Supplement 0 >>` +
+        `${opts.dw === undefined ? "" : ` /DW ${opts.dw}`}${opts.w === undefined ? "" : ` /W [${opts.w}]`} >>`,
+    );
+    return this.add(
+      `<< /Type /Font /Subtype /Type0 /BaseFont /${base} /Encoding ${opts.encoding ?? "/Identity-H"} /DescendantFonts [${refs(descendant)}]` +
+        `${opts.toUnicode === undefined ? "" : ` /ToUnicode ${refs(opts.toUnicode)}`} >>`,
+    );
+  }
+
+  /**
+   * A simple font: `encoding` is the /Encoding value (a name, or a dictionary with /Differences),
+   * `widths` the /Widths array's content starting at `firstChar` (32 by default).
+   */
+  simpleFont(opts: { subtype?: string; base?: string; encoding?: string; widths?: string; firstChar?: number; toUnicode?: number; extra?: string } = {}): number {
+    return this.add(
+      `<< /Type /Font /Subtype /${opts.subtype ?? "TrueType"} /BaseFont /${opts.base ?? "Arial"}` +
+        `${opts.encoding ? ` /Encoding ${opts.encoding}` : ""}` +
+        `${opts.widths === undefined ? "" : ` /FirstChar ${opts.firstChar ?? 32} /Widths [${opts.widths}]`}` +
+        `${opts.toUnicode === undefined ? "" : ` /ToUnicode ${refs(opts.toUnicode)}`}${opts.extra ?? ""} >>`,
+    );
+  }
+
   /**
    * The file. Objects are written in `order` (the others follow by number); objects listed in
    * `packed` go into one compressed object stream; `xrefStream` writes the trailer as a
@@ -158,17 +197,66 @@ export function pdfUpdate(file: Buffer, root: number, objects: ({ num: number } 
   ]);
 }
 
-/** A PDF whose pages (in a real page tree) draw the given content streams; `extraStreams` are other, unreferenced objects. */
-export function pdf(pages: string[], extraStreams: { dict: string; data: Buffer }[] = []): Buffer {
+/** A 4-digit hex code, as CMaps write them. */
+export const hex4 = (code: number) => code.toString(16).toUpperCase().padStart(4, "0");
+
+/** A hex string of character codes, each `bytes` wide, as content streams show text in composite fonts. */
+export const hexString = (codes: number[], bytes = 2) => `<${codes.map((code) => code.toString(16).toUpperCase().padStart(2 * bytes, "0")).join("")}>`;
+
+/**
+ * A ToUnicode CMap as producers write them: `codespace` ranges (<0000> <FFFF> by default), `bfchar`
+ * [src, dst] pairs and `bfrange` [lo, hi, dst] entries whose dst is one hex string (counting up) or
+ * an array of them, all as hex digits; `junk` is written where the mappings go, before them.
+ */
+export function cmapOf(opts: { codespace?: [string, string][]; bfchar?: [string, string][]; bfrange?: [string, string, string | string[]][]; junk?: string }): string {
+  const lines = [
+    "/CIDInit /ProcSet findresource begin",
+    "12 dict begin",
+    "begincmap",
+    "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+    "/CMapName /Adobe-Identity-UCS def",
+    "/CMapType 2 def",
+  ];
+  const codespace = opts.codespace ?? [["0000", "FFFF"]];
+  lines.push(`${codespace.length} begincodespacerange`);
+  for (const [lo, hi] of codespace) lines.push(`<${lo}> <${hi}>`);
+  lines.push("endcodespacerange");
+  if (opts.junk) lines.push(opts.junk);
+  if (opts.bfchar?.length) {
+    lines.push(`${opts.bfchar.length} beginbfchar`);
+    for (const [src, dst] of opts.bfchar) lines.push(`<${src}> <${dst}>`);
+    lines.push("endbfchar");
+  }
+  if (opts.bfrange?.length) {
+    lines.push(`${opts.bfrange.length} beginbfrange`);
+    for (const [lo, hi, dst] of opts.bfrange) lines.push(`<${lo}> <${hi}> ${Array.isArray(dst) ? `[${dst.map((d) => `<${d}>`).join(" ")}]` : `<${dst}>`}`);
+    lines.push("endbfrange");
+  }
+  lines.push("endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end");
+  return lines.join("\n");
+}
+
+/**
+ * A PDF whose pages (in a real page tree) draw the given content streams; `extraStreams` are other,
+ * unreferenced objects; `fonts` adds fonts to the builder and names them in every page's /Resources.
+ */
+export function pdf(pages: string[], extraStreams: { dict: string; data: Buffer }[] = [], fonts?: (b: PdfBuilder) => Record<string, number>): Buffer {
   const b = new PdfBuilder();
   const catalog = b.reserve();
   const tree = b.reserve();
   for (const extra of extraStreams) b.add(extra.dict, extra.data);
-  const kids = pages.map((content) => b.add(`<< /Type /Page /Parent ${tree} 0 R /MediaBox [0 0 612 792] /Contents ${refs(b.content(content))} >>`));
+  const resources = fonts ? ` /Resources << /Font << ${fontResources(fonts(b))} >> >>` : "";
+  const kids = pages.map((content) => b.add(`<< /Type /Page /Parent ${tree} 0 R /MediaBox [0 0 612 792] /Contents ${refs(b.content(content))}${resources} >>`));
   b.set(catalog, `<< /Type /Catalog /Pages ${refs(tree)} >>`);
   b.set(tree, `<< /Type /Pages /Kids [${refs(kids)}] /Count ${kids.length} >>`);
   return b.build(catalog);
 }
+
+/** The entries of a /Font resource dictionary: "/F1 5 0 R /F2 9 0 R". */
+export const fontResources = (fonts: Record<string, number>) =>
+  Object.entries(fonts)
+    .map(([name, num]) => `/${name} ${refs(num)}`)
+    .join(" ");
 
 /** A Word document whose body is the given WordprocessingML. */
 export const docxOf = (body: string) =>
