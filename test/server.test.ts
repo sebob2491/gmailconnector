@@ -6,7 +6,7 @@ import { after, beforeEach, describe, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
-import { TokenProvider } from "../src/gmailClient.js";
+import { setRetryWait, TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
 import { decodeBase64Url, sendAsCache, withoutBodyData } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
@@ -18,6 +18,12 @@ const WORK = "me@work.example";
 
 const tmpDirs: string[] = [];
 after(() => tmpDirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+
+/** The waits the client asked for before retries; none of them is actually waited for. */
+const retryWaits: number[] = [];
+setRetryWait(async (ms) => {
+  retryWaits.push(ms);
+});
 
 function crlf(lines: string[]): string {
   return lines.join("\r\n");
@@ -920,6 +926,22 @@ describe("fixes from the code review", () => {
     fake.failOnce.set("messages/w2", 403);
     const res = await call("get_message", { account: "work", messageId: "w2" });
     assert.equal(res.isError, false, res.text);
+  });
+
+  test("retries back off: 400 ms then 1,200 ms, and 500 ms per round inside a batch", async () => {
+    const { call, fake } = await setup();
+    retryWaits.length = 0;
+    fake.failAlways.set("messages/w2", 429);
+    const res = await call("get_message", { account: "work", messageId: "w2" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /429/);
+    assert.deepEqual(retryWaits, [400, 1200]);
+    fake.failAlways.clear();
+    retryWaits.length = 0;
+    fake.failAlways.set("threads/wt1", 429);
+    const search = await call("search_threads", { account: "work" });
+    assert.deepEqual(search.json.unavailable.threadIds, ["wt1"]);
+    assert.deepEqual(retryWaits, [500]);
   });
 
   test("page tokens are checked against the accounts being searched", async () => {
