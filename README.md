@@ -84,8 +84,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   listed only when an email wasn't addressed to just you. A 50-email search comes back about half the
   size of the raw Gmail data. The search help Claude sees covers Gmail's full operator syntax.
 - `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
-  how much was left out). Pass `maxBodyChars: 0` for the full text. Replies and forwards always use the
-  whole email.
+  so, and how much was left out when the body was read whole). Only the start of a long body is read
+  and converted, so a 2 MB newsletter takes a few milliseconds. Pass `maxBodyChars: 0` for the full
+  text. Replies and forwards always use the whole email.
 - `get_message` and `get_thread` cut links longer than 200 characters (almost always marketing tracking
   redirects) to their website, e.g. `https://click.shop.com/…`, with a note saying so. A typical store
   email shrinks from tens of thousands of characters to a few thousand. `messageFormat: "FULL_CONTENT"`

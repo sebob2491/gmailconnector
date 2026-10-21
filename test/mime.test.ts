@@ -10,13 +10,14 @@ import {
   extractContent,
   formatMessage,
   hideQuotedHistory,
+  limitLength,
   parseAddressList,
   parseMailboxes,
   recipientsFrom,
   unflow,
   type ApiMessagePart,
 } from "../src/format.js";
-import { Base64UrlData, buildMime, decodeBase64, decodeEntities, encodeHeaderValue, htmlToText } from "../src/mime.js";
+import { Base64UrlData, buildMime, decodeBase64, decodeEntities, encodeHeaderValue, htmlToText, HtmlTextReader } from "../src/mime.js";
 import { attachmentDataOf } from "../src/mailbox.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
 
@@ -585,5 +586,59 @@ function quotingThread(count: number): string[] {
 test("cutting the quoted history before cleaning a body gives the same text as after", () => {
   for (const body of quotingThread(100)) {
     assert.equal(cleanBody(hideQuotedHistory(body.replace(/\r\n?/g, "\n"))), hideQuotedHistory(cleanBody(body)));
+  }
+});
+
+/** A newsletter of about `bytes` characters: rows of a layout table, each with a headline, a paragraph and a tracking link. */
+function newsletter(bytes: number): string {
+  let html = '<html><body><div style="display:none;max-height:0;overflow:hidden">Preview text</div><table role="presentation"><tr><td><table width="600">';
+  for (let i = 1; html.length < bytes; i++) {
+    html +=
+      `<tr><td style="padding:10px 20px;font-family:Arial,sans-serif"><h2 style="font-size:18px">Story ${i}: what changed this week</h2>` +
+      `<p style="margin:0 0 12px">We rebuilt the reports pipeline &amp; cut the wait from minutes to seconds. Here is what that means for your team.</p>` +
+      `<p><a href="https://click.example.com/t/${"x".repeat(220)}?u=${i}" style="color:#0a0">Read more</a></p></td></tr>\n`;
+  }
+  return `${html}</table></td></tr></table></body></html>`;
+}
+
+const htmlMessage = (html: string) => ({
+  id: "m",
+  threadId: "t",
+  payload: { partId: "", mimeType: "text/html", headers: [{ name: "Content-Type", value: "text/html; charset=UTF-8" }], body: { size: html.length, data: Buffer.from(html).toString("base64url") } },
+});
+
+test("htmlToText converts only as much as asked, and goes on from there when asked for more", () => {
+  const html = newsletter(200_000);
+  const whole = htmlToText(html);
+  const start = htmlToText(html, 1000);
+  assert.ok(start.length >= 1000 && start.length < 2500, `${start.length} characters`);
+  assert.ok(whole.startsWith(start.slice(0, 1000)));
+  // Read in steps, the text is the same as read at once.
+  const reader = new HtmlTextReader(html);
+  let read = reader.read(500);
+  for (let chars = 2000; !read.complete; chars *= 3) read = reader.read(chars);
+  assert.equal(read.text, whole);
+});
+
+test("only the start of a long body is read, and it reads exactly like the start of the whole body", async () => {
+  const none = async () => "";
+  for (const [size, max] of [[2_000_000, 20_000], [200_000, 20_000], [30_000, 20_000], [30_000, 0], [200_000, 3_000]]) {
+    const msg = htmlMessage(newsletter(size));
+    const all = await formatMessage(msg, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: 0 });
+    const cpu = process.cpuUsage();
+    const out = await formatMessage(msg, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: max });
+    const used = process.cpuUsage(cpu);
+    assert.equal(out.plaintextBody, max ? limitLength(all.plaintextBody!, max).text : all.plaintextBody, `${size} characters, limit ${max}`);
+    if (!max || all.plaintextBody!.length <= max) assert.equal(out.truncated, undefined, "a body within the limit is all there");
+    else if (size > 100_000) assert.equal(out.truncated, "Body shortened; the rest is available with maxBodyChars: 0.");
+    assert.ok((used.user + used.system) / 1000 < 100, `${size}: ${(used.user + used.system) / 1000} ms`);
+  }
+  // Plain text too, without a link cut at the point where reading stopped.
+  const text = ("Read https://click.example.com/" + "y".repeat(300) + " now.\n").repeat(400);
+  const plain = { id: "m", threadId: "t", payload: { partId: "", mimeType: "text/plain", headers: [], body: { size: text.length, data: Buffer.from(text).toString("base64url") } } };
+  const all = await formatMessage(plain, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: 0 });
+  for (const max of [100, 1_000, 5_000]) {
+    const out = await formatMessage(plain, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: max });
+    assert.equal(out.plaintextBody, limitLength(all.plaintextBody!, max).text);
   }
 });

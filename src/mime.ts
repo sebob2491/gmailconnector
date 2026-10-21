@@ -650,6 +650,28 @@ function isHtmlSpace(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 13 || c === 12;
 }
 
+/**
+ * Text as a browser lays it out: each run of white space becomes one space, control characters are
+ * dropped. Most text needs no change, which one quick look finds out.
+ */
+function collapseSpace(t: string): string {
+  const n = t.length;
+  for (let i = 0; i < n; i++) {
+    const c = t.charCodeAt(i);
+    if (c > 32 && c !== 127 && c !== 160) continue;
+    if (c === 32) {
+      const next = t.charCodeAt(i + 1);
+      if (i + 1 === n || (next > 32 && next !== 127 && next !== 160)) continue; // a single space before text
+    }
+    return t.replace(HTML_CONTROLS, "").replace(HTML_SPACE, " ");
+  }
+  return t;
+}
+
+function isHighSurrogate(c: number): boolean {
+  return c >= 0xd800 && c <= 0xdbff;
+}
+
 function isLetter(c: number): boolean {
   return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
@@ -756,6 +778,8 @@ function endsImplicitly(open: string, tag: string): boolean {
 /** Collects output text, collapsing white space and blank lines as a browser lays them out. */
 class TextBuilder {
   parts: string[] = [];
+  /** Characters in `parts`. */
+  chars = 0;
   private lineStart = true;
   private newlines = 0;
   private emitted = 0;
@@ -773,11 +797,14 @@ class TextBuilder {
   marker = "";
 
   private emit(s: string) {
+    let before = "";
     if (this.lineStart) {
-      if (this.marker) this.parts.push(this.marker, " ");
-    } else if (this.sep) this.parts.push(this.sep);
-    else if (this.space) this.parts.push(" ");
+      if (this.marker) before = `${this.marker} `;
+    } else if (this.sep) before = this.sep;
+    else if (this.space) before = " ";
+    if (before) this.parts.push(before);
     this.parts.push(s);
+    this.chars += before.length + s.length;
     this.lineStart = false;
     this.newlines = 0;
     this.space = false;
@@ -831,7 +858,10 @@ class TextBuilder {
     this.cellEmitted[top] = -1;
     const start = this.cellStart[top];
     const parts = this.parts;
-    while (parts.length > start && parts[parts.length - 1] === "\n") parts.pop();
+    while (parts.length > start && parts[parts.length - 1] === "\n") {
+      parts.pop();
+      this.chars--;
+    }
     let newlines = 0;
     while (newlines < 2 && parts[parts.length - 1 - newlines] === "\n") newlines++;
     this.lineStart = !parts.length || newlines > 0;
@@ -841,7 +871,7 @@ class TextBuilder {
 
   /** Normal text: runs of white space become one space, which is dropped at line starts. */
   text(raw: string) {
-    const t = decodeEntities(raw).replace(HTML_CONTROLS, "").replace(HTML_SPACE, " ");
+    const t = collapseSpace(decodeEntities(raw));
     if (!t) return;
     const lead = t.charCodeAt(0) === 32;
     const trail = t.length > 1 && t.charCodeAt(t.length - 1) === 32;
@@ -867,7 +897,10 @@ class TextBuilder {
 
   /** A line break (<br>); more than one blank line in a row is not kept. */
   newline() {
-    if (this.newlines < 2) this.parts.push("\n");
+    if (this.newlines < 2) {
+      this.parts.push("\n");
+      this.chars++;
+    }
     this.newlines = Math.min(this.newlines + 1, 2);
     this.lineStart = true;
     this.space = false;
@@ -893,6 +926,11 @@ class TextBuilder {
     return this.parts.length;
   }
 
+  /** Whether the next text starts a line (a block or line break was the last thing written). */
+  get atLineStart() {
+    return this.lineStart;
+  }
+
   textSince(index: number): string {
     return this.parts.slice(index).join("").trim();
   }
@@ -909,28 +947,55 @@ class TextBuilder {
  * max-height:0 and overflow:hidden of a newsletter's preview text) or by `hidden` are left out. Runs
  * in linear time on any input, including broken HTML.
  */
-export function htmlToText(html: string): string {
-  const b = new TextBuilder();
-  const n = html.length;
-  const lists: { ordered: boolean; next: number }[] = [];
-  let link: { href: string; start: number; alts: string[] } | undefined;
-  let pre = 0;
-  let preStart = false;
-  let pos = 0;
-  const flags: TagFlags = { style: undefined, hidden: false };
+export function htmlToText(html: string, maxChars = 0): string {
+  return new HtmlTextReader(html).read(maxChars).text;
+}
+
+/** A link being read: its address, where its text starts in the output, and the alt text of images in it. */
+interface OpenLink {
+  href: string;
+  start: number;
+  alts: string[];
+}
+
+/**
+ * Converts an HTML document to text (see htmlToText) only as far as asked, so that a long email whose
+ * text will be cut anyway isn't converted whole. `read(maxChars)` goes on from where the last call
+ * stopped until the text holds `maxChars` characters (0: to the end), finishing the block it is in (or
+ * stopping at twice that if the block goes on), or until `maxInput` characters of the HTML have been
+ * read, and returns all the text so far. A link still open where it stopped has its address added only
+ * once it is read to its end.
+ */
+export class HtmlTextReader {
+  private readonly b = new TextBuilder();
+  private pos = 0;
+  private done = false;
+  private readonly lists: { ordered: boolean; next: number }[] = [];
+  private link: OpenLink | undefined;
+  private pre = 0;
+  private preStart = false;
   /**
    * An element hidden by its style, and everything in it, until its end: how many of its kind are open,
    * and the elements opened inside it (by name, and in all).
    */
-  let hidden: { tag: string; depth: number; inner: Map<string, number>; open: number } | undefined;
+  private hidden: { tag: string; depth: number; inner: Map<string, number>; open: number } | undefined;
+  private readonly flags: TagFlags = { style: undefined, hidden: false };
 
-  const closeLink = () => {
+  constructor(private readonly html: string) {}
+
+  read(maxChars: number, maxInput = Infinity): { text: string; complete: boolean } {
+    if (!this.done && this.pos < maxInput) this.convert(maxChars, maxInput);
+    return { text: this.b.toString(), complete: this.done };
+  }
+
+  private closeLink() {
+    const link = this.link;
     if (!link) return;
-    const { href, start, alts } = link;
-    link = undefined;
-    const label = b.textSince(start);
-    const url = href.trim();
-    const alt = alts.join(" ").trim();
+    const b = this.b;
+    this.link = undefined;
+    const label = b.textSince(link.start);
+    const url = link.href.trim();
+    const alt = link.alts.join(" ").trim();
     if (!url || url.startsWith("#") || /^javascript:/i.test(url)) {
       if (!label) b.word(alt);
       return;
@@ -951,142 +1016,179 @@ export function htmlToText(html: string): string {
       b.space = true;
       b.word(`(${url})`);
     }
-  };
+  }
 
-  while (pos < n) {
-    // The next "<" that starts markup; any other "<" is part of the text run, however many there are.
-    let lt = html.indexOf("<", pos);
-    while (lt >= 0 && !startsMarkup(html, lt)) lt = html.indexOf("<", lt + 1);
-    const textEnd = lt < 0 ? n : lt;
-    if (textEnd > pos && !hidden) {
-      let raw = html.slice(pos, textEnd);
-      if (pre) {
-        if (preStart) raw = raw.replace(/^\r?\n/, "");
-        b.pre(raw);
-      } else b.text(raw);
-      preStart = false;
-    }
-    if (lt < 0) break;
-    const c1 = html.charCodeAt(lt + 1);
-    if (c1 === 33 /* ! */) {
-      // Comments, including unterminated ones (which hide the rest, as in browsers), DOCTYPE and <![…]>.
-      let end: number;
-      if (html.startsWith("<!--", lt)) {
-        if (html.startsWith("<!-->", lt)) end = lt + 5;
-        else if (html.startsWith("<!--->", lt)) end = lt + 6;
-        else {
-          const close = html.indexOf("-->", lt + 4);
-          end = close < 0 ? n : close + 3;
-        }
-      } else {
-        const close = html.indexOf(">", lt + 2);
-        end = close < 0 ? n : close + 1;
+  private convert(maxChars: number, maxInput: number) {
+    const { html, b, lists, flags } = this;
+    const n = html.length;
+    // Past `hardLimit` characters of text, or `rawLimit` characters of HTML in one run of text, it stops at once.
+    const hardLimit = maxChars ? 2 * maxChars : Infinity;
+    const rawLimit = maxChars ? 8 * maxChars : Infinity;
+    let { pos, pre, preStart, hidden } = this;
+    let paused = false;
+
+    while (pos < n) {
+      if (b.chars >= hardLimit || pos >= maxInput) {
+        paused = true;
+        break;
       }
-      pos = end;
-      continue;
-    }
-    if (c1 === 63 /* ? */ || (c1 === 47 /* / */ && !isLetter(html.charCodeAt(lt + 2)))) {
-      const close = html.indexOf(">", lt + 2);
-      pos = close < 0 ? n : close + 1;
-      continue;
-    }
-    const closing = c1 === 47;
-    const nameStart = closing ? lt + 2 : lt + 1;
-    let i = nameStart + 1;
-    for (let c = html.charCodeAt(i); i < n && c !== 62 && c !== 47 && !isHtmlSpace(c); c = html.charCodeAt(++i));
-    const tag = html.slice(nameStart, i).toLowerCase();
-    const wantAttrs = !closing && (tag === "a" || tag === "img" || tag === "ol");
-    const attrs = wantAttrs ? new Map<string, string>() : undefined;
-    flags.style = undefined;
-    flags.hidden = false;
-    const end = scanAttributes(html, i, attrs, closing ? undefined : flags);
-    if (end < 0) break;
-    pos = end;
-
-    if (!closing && HIDDEN_END.has(tag)) {
-      const re = HIDDEN_END.get(tag)!;
-      re.lastIndex = pos;
-      const m = re.exec(html);
-      if (!m) break;
-      const after = scanAttributes(html, m.index + 2 + tag.length);
-      if (after < 0) break;
-      pos = after;
-      continue;
-    }
-
-    if (hidden) {
-      // Inside a hidden element: only its end matters (its own end tag, an end tag of an element it is
-      // in, or a start tag that implicitly ends it, such as the next <td>).
-      if (closing) {
-        if (tag === hidden.tag) {
-          if (--hidden.depth === 0) hidden = undefined;
-          continue;
+      // The next "<" that starts markup; any other "<" is part of the text run, however many there are.
+      let lt = html.indexOf("<", pos);
+      while (lt >= 0 && !startsMarkup(html, lt) && lt - pos < rawLimit) lt = html.indexOf("<", lt + 1);
+      let textEnd = lt < 0 ? n : lt;
+      if (textEnd - pos > rawLimit) {
+        // A run of text longer than could be needed: convert its start (not splitting a character reference) and stop.
+        textEnd = pos + rawLimit;
+        const amp = html.lastIndexOf("&", textEnd);
+        if (amp > pos && amp > textEnd - 40) textEnd = amp;
+        else if (isHighSurrogate(html.charCodeAt(textEnd - 1))) textEnd--;
+        lt = -1;
+        paused = true;
+      }
+      if (textEnd > pos && !hidden) {
+        let raw = html.slice(pos, textEnd);
+        if (pre) {
+          if (preStart) raw = raw.replace(/^\r?\n/, "");
+          b.pre(raw);
+        } else b.text(raw);
+        preStart = false;
+      }
+      if (lt < 0) {
+        pos = textEnd;
+        break;
+      }
+      const c1 = html.charCodeAt(lt + 1);
+      if (c1 === 33 /* ! */) {
+        // Comments, including unterminated ones (which hide the rest, as in browsers), DOCTYPE and <![…]>.
+        let end: number;
+        if (html.startsWith("<!--", lt)) {
+          if (html.startsWith("<!-->", lt)) end = lt + 5;
+          else if (html.startsWith("<!--->", lt)) end = lt + 6;
+          else {
+            const close = html.indexOf("-->", lt + 4);
+            end = close < 0 ? n : close + 3;
+          }
+        } else {
+          const close = html.indexOf(">", lt + 2);
+          end = close < 0 ? n : close + 1;
         }
-        const opened = hidden.inner.get(tag);
-        if (opened) {
-          hidden.inner.set(tag, opened - 1);
-          hidden.open--;
-          continue;
-        }
-        hidden = undefined;
-      } else if (hidden.depth === 1 && !hidden.open && endsImplicitly(hidden.tag, tag)) {
-        hidden = undefined;
-      } else {
-        if (tag === hidden.tag) hidden.depth++;
-        else if (!VOID_TAGS.has(tag)) {
-          hidden.inner.set(tag, (hidden.inner.get(tag) ?? 0) + 1);
-          hidden.open++;
-        }
+        pos = end;
         continue;
       }
-    }
-    if (!closing && (flags.hidden || (flags.style !== undefined && hidesElement(flags.style)))) {
-      if (!VOID_TAGS.has(tag)) hidden = { tag, depth: 1, inner: new Map(), open: 0 };
-      continue;
-    }
+      if (c1 === 63 /* ? */ || (c1 === 47 /* / */ && !isLetter(html.charCodeAt(lt + 2)))) {
+        const close = html.indexOf(">", lt + 2);
+        pos = close < 0 ? n : close + 1;
+        continue;
+      }
+      const closing = c1 === 47;
+      const nameStart = closing ? lt + 2 : lt + 1;
+      let i = nameStart + 1;
+      for (let c = html.charCodeAt(i); i < n && c !== 62 && c !== 47 && !isHtmlSpace(c); c = html.charCodeAt(++i));
+      const tag = html.slice(nameStart, i).toLowerCase();
+      const wantAttrs = !closing && (tag === "a" || tag === "img" || tag === "ol");
+      const attrs = wantAttrs ? new Map<string, string>() : undefined;
+      flags.style = undefined;
+      flags.hidden = false;
+      const end = scanAttributes(html, i, attrs, closing ? undefined : flags);
+      if (end < 0) {
+        pos = n; // the document ends inside the tag: browsers drop it
+        break;
+      }
+      pos = end;
 
-    if (tag === "br") b.newline();
-    else if (tag === "a") {
-      closeLink();
-      if (!closing) link = { href: decodeEntities(attrs!.get("href") ?? ""), start: b.length, alts: [] };
-    } else if (tag === "img") {
-      const alt = attrs?.get("alt");
-      if (link && alt) link.alts.push(decodeEntities(alt).replace(HTML_SPACE, " ").trim());
-    } else if (tag === "td" || tag === "th") {
-      if (closing) b.endCell();
-      else b.openCell();
-    } else if (tag === "table") {
-      if (closing) b.closeTable();
-      b.line();
-      if (!closing) b.openTable();
-    } else if (tag === "tr") {
-      b.endCell();
-      b.sep = "";
-      b.line();
-    } else if (tag === "li") {
-      b.line();
-      if (!closing) {
-        const list = lists.at(-1);
-        // Items of nested lists are indented two spaces per level (up to MAX_LIST_INDENT levels).
-        const indent = "  ".repeat(Math.min(Math.max(lists.length - 1, 0), MAX_LIST_INDENT));
-        b.marker = indent + (list?.ordered ? `${list.next++}.` : "-");
+      if (!closing && HIDDEN_END.has(tag)) {
+        const re = HIDDEN_END.get(tag)!;
+        re.lastIndex = pos;
+        const m = re.exec(html);
+        const after = m ? scanAttributes(html, m.index + 2 + tag.length) : -1;
+        pos = after < 0 ? n : after;
+        continue;
       }
-    } else if (tag === "ul" || tag === "ol") {
-      if (closing) lists.pop();
-      if (lists.length) b.line();
-      else b.blank();
-      if (!closing) {
-        const start = Number.parseInt(attrs?.get("start") ?? "", 10);
-        lists.push({ ordered: tag === "ol", next: Number.isNaN(start) ? 1 : Math.min(Math.max(start, -MAX_LIST_START), MAX_LIST_START) });
+
+      if (hidden) {
+        // Inside a hidden element: only its end matters (its own end tag, an end tag of an element it is
+        // in, or a start tag that implicitly ends it, such as the next <td>).
+        if (closing) {
+          if (tag === hidden.tag) {
+            if (--hidden.depth === 0) hidden = undefined;
+            continue;
+          }
+          const opened = hidden.inner.get(tag);
+          if (opened) {
+            hidden.inner.set(tag, opened - 1);
+            hidden.open--;
+            continue;
+          }
+          hidden = undefined;
+        } else if (hidden.depth === 1 && !hidden.open && endsImplicitly(hidden.tag, tag)) {
+          hidden = undefined;
+        } else {
+          if (tag === hidden.tag) hidden.depth++;
+          else if (!VOID_TAGS.has(tag)) {
+            hidden.inner.set(tag, (hidden.inner.get(tag) ?? 0) + 1);
+            hidden.open++;
+          }
+          continue;
+        }
       }
-    } else if (PARAGRAPH_TAGS.has(tag)) {
-      b.blank();
-      if (tag === "pre") {
-        pre = Math.max(0, pre + (closing ? -1 : 1));
-        preStart = !closing;
+      if (!closing && (flags.hidden || (flags.style !== undefined && hidesElement(flags.style)))) {
+        if (!VOID_TAGS.has(tag)) hidden = { tag, depth: 1, inner: new Map(), open: 0 };
+        continue;
       }
-    } else if (LINE_TAGS.has(tag)) b.line();
+
+      if (tag === "br") b.newline();
+      else if (tag === "a") {
+        this.closeLink();
+        if (!closing) this.link = { href: decodeEntities(attrs!.get("href") ?? ""), start: b.length, alts: [] };
+      } else if (tag === "img") {
+        const alt = attrs?.get("alt");
+        if (this.link && alt) this.link.alts.push(decodeEntities(alt).replace(HTML_SPACE, " ").trim());
+      } else if (tag === "td" || tag === "th") {
+        if (closing) b.endCell();
+        else b.openCell();
+      } else if (tag === "table") {
+        if (closing) b.closeTable();
+        b.line();
+        if (!closing) b.openTable();
+      } else if (tag === "tr") {
+        b.endCell();
+        b.sep = "";
+        b.line();
+      } else if (tag === "li") {
+        b.line();
+        if (!closing) {
+          const list = lists.at(-1);
+          // Items of nested lists are indented two spaces per level (up to MAX_LIST_INDENT levels).
+          const indent = "  ".repeat(Math.min(Math.max(lists.length - 1, 0), MAX_LIST_INDENT));
+          b.marker = indent + (list?.ordered ? `${list.next++}.` : "-");
+        }
+      } else if (tag === "ul" || tag === "ol") {
+        if (closing) lists.pop();
+        if (lists.length) b.line();
+        else b.blank();
+        if (!closing) {
+          const start = Number.parseInt(attrs?.get("start") ?? "", 10);
+          lists.push({ ordered: tag === "ol", next: Number.isNaN(start) ? 1 : Math.min(Math.max(start, -MAX_LIST_START), MAX_LIST_START) });
+        }
+      } else if (PARAGRAPH_TAGS.has(tag)) {
+        b.blank();
+        if (tag === "pre") {
+          pre = Math.max(0, pre + (closing ? -1 : 1));
+          preStart = !closing;
+        }
+      } else if (LINE_TAGS.has(tag)) b.line();
+      if (maxChars && b.chars >= maxChars && b.atLineStart && pos < n) {
+        paused = true;
+        break;
+      }
+    }
+    this.pos = pos;
+    this.pre = pre;
+    this.preStart = preStart;
+    this.hidden = hidden;
+    if (!paused || pos >= n) {
+      this.closeLink();
+      this.done = true;
+    }
   }
-  closeLink();
-  return b.toString();
 }

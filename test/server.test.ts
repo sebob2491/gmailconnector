@@ -1100,8 +1100,14 @@ describe("cleaner, smaller results", () => {
     });
     const short = await call("get_message", { account: "personal", messageId: "huge" });
     assert.ok(short.json.plaintextBody.length <= 20_000);
-    // 50,000 characters, less the trailing space that cleaning trims, less the 20,000 shown.
-    assert.match(short.json.truncated, /^Body shortened: 29,999 more characters not shown/);
+    // Only the start of a body far over the limit is read, so the note can't say how much more there is.
+    assert.equal(short.json.truncated, "Body shortened; the rest is available with maxBodyChars: 0.");
+    // One read whole says how much was left out: 25,000 characters, less the trailing space, less 20,000.
+    fake.deliver(personal, crlf(["From: news@example.com", `To: ${PERSONAL}`, "Subject: Long", "Content-Type: text/plain", "", "word ".repeat(5_000)]), {
+      id: "long",
+    });
+    const counted = await call("get_message", { account: "personal", messageId: "long" });
+    assert.match(counted.json.truncated, /^Body shortened: 4,999 more characters not shown/);
 
     const custom = await call("get_message", { account: "personal", messageId: "huge", maxBodyChars: 500 });
     assert.equal(custom.json.plaintextBody.length, 500);

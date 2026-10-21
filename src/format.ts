@@ -1,5 +1,5 @@
 import { Buffer, isAscii } from "node:buffer";
-import { decodeEntities, htmlToText, isValidAddress, type Mailbox } from "./mime.js";
+import { decodeEntities, HtmlTextReader, isValidAddress, type Mailbox } from "./mime.js";
 
 /** Subset of the Gmail API Message resource we rely on. */
 export interface ApiMessagePart {
@@ -393,9 +393,44 @@ export function unflow(text: string, delSp: boolean): string {
 
 /** The readable body: the plain-text part, or the HTML converted to text when that's missing or blank. */
 export function bodyText(content: { text?: string; html?: string }): string {
-  if (content.text?.trim()) return content.text;
-  if (content.html !== undefined) return htmlToText(content.html);
-  return content.text ?? "";
+  return bodyTextStart(content, 0).text;
+}
+
+/**
+ * The start of the readable body (see bodyText): about `maxChars` characters of it (0: all), and
+ * whether that is all of it. Only that much of the body is converted.
+ */
+export function bodyTextStart(content: { text?: string; html?: string }, maxChars: number): { text: string; complete: boolean } {
+  return bodyReader(content)(maxChars);
+}
+
+/**
+ * Reads the readable body (see bodyText) in steps: each call gives the start of it, about `maxChars`
+ * characters long (0: all of it), converting HTML only as far as it hasn't been already, and never
+ * reading past `maxInput` characters of the part.
+ */
+function bodyReader(
+  content: { text?: string; html?: string },
+  maxInput = Infinity,
+): (maxChars: number) => { text: string; complete: boolean } {
+  const text = content.text;
+  if (text?.trim()) {
+    return (maxChars) => {
+      const limit = Math.min(maxChars || Infinity, maxInput);
+      if (text.length <= limit) return { text, complete: true };
+      const end = isHighSurrogate(text.charCodeAt(limit - 1)) ? limit - 1 : limit;
+      return { text: text.slice(0, end), complete: false };
+    };
+  }
+  if (content.html !== undefined) {
+    const reader = new HtmlTextReader(content.html);
+    return (maxChars) => reader.read(maxChars, maxInput);
+  }
+  return () => ({ text: text ?? "", complete: true });
+}
+
+function isHighSurrogate(c: number): boolean {
+  return c >= 0xd800 && c <= 0xdbff;
 }
 
 /** Gmail's internalDate (milliseconds since 1970) as ISO 8601 to the second, e.g. 2026-10-20T21:09:45Z; undefined if it isn't a time. */
@@ -519,9 +554,65 @@ export const DEFAULT_MAX_BODY_CHARS = 20_000;
 export function limitLength(text: string, max: number): { text: string; omitted: number } {
   if (!max || text.length <= max) return { text, omitted: 0 };
   let end = max;
-  const code = text.charCodeAt(end - 1);
-  if (code >= 0xd800 && code <= 0xdbff) end--; // don't split a surrogate pair
+  if (isHighSurrogate(text.charCodeAt(end - 1))) end--; // don't split a surrogate pair
   return { text: text.slice(0, end), omitted: text.length - end };
+}
+
+/**
+ * The start of a body read only partway, without a link it ends inside: cut short, the link would be
+ * shown as it is instead of being shortened (it is read whole when more is read).
+ */
+function withoutCutLink(text: string): string {
+  let i = text.length;
+  for (let c = text.charCodeAt(i - 1); i > 0 && !(c <= 32 || c === 0xa0 || c === 0x3000 || (c >= 0x2000 && c <= 0x200b)); c = text.charCodeAt(--i - 1));
+  return /https?:\/\//i.test(text.slice(i)) ? text.slice(0, i) : text;
+}
+
+/**
+ * Bodies are read this far past the characters shown (1.5 times as many), since cleaning and cutting
+ * links shrink them; the rest would be cut anyway.
+ */
+const READ_AHEAD = 1.5;
+
+/** With a limit on characters shown, at most this many times as many characters of a body part are read. */
+const MAX_READ_FACTOR = 64;
+
+/**
+ * The body as shown in results: line ends normalized, the quoted history cut (`hide`), cleaned, long
+ * links cut (`shorten`). With a limit (`max`), only the start of the body is read: READ_AHEAD times
+ * `max` characters, then more for as long as cleaning and cutting links leave no more than `max`, so
+ * whatever fits within the limit comes out exactly as if all of it had been read (up to MAX_READ_FACTOR
+ * times `max` characters of the part, which only markup or padding without text ever needs).
+ * `complete` says whether everything was read (or everything not read was quoted history being hidden).
+ */
+function readableBody(
+  content: ExtractedContent,
+  max: number,
+  opts: { hide: boolean; shorten: boolean },
+): { text: string; shortened: number; complete: boolean } {
+  const read = bodyReader(content, max ? max * MAX_READ_FACTOR + 65_536 : Infinity);
+  let budget = max ? Math.ceil(max * READ_AHEAD) : 0;
+  let previous = -1;
+  for (;;) {
+    const start = read(budget);
+    const stuck = start.text.length === previous; // nothing more can be read
+    previous = start.text.length;
+    let text = (start.complete || stuck ? start.text : withoutCutLink(start.text)).replace(/\r\n?/g, "\n");
+    let complete = start.complete;
+    // The quoted history is cut before cleaning, so the cleaning doesn't run over text that is dropped.
+    if (opts.hide) {
+      const cut = hideQuotedHistory(text);
+      if (cut !== text) complete = true;
+      text = cut;
+    }
+    text = cleanBody(text);
+    let shortened = 0;
+    if (opts.shorten) ({ text, shortened } = shortenLinks(text));
+    if (complete || text.length > max || stuck) return { text, shortened, complete };
+    // Read on: in proportion to how much cleaning took away, at least a quarter more, at most four times as much.
+    const wanted = (budget * (max + 1) * 1.1) / Math.max(text.length, 1);
+    budget = Math.ceil(Math.min(budget * 4, Math.max(budget * 1.25, wanted)));
+  }
 }
 
 export interface FormatOptions {
@@ -589,13 +680,10 @@ export async function formatMessage(
   if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {
     const content = await extractContent(p, loadData);
     const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
-    // The quoted history is cut before cleaning, so the cleaning doesn't run over text that is dropped.
-    let body = bodyText(content).replace(/\r\n?/g, "\n");
-    if (opts.hideQuotedHistory && format === "PLAIN_TEXT") body = hideQuotedHistory(body);
-    body = cleanBody(body);
-    let shortenedLinks = 0;
-    if (opts.shortenLinks && format === "PLAIN_TEXT") ({ text: body, shortened: shortenedLinks } = shortenLinks(body));
-    const plain = limitLength(body, max);
+    const reading = format === "PLAIN_TEXT";
+    const body = readableBody(content, max, { hide: Boolean(opts.hideQuotedHistory && reading), shorten: Boolean(opts.shortenLinks && reading) });
+    const shortenedLinks = body.shortened;
+    const plain = limitLength(body.text, max);
     out.plaintextBody = plain.text;
     let omitted = plain.omitted;
     if (format === "FULL_CONTENT" && content.html !== undefined) {
@@ -603,7 +691,10 @@ export async function formatMessage(
       out.htmlBody = html.text;
       omitted = Math.max(omitted, html.omitted);
     }
-    if (omitted) {
+    if (!body.complete) {
+      // Only the start of the body was read, so how much more there is isn't known.
+      out.truncated = "Body shortened; the rest is available with maxBodyChars: 0.";
+    } else if (omitted) {
       out.truncated =
         `Body shortened: ${omitted.toLocaleString("en-US")} more characters not shown. ` +
         `Fetch it with get_message, get_thread or get_draft and maxBodyChars: 0 for the full text.`;
