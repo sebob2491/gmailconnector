@@ -11,6 +11,8 @@ import {
   formatMessage,
   hideQuotedHistory,
   limitLength,
+  QUOTE_HIDDEN,
+  quoteKey,
   parseAddressList,
   parseMailboxes,
   recipientsFrom,
@@ -584,9 +586,14 @@ function quotingThread(count: number): string[] {
 }
 
 test("cutting the quoted history before cleaning a body gives the same text as after", () => {
-  for (const body of quotingThread(100)) {
-    assert.equal(cleanBody(hideQuotedHistory(body.replace(/\r\n?/g, "\n"))), hideQuotedHistory(cleanBody(body)));
-  }
+  const bodies = quotingThread(100);
+  const keys = bodies.map((body) => quoteKey(body));
+  bodies.forEach((body, i) => {
+    const before = cleanBody(hideQuotedHistory(body, keys.slice(0, i))); // CRLF line ends and all
+    assert.equal(before, hideQuotedHistory(cleanBody(body), keys.slice(0, i)));
+    assert.equal(before, cleanBody(hideQuotedHistory(body.replace(/\r\n?/g, "\n"), keys.slice(0, i))));
+    if (i) assert.ok(before.endsWith(QUOTE_HIDDEN), `message ${i} has its quote hidden`);
+  });
 });
 
 /** A newsletter of about `bytes` characters: rows of a layout table, each with a headline, a paragraph and a tracking link. */
@@ -641,4 +648,76 @@ test("only the start of a long body is read, and it reads exactly like the start
     const out = await formatMessage(plain, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: max });
     assert.equal(out.plaintextBody, limitLength(all.plaintextBody!, max).text);
   }
+});
+
+/** hideQuotedHistory for a reply, given the earlier messages of its thread. */
+const hideIn = (reply: string, ...earlier: string[]) => hideQuotedHistory(reply, earlier.map(quoteKey));
+
+test("quoted history is hidden in Gmail, Apple Mail and Outlook replies, in several languages", () => {
+  const ask = "Can we meet at 3pm tomorrow?\n\nJohn";
+  const gmail = "Sounds good.\n\nOn Mon, Jan 1, 2024 at 10:00 AM John <john@example.com> wrote:\n\n> Can we meet at 3pm tomorrow?\n>\n> John\n";
+  assert.equal(hideIn(gmail, ask), `Sounds good.\n\n${QUOTE_HIDDEN}`);
+  const wrapped = "Sounds good.\n\nOn Mon, Jan 1, 2024 at 10:00 AM Jonathan Livingston Seagull <jonathan@example.com>\nwrote:\n\n> Can we meet at 3pm tomorrow?\n>\n> John\n";
+  assert.equal(hideIn(wrapped, ask), `Sounds good.\n\n${QUOTE_HIDDEN}`);
+  // Apple Mail puts the attribution inside the quote.
+  const apple = "Sounds good.\n\nSent from my iPhone\n\n> On Jan 1, 2024, at 10:00 AM, John <john@example.com> wrote:\n> \n> Can we meet at 3pm tomorrow?\n> \n> John\n";
+  assert.equal(hideIn(apple, ask), `Sounds good.\n\nSent from my iPhone\n\n${QUOTE_HIDDEN}`);
+  // Outlook: the header block (with the rule above it), or -----Original Message-----.
+  const outlook = "Perfect.\n\n________________________________\nFrom: John <john@example.com>\nSent: Monday, January 1, 2024 10:00 AM\nTo: Me <me@example.com>\nSubject: Meeting\n\nCan we meet at 3pm tomorrow?\n\nJohn\n";
+  assert.equal(hideIn(outlook, ask), `Perfect.\n\n${QUOTE_HIDDEN}`);
+  const original = "Perfect.\n\n-----Original Message-----\nFrom: John <john@example.com>\nSent: Monday, January 1, 2024 10:00 AM\nTo: Me\nSubject: Meeting\n\nCan we meet at 3pm tomorrow?\nJohn\n";
+  assert.equal(hideIn(original, ask), `Perfect.\n\n${QUOTE_HIDDEN}`);
+  const german = "Passt, danke!\n\nVon: Hans Müller <hans@example.de>\nGesendet: Montag, 1. Januar 2024 10:00\nAn: Sebastian <me@example.com>\nBetreff: Treffen\n\nKönnen wir uns am Montag treffen?\n";
+  assert.equal(hideIn(german, "Können wir uns am Montag treffen?"), `Passt, danke!\n\n${QUOTE_HIDDEN}`);
+  const french = "Oui.\n\nDe : Marie Curie <marie@example.fr>\nEnvoyé : lundi 1 janvier 2024 10:00\nÀ : Sebastian <me@example.com>\nObjet : Réunion\n\nOn se voit lundi ?\n";
+  assert.equal(hideIn(french, "On se voit lundi ?"), `Oui.\n\n${QUOTE_HIDDEN}`);
+  // Below an Outlook header nobody answers between the lines, even if the quoted reply quotes with ">" itself.
+  const earlierReply = "Friday works.\n\nOn Tue, Jan 2, 2024 at 9:00 AM Ann <ann@example.com> wrote:\n> Can we meet Friday?\n";
+  const outlookOverQuotes = `Great, see you then.\n\nFrom: Bob <bob@example.com>\nSent: Tuesday, January 2, 2024 9:30 AM\nTo: Ann <ann@example.com>\nSubject: RE: Friday\n\n${earlierReply}`;
+  assert.equal(hideIn(outlookOverQuotes, "Can we meet Friday?", earlierReply), `Great, see you then.\n\n${QUOTE_HIDDEN}`);
+  // Attribution lines in other languages put the verb anywhere on the line.
+  const question = "Können wir uns am Montag treffen?";
+  for (const attribution of [
+    "Am Mo., 1. Jan. 2024 um 10:00 Uhr schrieb Hans Müller <hans@example.de>:",
+    "Am 01.01.2024 um 10:00 schrieb Hans Müller <hans@example.de>:",
+    "Le lun. 1 janv. 2024 à 10:00, Marie Curie <marie@example.fr> a écrit :",
+    "El lun, 1 ene 2024 a las 10:00, Juan Pérez (<juan@example.es>) escribió:",
+    "Il giorno lun 1 gen 2024 alle ore 10:00 Marco Rossi <marco@example.it> ha scritto:",
+    "Op ma 1 jan 2024 om 10:00 schreef Jan de Vries <jan@example.nl>:",
+    "Den 1 jan. 2024 kl. 10:00 skrev Sven <sven@example.se>:",
+    "pon., 1 sty 2024 o 10:00 Jan Kowalski <jan@example.pl> napisał(a):",
+    "пн, 1 янв. 2024 г. в 10:00, Иван <ivan@example.ru>:",
+  ]) {
+    assert.equal(hideIn(`Ja.\n\n${attribution}\n\n> ${question}\n`, question), `Ja.\n\n${QUOTE_HIDDEN}`, attribution);
+    assert.equal(hideIn(`Ja.\n\n> ${attribution}\n> \n> ${question}\n`, question), `Ja.\n\n${QUOTE_HIDDEN}`, `quoted ${attribution}`);
+  }
+  // A short message is hidden when quoted as it is.
+  assert.equal(hideIn("You're welcome.\n\nOn Mon, Jan 1, 2024 at 10:00 AM Ann <ann@example.com> wrote:\n> Thanks!\n", "Thanks!"), `You're welcome.\n\n${QUOTE_HIDDEN}`);
+});
+
+test("a forwarded email, a quote from outside the thread and answers between quoted lines stay", () => {
+  // Gmail's forward (fuzz repro thread-forward-hidden.txt): kept, even when the thread holds the forwarded email.
+  const forward =
+    "FYI, see below.\n\n---------- Forwarded message ---------\nFrom: Vendor Support <support@vendor.example>\nDate: Tue, Jan 2, 2024 at 4:15 PM\n" +
+    "Subject: Ticket #4521\nTo: Sebastian <me@example.com>\n\n\nHi Sebastian,\n\nWe have identified the cause. A fix will ship on Jan 4.\n\nRegards,\nPriya\n";
+  const vendor = "Hi Sebastian,\n\nWe have identified the cause. A fix will ship on Jan 4.\n\nRegards,\nPriya";
+  assert.equal(hideIn(forward, "Any news from the vendor?"), forward);
+  assert.equal(hideIn(forward, vendor), forward);
+  for (const marker of ["---------- Weitergeleitete Nachricht ---------", "---------- Message transféré ---------", "-------- Forwarded Message --------", "Begin forwarded message:"]) {
+    const localized = forward.replace("---------- Forwarded message ---------", marker);
+    assert.equal(hideIn(localized, vendor), localized, marker);
+  }
+  // Outlook forwards look like replies: what doesn't copy an earlier message of the thread stays.
+  const outlookForward = "Please handle.\n\nFrom: Vendor Support <support@vendor.example>\nSent: Tuesday, January 2, 2024 4:15 PM\nTo: Sebastian <me@example.com>\nSubject: Ticket #4521\n\nThanks for your patience, the fix ships on Jan 4.\n";
+  assert.equal(hideIn(outlookForward, "Thanks", "Can you forward me their answer?"), outlookForward);
+  // A quote of a message that isn't in the thread.
+  const elsewhere = "Agreed.\n\nOn Mon, Jan 1, 2024 at 10:00 AM Jon <jon@example.com> wrote:\n> The budget for Q3 is approved.\n";
+  assert.equal(hideIn(elsewhere, "Lunch on Friday?"), elsewhere);
+  // Answers written between quoted lines.
+  const inline = "Answers inline.\n\nOn Mon, Jan 1, 2024 at 10:00 AM Jon <jon@example.com> wrote:\n\n> Can you do Monday?\nYes.\n> And Tuesday?\nNo.\n";
+  assert.equal(hideIn(inline, "Can you do Monday?\nAnd Tuesday?"), inline);
+  // Prose that looks like an attribution, and no earlier messages at all.
+  const prose = "Thanks!\n\nOn Monday the team wrote:\nWe are hiring two people.";
+  assert.equal(hideIn(prose, "We are hiring two people."), prose);
+  assert.equal(hideQuotedHistory("Sounds good.\n\nOn Mon, Jan 1, 2024 at 10:00 AM John <john@example.com> wrote:\n> Hi\n"), "Sounds good.\n\nOn Mon, Jan 1, 2024 at 10:00 AM John <john@example.com> wrote:\n> Hi\n");
 });

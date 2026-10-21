@@ -1188,6 +1188,47 @@ describe("cleaner, smaller results", () => {
     assert.match(one.json.plaintextBody, /wrote:\n\n> Can you do Friday\?\n>$/);
   });
 
+  test("get_thread hides Outlook and Apple Mail quotes of earlier messages, but never a forwarded email", async () => {
+    const { call, fake, personal } = await setup();
+    const mail = (id: string, from: string, subject: string, body: string[]) =>
+      fake.deliver(personal, crlf([`From: ${from}`, `To: ${PERSONAL}`, `Subject: ${subject}`, "Content-Type: text/plain; charset=UTF-8", "", ...body]), {
+        id,
+        threadId: "mixed",
+      });
+    mail("m0", "Hans <hans@example.de>", "Treffen", ["Können wir uns am Montag treffen?"]);
+    mail("m1", "Me <me@example.com>", "AW: Treffen", [
+      "Passt, danke!",
+      "",
+      "Von: Hans <hans@example.de>",
+      "Gesendet: Montag, 1. Januar 2024 10:00",
+      "An: Me <me@example.com>",
+      "Betreff: Treffen",
+      "",
+      "Können wir uns am Montag treffen?",
+    ]);
+    // The forwarded email (fuzz repro thread-forward-hidden.txt) isn't in the thread: it stays.
+    mail("m2", "Me <me@example.com>", "Fwd: Ticket #4521", [
+      "FYI, see below.",
+      "",
+      "---------- Forwarded message ---------",
+      "From: Vendor Support <support@vendor.example>",
+      "Date: Tue, Jan 2, 2024 at 4:15 PM",
+      "Subject: Ticket #4521",
+      "To: Sebastian <me@example.com>",
+      "",
+      "",
+      "Hi Sebastian,",
+      "",
+      "We have identified the cause. A fix will ship on Jan 4.",
+    ]);
+    mail("m3", "Hans <hans@example.de>", "Re: Treffen", ["Super.", "", "> Am 01.01.2024 um 10:05 schrieb Me <me@example.com>:", "> ", "> Passt, danke!", "> "]);
+    const thread = await call("get_thread", { account: "personal", threadId: "mixed" });
+    const bodies = thread.json.messages.map((m: any) => m.plaintextBody);
+    assert.equal(bodies[1], "Passt, danke!\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+    assert.match(bodies[2], /---------- Forwarded message ---------\nFrom: Vendor Support[^]*A fix will ship on Jan 4\.$/);
+    assert.equal(bodies[3], "Super.\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+  });
+
   test("long tracking links are cut to their site when reading, but kept in drafts and FULL_CONTENT", async () => {
     const { call, fake, personal } = await setup();
     const tracking = `https://click.mail.shop.example/c2/abc?jwt=${"x".repeat(1500)}`;

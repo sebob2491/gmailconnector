@@ -503,34 +503,223 @@ export function attachmentText(text: string): string {
   return text.replace(/^\ufeff/, "").replace(/\0/g, "").replace(/\r\n?/g, "\n");
 }
 
+// ---------- quoted history ----------
+
 /**
- * Where a reply's quoted history starts: "On <date>, <name> wrote:" (possibly wrapped onto a second
- * line, and in a few languages), Outlook's "-----Original Message-----", or its "From:/Sent:" header block.
+ * Verbs of attribution lines ("On <date>, <name> wrote:"), in the languages of common mail programs.
+ * The verb may stand anywhere on the line: "Am Mo., 1. Jan. 2024 um 10:00 Uhr schrieb Hans <…>:".
  */
-const QUOTE_START = new RegExp(
-  [
-    String.raw`^On\b[^\n]{0,300}(?:\n[^\n]{0,300})?\b(?:wrote|schrieb|a écrit|escribió|scrisse|schreef|skrev|napisał)\s?:[ \t]*$`,
-    String.raw`^-{2,}[ \t]*Original Message[ \t]*-{2,}[ \t]*$`,
-    String.raw`^From:[^\n]+\n(?:Sent|Date):[^\n]+\n(?:To|Subject|Cc):`,
-  ].join("|"),
-  "im",
+const ATTRIBUTION_VERB = new RegExp(
+  String.raw`(?<!\p{L})(?:wrote|schrieb|a [ée]crit|escribi[óo]|ha scritto|scrisse|schreef|geschreven|skrev|napisa[łl](?:\(a\)|a)?|pisze|escreveu|kirjoitti|napsal(?:\(a\)|a)?|написал(?:\(а\)|а)?|пишет|yazd[ıi]|írta|έγραψε)(?!\p{L})|写道|작성`,
+  "iu",
 );
+/** Attribution lines that name the sender by address, without a verb (Gmail in Russian, Japanese…). */
+const ENDS_WITH_ADDRESS = /<[^<>\s@]+@[^<>\s]+>\)?\s?[:：]$/;
+
+/** An attribution line: dated (a digit), a verb or the sender's address, ending with ":". */
+function isAttribution(line: string): boolean {
+  return line.length <= 400 && /[:：]$/.test(line) && /\d/.test(line) && (ATTRIBUTION_VERB.test(line) || ENDS_WITH_ADDRESS.test(line));
+}
+
+/** Outlook's "-----Original Message-----" line, also in other languages. */
+const ORIGINAL_MESSAGE =
+  /^-{2,}\s*(?:original message|urspr[üu]ngliche nachricht|message d'origine|mensaje original|messaggio originale|oorspronkelijk bericht|ursprungligt meddelande|oprindelig meddelelse|opprinnelig melding|oryginalna wiadomo[śs][ćc]|mensagem original)\s*-{2,}$/i;
+
+/** The first three lines of an Outlook header block (From:, Sent:/Date:, To:/Subject:/Cc:), in several languages. */
+const OUTLOOK_FROM = /^\*?(?:from|von|de|da|van|fr[åa]n|fra|od|l[äa]hett[äa]j[äa]|felad[óo]|от)\*?[ \t\u00a0]?:/i;
+const OUTLOOK_SENT =
+  /^\*?(?:sent|date|gesendet|datum|envoy[ée]|enviado|enviada|fecha|inviato|data|verzonden|skickat|sendt|wys[łl]ano|l[äa]hetetty|elk[üu]ldve|отправлено)\*?[ \t\u00a0]?:/i;
+const OUTLOOK_TO =
+  /^\*?(?:to|subject|cc|an|betreff|[àa]|objet|para|asunto|oggetto|aan|onderwerp|till|[äa]mne|til|emne|do|temat|dw|kopie|vastaanottaja|aihe|assunto|c[ée]zott|t[áa]rgy|кому|тема)\*?[ \t\u00a0]?:/i;
+/** A line of a header block: a short label and ":". */
+const HEADER_LINE = /^\*?[\p{L}][\p{L}\p{M} .'-]{0,30}\*?[ \t\u00a0]?:/u;
+/** The rule Outlook puts above its header block in plain text. */
+const SEPARATOR_LINE = /^(?:_{10,}|-{10,})$/;
+
+/** A forwarded message's header: Gmail's, Thunderbird's and Apple Mail's, in several languages. */
+const FORWARD_MARKER = new RegExp(
+  [
+    String.raw`^-{3,}\s*(?:forwarded message|weitergeleitete nachricht|message transf[ée]r[ée]|mensaje reenviado|messaggio inoltrato|doorgestuurd bericht|mensagem encaminhada|vidarebefordrat meddelande|videresendt meddelelse|videresendt melding|wiadomo[śs][ćc] przekazana dalej|пересланное сообщение)\s*-{3,}$`,
+    String.raw`^(?:begin forwarded message|anfang der weitergeleiteten nachricht|d[ée]but du message r[ée]exp[ée]di[ée]|inicio del mensaje reenviado|inizio messaggio inoltrato|begin doorgestuurd bericht)\s?:$`,
+  ].join("|"),
+  "i",
+);
+
+/** Where quoted history starts in a reply: the text hidden from `index` on, quoting what starts at `body`. */
+interface QuoteStart {
+  index: number;
+  body: number;
+  /** An attribution line ("On … wrote:"), below which a reply may answer between quoted lines; otherwise an Outlook header. */
+  attribution: boolean;
+}
+
+/** Where the line starting at `start` ends: at its "\n", or the text's end. */
+function lineEnd(text: string, start: number): number {
+  const nl = text.indexOf("\n", start);
+  return nl < 0 ? text.length : nl;
+}
+
+/** White space at the end of a line, as trimEnd sees it (CR included). */
+function isTrailingSpace(c: number): boolean {
+  return c <= 32 || c === 0xa0 || c === 0xfeff || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x202f || c === 0x205f || c === 0x3000;
+}
+
+/** A line without its quote marks (">", nested or spaced) and surrounding blanks. */
+function lineContent(text: string, start: number, end: number): string {
+  let i = start;
+  for (let c = text.charCodeAt(i); i < end && (c === 62 || c === 32 || c === 9 || c === 0xa0); c = text.charCodeAt(++i));
+  let j = end;
+  while (j > i && isTrailingSpace(text.charCodeAt(j - 1))) j--;
+  return text.slice(i, j);
+}
+
+/** The content (see lineContent) of the line after the one ending at `end`, if there is one. */
+function nextLine(text: string, end: number): { start: number; end: number; content: string } | undefined {
+  if (end >= text.length) return undefined;
+  const start = end + 1;
+  const next = lineEnd(text, start);
+  return { start, end: next, content: lineContent(text, start, next) };
+}
+
+/** Where the quoted text below a header block starts: after its header lines and the blank lines that follow. */
+function afterHeaders(text: string, from: number): number {
+  let headers = true;
+  for (let start = from; start < text.length; ) {
+    const end = lineEnd(text, start);
+    const content = lineContent(text, start, end);
+    if (!(headers && HEADER_LINE.test(content))) {
+      headers = false;
+      if (content) return start;
+    }
+    start = end + 1;
+  }
+  return text.length;
+}
+
+/**
+ * Finds where a reply's quoted history starts: an attribution line ("On <date>, <name> wrote:", wrapped
+ * onto a second line or not, inside a quote or not, in several languages), Outlook's
+ * "-----Original Message-----", or its From:/Sent:/To: header block. Nothing is found below a
+ * forwarded message's header: what follows it is the forwarded message, not quoted history.
+ */
+function findQuoteStart(text: string): QuoteStart | undefined {
+  // The line before, when it isn't blank (an attribution may be wrapped onto two lines).
+  let previousStart = -1;
+  let previous = "";
+  for (let start = 0; start <= text.length; ) {
+    const end = lineEnd(text, start);
+    const content = lineContent(text, start, end);
+    if (content) {
+      if (FORWARD_MARKER.test(content)) return undefined;
+      if (ORIGINAL_MESSAGE.test(content)) return { index: start, body: afterHeaders(text, end + 1), attribution: false };
+      if (OUTLOOK_FROM.test(content)) {
+        const sent = nextLine(text, end);
+        const to = sent && nextLine(text, sent.end);
+        if (sent && to && OUTLOOK_SENT.test(sent.content) && OUTLOOK_TO.test(to.content)) {
+          const index = previous && SEPARATOR_LINE.test(previous) ? previousStart : start;
+          return { index, body: afterHeaders(text, start), attribution: false };
+        }
+      }
+      const last = content.charCodeAt(content.length - 1);
+      if (last === 58 /* : */ || last === 0xff1a /* ： */) {
+        if (isAttribution(content)) return { index: start, body: end + 1, attribution: true };
+        if (previous && isAttribution(`${previous} ${content}`)) return { index: previousStart, body: end + 1, attribution: true };
+      }
+    }
+    previousStart = start;
+    previous = content;
+    start = end + 1;
+  }
+  return undefined;
+}
+
+/** Characters that leave a line looking empty: white space and the invisible padding stripInvisible removes. */
+function isBlank(c: number): boolean {
+  return c === 32 || c === 9 || c === 13 || c === 0xa0 || c === 0xfeff || (c >= 0x2000 && c <= 0x200f) || c === 0x3000 || c === 0xad || c === 0x34f || (c >= 0x2060 && c <= 0x206f);
+}
+
+/** Whether a reply answers between the quoted lines from `from` on (some lines start with ">", others don't). */
+function answersBetweenQuotes(text: string, from: number): boolean {
+  let quoted = false;
+  let unquoted = false;
+  for (let i = from; i < text.length; ) {
+    // The first character on the line that isn't blank.
+    let c = text.charCodeAt(i);
+    while (i < text.length && isBlank(c)) c = text.charCodeAt(++i);
+    if (i >= text.length) break;
+    if (c !== 10) {
+      if (c === 62 /* > */) quoted = true;
+      else unquoted = true;
+      if (quoted && unquoted) return true;
+    }
+    const nl = text.indexOf("\n", i);
+    if (nl < 0) break;
+    i = nl + 1;
+  }
+  return false;
+}
+
+/** Text as compared between a quote and the message it may be quoting: lower-case words, no links or punctuation. */
+function quoteWords(text: string): string {
+  const words = text.replace(/\b(?:https?:\/\/|www\.|mailto:)\S*/gi, " ").toLowerCase();
+  if (/^[\x00-\x7f]*$/.test(words)) return words.replace(/[^a-z0-9]+/g, " ").trim();
+  return stripInvisible(words).normalize("NFC").replace(/[^\p{L}\p{N}\p{M}]+/gu, " ").trim();
+}
+
+/** How much of a message's start (raw characters, and words) is compared with quotes. */
+const KEY_SOURCE = 1000;
+const KEY_LENGTH = 200;
+
+/** The start of a message as compared with quotes in later replies (see hideQuotedHistory). */
+export interface QuoteKey {
+  /** The message's first words (see quoteWords), at most KEY_LENGTH characters. */
+  start: string;
+  /** Whether that is the whole message. */
+  whole: boolean;
+}
+
+/** A message's QuoteKey, from its readable body (the start of it is enough). */
+export function quoteKey(body: string): QuoteKey {
+  const words = quoteWords(body.slice(0, KEY_SOURCE));
+  return { start: words.slice(0, KEY_LENGTH), whole: body.length <= KEY_SOURCE && words.length <= KEY_LENGTH };
+}
+
+/**
+ * Whether quoted text (its first words `quote`; `whole` if that is all of it) is a copy of the message
+ * `key` describes: it holds the message's first words, or, for a short message, is exactly it; or the
+ * quote, two words or more, is all there is and the message starts with it (a quote cut down to its
+ * first lines).
+ */
+function quotes(quote: string, whole: boolean, key: QuoteKey): boolean {
+  const start = key.start;
+  if (!start || !quote) return false;
+  if (start.length >= 24) {
+    if (quote.includes(start.slice(0, 48))) return true;
+  } else if (key.whole && quote === start) return true;
+  return whole && quote.includes(" ") && start.startsWith(quote) && (start.length === quote.length || start[quote.length] === " ");
+}
 
 export const QUOTE_HIDDEN = "[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]";
 
 /**
- * Removes the trailing quoted history from a reply, for thread views where the quoted messages are
- * already shown. Only cuts when everything after the marker is quote: all lines start with ">", or
- * none do (a top-posted reply). A mix means the sender answered between quoted lines, so it's kept.
+ * Removes a reply's quoted history, for thread views, where the messages it quotes are shown anyway:
+ * only when the quoted text is a copy of one of the `earlier` messages of the thread (their QuoteKeys),
+ * so a forwarded email or a quote of a message from elsewhere stays. Below an attribution line ("On …
+ * wrote:"), it is kept when the reply answers between quoted lines; below an Outlook header (nobody
+ * answers between the lines of one), it is cut whatever the lines look like. Lines may end in CRLF.
  */
-export function hideQuotedHistory(text: string): string {
-  const match = QUOTE_START.exec(text);
-  // Real "On … wrote:" lines carry a date or time; "On Monday the team wrote:" in prose doesn't count.
-  if (!match || (/^on\b/i.test(match[0]) && !/\d/.test(match[0]))) return text;
-  const after = text.slice(match.index + match[0].length).split("\n").filter((l) => l.trim());
-  const quoted = after.filter((l) => l.trimStart().startsWith(">")).length;
-  if (quoted && quoted < after.length) return text;
-  return `${text.slice(0, match.index).trimEnd()}\n\n${QUOTE_HIDDEN}`.trimStart();
+export function hideQuotedHistory(text: string, earlier: readonly QuoteKey[] = []): string {
+  if (!earlier.length) return text;
+  const found = findQuoteStart(text);
+  if (!found) return text;
+  if (found.attribution && answersBetweenQuotes(text, found.body)) return text;
+  const quote = quoteWords(text.slice(found.body, found.body + KEY_SOURCE));
+  const whole = text.length - found.body <= KEY_SOURCE;
+  // Most replies quote the message just before them: look there first.
+  for (let i = earlier.length - 1; i >= 0; i--) {
+    if (quotes(quote, whole, earlier[i])) return `${text.slice(0, found.index).trimEnd()}\n\n${QUOTE_HIDDEN}`.trimStart();
+  }
+  return text;
 }
 
 /** Links longer than this are nearly always tracking redirects; reading views cut them to their site. */
@@ -588,7 +777,7 @@ const MAX_READ_FACTOR = 64;
 function readableBody(
   content: ExtractedContent,
   max: number,
-  opts: { hide: boolean; shorten: boolean },
+  opts: { hide: boolean; shorten: boolean; earlier: readonly QuoteKey[] },
 ): { text: string; shortened: number; complete: boolean } {
   const read = bodyReader(content, max ? max * MAX_READ_FACTOR + 65_536 : Infinity);
   let budget = max ? Math.ceil(max * READ_AHEAD) : 0;
@@ -597,11 +786,12 @@ function readableBody(
     const start = read(budget);
     const stuck = start.text.length === previous; // nothing more can be read
     previous = start.text.length;
-    let text = (start.complete || stuck ? start.text : withoutCutLink(start.text)).replace(/\r\n?/g, "\n");
+    let text = start.complete || stuck ? start.text : withoutCutLink(start.text);
     let complete = start.complete;
-    // The quoted history is cut before cleaning, so the cleaning doesn't run over text that is dropped.
+    // The quoted history is cut (CRLF line ends and all) before cleaning, so the cleaning doesn't run
+    // over text that is dropped.
     if (opts.hide) {
-      const cut = hideQuotedHistory(text);
+      const cut = hideQuotedHistory(text, opts.earlier);
       if (cut !== text) complete = true;
       text = cut;
     }
@@ -623,7 +813,10 @@ export interface FormatOptions {
    * may be edited and saved again (drafts), since the cut links would replace the real ones.
    */
   shortenLinks?: boolean;
-  /** In PLAIN_TEXT, hide a reply's quoted history (for thread views, where it's shown anyway). */
+  /**
+   * In PLAIN_TEXT, hide a reply's quoted copy of earlier messages of its thread, which a thread view
+   * shows anyway (see formatThread; a message formatted on its own has no earlier messages).
+   */
   hideQuotedHistory?: boolean;
 }
 
@@ -650,6 +843,11 @@ export interface FormattedMessage {
   viewUrl: string;
 }
 
+/** Whether a format shows bodies, which then have to be read. */
+function showsBody(format: MessageFormat): boolean {
+  return format === "FULL_CONTENT" || format === "PLAIN_TEXT";
+}
+
 export async function formatMessage(
   msg: ApiMessage,
   format: MessageFormat,
@@ -657,6 +855,35 @@ export async function formatMessage(
   loadData: (attachmentId: string) => Promise<string>,
   opts: FormatOptions = {},
 ): Promise<FormattedMessage> {
+  return formatContent(msg, format, email, showsBody(format) ? await extractContent(msg.payload, loadData) : undefined, opts, []);
+}
+
+/**
+ * Formats the messages of a thread, in order. With hideQuotedHistory (in PLAIN_TEXT), each reply's
+ * quoted copy of an earlier message of the thread is hidden, as that message is in the result; any
+ * other quote (a forwarded email, a message from elsewhere) stays, and the first message keeps its
+ * quote. `loader` gives each message's loadData (see extractContent). Bodies are fetched in parallel.
+ */
+export async function formatThread(
+  messages: ApiMessage[],
+  format: MessageFormat,
+  email: string,
+  loader: (messageId: string) => (attachmentId: string) => Promise<string>,
+  opts: FormatOptions = {},
+): Promise<FormattedMessage[]> {
+  const contents = showsBody(format) ? await Promise.all(messages.map((m) => extractContent(m.payload, loader(m.id)))) : [];
+  const keys = opts.hideQuotedHistory && format === "PLAIN_TEXT" ? contents.map((c) => quoteKey(bodyTextStart(c, KEY_SOURCE).text)) : [];
+  return messages.map((m, i) => formatContent(m, format, email, contents[i], opts, keys.slice(0, i)));
+}
+
+function formatContent(
+  msg: ApiMessage,
+  format: MessageFormat,
+  email: string,
+  content: ExtractedContent | undefined,
+  opts: FormatOptions,
+  earlier: readonly QuoteKey[],
+): FormattedMessage {
   const url = viewUrl(email, `all/${msg.id}`);
   if (format === "RAW") {
     return { id: msg.id, threadId: msg.threadId, labelIds: msg.labelIds, raw: decodeBody(msg.raw ?? ""), viewUrl: url };
@@ -677,11 +904,14 @@ export async function formatMessage(
   out.date = isoTime(msg.internalDate) ?? header(p, "Date");
   out.labelIds = msg.labelIds ?? [];
 
-  if (format === "FULL_CONTENT" || format === "PLAIN_TEXT") {
-    const content = await extractContent(p, loadData);
+  if (content) {
     const max = opts.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
     const reading = format === "PLAIN_TEXT";
-    const body = readableBody(content, max, { hide: Boolean(opts.hideQuotedHistory && reading), shorten: Boolean(opts.shortenLinks && reading) });
+    const body = readableBody(content, max, {
+      hide: Boolean(opts.hideQuotedHistory && reading),
+      shorten: Boolean(opts.shortenLinks && reading),
+      earlier,
+    });
     const shortenedLinks = body.shortened;
     const plain = limitLength(body.text, max);
     out.plaintextBody = plain.text;

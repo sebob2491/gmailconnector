@@ -9,6 +9,7 @@ import {
   bodyText,
   extractContent,
   formatMessage,
+  formatThread,
   header,
   limitLength,
   parseMailboxes,
@@ -888,10 +889,8 @@ export class Mailbox {
       query: { format: apiFormat(format), metadataHeaders: format === "MINIMAL" || format === "METADATA_ONLY" ? METADATA_HEADERS : undefined },
     });
     const messages = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT"));
-    // The first message keeps any quote: what it quotes isn't in this thread.
-    const formatted = (
-      await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts)))
-    ).map((m) => this.markFromMe(m));
+    // A reply's quoted copy of an earlier message is hidden (see formatThread): that message is in the result.
+    const formatted = (await formatThread(messages, format, this.email, (id) => this.loader(id), opts)).map((m) => this.markFromMe(m));
     const base = {
       id: thread.id as string,
       viewUrl: viewUrl(this.email, `all/${thread.id}`),
