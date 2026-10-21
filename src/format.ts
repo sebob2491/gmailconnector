@@ -1,4 +1,4 @@
-import { Buffer } from "node:buffer";
+import { Buffer, isAscii } from "node:buffer";
 import { decodeEntities, htmlToText, isValidAddress, type Mailbox } from "./mime.js";
 
 /** Subset of the Gmail API Message resource we rely on. */
@@ -182,6 +182,9 @@ export function attachmentCharset(payload: ApiMessagePart | undefined, partId: s
   return undefined;
 }
 
+/** Charsets whose text is all ASCII bytes, read through escape sequences (ISO-2022-JP, HZ, UTF-7). */
+const SEVEN_BIT = /^(?:iso-?2022|csiso2022|hz-|utf-?7)/;
+
 /** Charsets that mean "UTF-8 if it is valid": senders often label Windows-1252 text as one of these. */
 const UTF8_LIKE = new Set(["utf-8", "utf8", "us-ascii", "ascii", "unicode-1-1-utf-8"]);
 
@@ -204,7 +207,10 @@ export function decodeCharset(bytes: Uint8Array, declared?: string, partial = fa
       // fall through
     }
   }
-  if (!charset || UTF8_LIKE.has(charset) || bytes.some((b) => b >= 0x80)) {
+  // Plain ASCII reads the same in every charset except the 7-bit ones that switch modes with escapes.
+  const ascii = isAscii(bytes);
+  if (ascii && !(charset && SEVEN_BIT.test(charset))) return utf8();
+  if (!charset || UTF8_LIKE.has(charset) || !ascii) {
     try {
       return utf8();
     } catch {
