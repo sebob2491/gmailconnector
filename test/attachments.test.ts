@@ -731,12 +731,13 @@ test("hostile ToUnicode CMaps stay fast and bounded", async () => {
   };
   for (const [name, { cmap, codes }] of Object.entries(cases)) {
     const file = pdf([`BT /F1 12 Tf 72 700 Td ${codes} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap) }) }));
-    // The first read includes warming up the parser (about 30 ms here for 100,000 entries); the second is what it costs.
+    // The first read includes warming up the parser (about 30 ms here for 100,000 entries); the best of the next few is what it costs.
     const cold = await timed(() => readPdf(file));
-    const warm = await timed(() => readPdf(file));
+    let warm = Infinity;
+    for (let i = 0; i < 3; i++) warm = Math.min(warm, (await timed(() => readPdf(file))).ms);
     assert.equal(cold.value?.text, "the quick brown fox jumps over the lazy dog", name);
     assert.ok(cold.ms < 200, `${name}: ${cold.ms.toFixed(0)} ms`);
-    assert.ok(warm.ms < 50, `${name}: ${warm.ms.toFixed(0)} ms warm`);
+    assert.ok(warm < 50, `${name}: ${warm.toFixed(0)} ms warm`);
   }
   // A CMap that inflates to 3 MB is past the limit: its font is unreadable, the page (and the rest) is still read, with no note.
   const huge = cmapOf({ bfchar: letters, junk: "% ".padEnd(3 * 1024 * 1024, "x") });

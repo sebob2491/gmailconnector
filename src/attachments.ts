@@ -332,9 +332,15 @@ function readEntry(bytes: Uint8Array, entry: ZipEntry, budget: Budget, want = MA
   throw new FileTooLargeError("This file unpacks to far more data than its size suggests (a damaged file or a decompression bomb), so it wasn't read.");
 }
 
-/** How many bytes of XML to unpack first for `chars` characters of text (more is read when it falls short). */
+/** The first read of a part whose parser can continue from where it stopped (sheets, shared strings); reads grow from there. */
+const FIRST_READ_BYTES = 64 * 1024;
+
+/**
+ * How many bytes of XML to unpack first for `chars` characters of text from a parser that starts
+ * over when it falls short (documents and slides, whose markup takes many bytes per character).
+ */
 function firstReadBytes(chars: number): number {
-  return Math.min(MAX_PART_BYTES, Math.max(256 * 1024, chars * 16));
+  return Math.min(MAX_PART_BYTES, Math.max(FIRST_READ_BYTES, chars * 16));
 }
 
 // ---------- XML ----------
@@ -352,78 +358,148 @@ function decodeXml(text: string): string {
   });
 }
 
-/** An element tag; `name` is the local name, without any namespace prefix (`x:row` and `row` are both "row"). */
+/**
+ * An element tag: `name` is the local name, without any namespace prefix (`x:row` and `row` are
+ * both "row"); its attributes sit in `xml` at [attrStart, attrEnd) and are read with attr(); `end`
+ * is the index after ">". One object serves every tag of a walk, so a handler must not keep it.
+ */
 interface XmlTag {
   name: string;
   close: boolean;
   empty: boolean;
-  attrs: string;
+  xml: string;
+  attrStart: number;
+  attrEnd: number;
+  end: number;
+}
+
+const TAG: XmlTag = { name: "", close: false, empty: false, xml: "", attrStart: 0, attrEnd: 0, end: 0 };
+
+/** True for the characters that end an element or attribute name: white space and the delimiters / > < ! ? " ' =. */
+function isXmlNameEnd(c: number): boolean {
+  return c <= 32 || c === 47 || c === 62 || c === 60 || c === 33 || c === 63 || c === 34 || c === 39 || c === 61;
 }
 
 /**
- * One tag. Attributes must start with white space or "/", and their quoted values may contain ">".
- * Every part starts with a different character, so a failed match never backtracks more than linearly.
+ * Walks XML in one pass from `from`: `onTag` gets each element tag and `onText` each run of
+ * character data (decoded). Either returns true to stop. Malformed markup ends the walk. Linear
+ * time, by character code: Office parts have millions of tags.
  */
-const XML_TAG = /<(\/?)([^\s/>!?<"'=]+)((?:[\s/](?:[^<>"']|"[^"]*"|'[^']*')*)?)>/y;
-
-/**
- * Walks XML in one pass: `onTag` gets each element tag and `onText` each run of character data
- * (decoded). Either returns true to stop. Malformed markup ends the walk. Linear time.
- */
-function walkXml(xml: string, onTag: (tag: XmlTag) => boolean | void, onText: (text: string) => boolean | void): void {
+function walkXml(xml: string, onTag: (tag: XmlTag) => boolean | void, onText: (text: string) => boolean | void, from = 0): void {
   const n = xml.length;
-  let pos = 0;
+  let pos = from;
+  TAG.xml = xml;
   while (pos < n) {
     const lt = xml.indexOf("<", pos);
     const textEnd = lt < 0 ? n : lt;
     if (textEnd > pos && onText(decodeXml(xml.slice(pos, textEnd)))) return;
     if (lt < 0) return;
-    if (xml.startsWith("<![CDATA[", lt)) {
-      const end = xml.indexOf("]]>", lt + 9);
-      if (end < 0 || onText(xml.slice(lt + 9, end))) return;
-      pos = end + 3;
-      continue;
-    }
-    if (xml.startsWith("<!--", lt)) {
-      const end = xml.indexOf("-->", lt + 4);
-      if (end < 0) return;
-      pos = end + 3;
-      continue;
-    }
     const c = xml.charCodeAt(lt + 1);
-    if (c === 33 /* <!DOCTYPE */ || c === 63 /* <?xml */) {
-      const end = xml.indexOf(">", lt);
+    if (c === 33 /* ! */ || c === 63 /* ? */) {
+      if (xml.startsWith("<![CDATA[", lt)) {
+        const end = xml.indexOf("]]>", lt + 9);
+        if (end < 0 || onText(xml.slice(lt + 9, end))) return;
+        pos = end + 3;
+        continue;
+      }
+      if (xml.startsWith("<!--", lt)) {
+        const end = xml.indexOf("-->", lt + 4);
+        if (end < 0) return;
+        pos = end + 3;
+        continue;
+      }
+      const end = xml.indexOf(">", lt); // <!DOCTYPE, <?xml
       if (end < 0) return;
       pos = end + 1;
       continue;
     }
-    XML_TAG.lastIndex = lt;
-    const m = XML_TAG.exec(xml);
-    if (!m) return;
-    const qname = m[2];
-    if (onTag({ name: qname.slice(qname.indexOf(":") + 1), close: m[1] === "/", empty: m[3].endsWith("/"), attrs: m[3] })) return;
-    pos = lt + m[0].length;
+    // A tag: "<" [/] name [attributes] [/] ">"; attributes start with white space or "/", and their quoted values may hold ">".
+    const close = c === 47;
+    let p = close ? lt + 2 : lt + 1;
+    const nameStart = p;
+    let colon = -1;
+    for (; p < n; p++) {
+      const d = xml.charCodeAt(p);
+      if (isXmlNameEnd(d)) break;
+      if (d === 58 && colon < 0) colon = p;
+    }
+    const attrStart = p;
+    if (p === nameStart || p >= n) return;
+    let quote = 0;
+    for (; p < n; p++) {
+      const d = xml.charCodeAt(p);
+      if (quote) {
+        if (d === quote) quote = 0;
+      } else if (d === 34 || d === 39) quote = d;
+      else if (d === 62) break;
+      else if (d === 60) return;
+    }
+    if (p >= n) return;
+    const empty = p > attrStart && xml.charCodeAt(p - 1) === 47;
+    TAG.name = xml.slice(colon >= 0 ? colon + 1 : nameStart, attrStart);
+    TAG.close = close;
+    TAG.empty = empty;
+    TAG.attrStart = attrStart;
+    TAG.attrEnd = empty ? p - 1 : p;
+    TAG.end = p + 1;
+    if (onTag(TAG)) return;
+    pos = p + 1;
   }
 }
 
-const attrPatterns = new Map<string, RegExp>();
+/** Where the attribute value findAttr last found ends. */
+let attrValueEnd = 0;
+
+/**
+ * Where a tag's attribute value starts in its XML, by local name (any namespace prefix, or, when
+ * `prefixed`, only with one), with its end left in attrValueEnd; -1 when the tag has no such attribute.
+ */
+function findAttr(tag: XmlTag, name: string, prefixed: boolean): number {
+  const { xml, attrEnd } = tag;
+  let p = tag.attrStart;
+  while (p < attrEnd) {
+    const c = xml.charCodeAt(p);
+    if (isXmlNameEnd(c)) {
+      p++;
+      continue;
+    }
+    // The qualified name, "=" (white space around it allowed) and the quoted value.
+    const start = p;
+    let local = p;
+    for (; p < attrEnd; p++) {
+      const d = xml.charCodeAt(p);
+      if (isXmlNameEnd(d)) break;
+      if (d === 58) local = p + 1;
+    }
+    const nameEnd = p;
+    while (p < attrEnd && xml.charCodeAt(p) <= 32) p++;
+    if (xml.charCodeAt(p) !== 61 /* = */) continue;
+    p++;
+    while (p < attrEnd && xml.charCodeAt(p) <= 32) p++;
+    const quote = xml.charCodeAt(p);
+    if (quote !== 34 && quote !== 39) continue;
+    const valueEnd = xml.indexOf(quote === 34 ? '"' : "'", p + 1);
+    if (valueEnd < 0 || valueEnd > attrEnd) return -1;
+    if (nameEnd - local === name.length && (local > start || !prefixed) && xml.startsWith(name, local)) {
+      attrValueEnd = valueEnd;
+      return p + 1;
+    }
+    p = valueEnd + 1;
+  }
+  return -1;
+}
+
+/** A tag's attribute value, decoded, by local name. */
+function attrValue(tag: XmlTag, name: string, prefixed: boolean): string | undefined {
+  const at = findAttr(tag, name, prefixed);
+  return at < 0 ? undefined : decodeXml(tag.xml.slice(at, attrValueEnd));
+}
 
 /** An attribute's decoded value, by local name (any namespace prefix, or none). */
-function attr(attrs: string, name: string): string | undefined {
-  let re = attrPatterns.get(name);
-  if (!re) {
-    re = new RegExp(`(?:^|\\s)(?:[\\w.-]+:)?${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`);
-    attrPatterns.set(name, re);
-  }
-  const m = re.exec(attrs);
-  return m ? decodeXml(m[1] ?? m[2]) : undefined;
-}
+const attr = (tag: XmlTag, name: string) => attrValue(tag, name, false);
 
 /** The relationship id (`r:id`) of an element; unlike `attr`, it needs a prefix, so a plain `id` doesn't match. */
-function relId(attrs: string): string | undefined {
-  const m = /(?:^|\s)[\w.-]+:id\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(attrs);
-  return m ? decodeXml(m[1] ?? m[2]) : undefined;
-}
+const relId = (tag: XmlTag) => attrValue(tag, "id", true);
 
 // ---------- Office Open XML packages ----------
 
@@ -478,14 +554,36 @@ class Package {
     walkXml(
       xml,
       (tag) => {
-        if (tag.name !== "Relationship" || tag.close || attr(tag.attrs, "TargetMode") === "External") return;
-        const id = attr(tag.attrs, "Id");
-        const target = attr(tag.attrs, "Target");
-        if (id && target) out.set(id, { target: resolvePath(folderOf(path), target), type: attr(tag.attrs, "Type") ?? "" });
+        if (tag.name !== "Relationship" || tag.close || attr(tag, "TargetMode") === "External") return;
+        const id = attr(tag, "Id");
+        const target = attr(tag, "Target");
+        if (id && target) out.set(id, { target: resolvePath(folderOf(path), target), type: attr(tag, "Type") ?? "" });
       },
       () => {},
     );
     return out;
+  }
+
+  /**
+   * Feeds a part to a reader that continues where it left off: feed(xml, cut) gets the part as
+   * read so far (`cut` says there is more). Reading starts at FIRST_READ_BYTES; each further read
+   * is sized for the rest of the reader's text at the density seen so far (with a margin), and at
+   * least doubles, until the reader is full or the part is read.
+   */
+  feedGrowing(path: string, reader: GrowingReader): void {
+    let want = FIRST_READ_BYTES;
+    for (;;) {
+      const part = this.read(path, want);
+      if (!part) return;
+      reader.feed(part.xml, part.cut);
+      if (!part.cut || reader.full || want >= MAX_PART_BYTES || this.budget.partBytes <= 0) {
+        if (part.cut && !reader.full) this.budget.cut(PART_TOO_LARGE);
+        return;
+      }
+      const rate = reader.length / part.xml.length;
+      const estimate = rate > 0 ? part.xml.length + Math.ceil(((reader.limit - reader.length) / rate) * 1.25) : want * 4;
+      want = Math.min(MAX_PART_BYTES, Math.max(want * 2, estimate));
+    }
   }
 
   /**
@@ -509,6 +607,14 @@ class Package {
 interface Parsed {
   text: string;
   full: boolean;
+}
+
+/** A reader fed a part piece by piece (see Package.feedGrowing): how much text it has, and wants. */
+interface GrowingReader {
+  feed(xml: string, cut: boolean): void;
+  readonly full: boolean;
+  readonly length: number;
+  readonly limit: number;
 }
 
 /** Sorts part names like "slide10.xml" after "slide2.xml". */
@@ -551,7 +657,8 @@ function documentText(xml: string, limit: number): Parsed {
   };
   walkXml(
     xml,
-    ({ name, close, empty, attrs }) => {
+    (tag) => {
+      const { name, close, empty } = tag;
       if (name === "Fallback" || name === "del" || name === "moveFrom") {
         if (!empty) hidden += close ? -1 : 1;
         return;
@@ -597,7 +704,7 @@ function documentText(xml: string, limit: number): Parsed {
           break;
         case "gridSpan": {
           const cell = cells.at(-1);
-          if (cell) cell.span = Math.min(64, Math.max(1, Number(attr(attrs, "val")) || 1));
+          if (cell) cell.span = Math.min(64, Math.max(1, Number(attr(tag, "val")) || 1));
           break;
         }
       }
@@ -638,7 +745,21 @@ function formatDateKind(code: string): DateKind | undefined {
   return date && time ? "datetime" : date ? "date" : time ? "time" : undefined;
 }
 
-const pad = (n: number) => String(n).padStart(2, "0");
+const pad = (n: number) => (n < 10 ? `0${n}` : String(n));
+
+/** The calendar date of a day counted from 1970-01-01 (proleptic Gregorian, like Date), as "YYYY-MM-DD". */
+function civilDate(day: number): string {
+  const z = day + 719468;
+  const era = Math.floor(z / 146097);
+  const doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  const y = yoe + era * 400 + (m <= 2 ? 1 : 0);
+  return `${y}-${pad(m)}-${pad(d)}`;
+}
 
 /** Shows an Excel serial date/time number as ISO-style text; returns undefined when it isn't a plausible date. */
 function formatSerial(serial: number, kind: DateKind, date1904: boolean): string | undefined {
@@ -647,21 +768,26 @@ function formatSerial(serial: number, kind: DateKind, date1904: boolean): string
   if (kind === "duration") {
     return `${Math.floor(seconds / 3600)}:${pad(Math.floor(seconds / 60) % 60)}:${pad(seconds % 60)}`;
   }
-  // Day 1 is 1900-01-01, and Excel counts a 1900-02-29 that never was (day 60).
-  const epoch = date1904 ? Date.UTC(1904, 0, 1) : serial < 60 ? Date.UTC(1899, 11, 31) : Date.UTC(1899, 11, 30);
-  const d = new Date(epoch + seconds * 1000);
-  const date = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
-  const time = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}${d.getUTCSeconds() ? `:${pad(d.getUTCSeconds())}` : ""}`;
+  // Day 1 is 1900-01-01, and Excel counts a 1900-02-29 that never was (day 60). The epochs are days from 1970-01-01.
+  const epoch = date1904 ? -24107 : serial < 60 ? -25568 : -25569;
+  const days = Math.floor(seconds / 86400);
+  const date = civilDate(epoch + days);
+  const rest = seconds - days * 86400;
+  const time = `${pad(Math.floor(rest / 3600))}:${pad(Math.floor(rest / 60) % 60)}${rest % 60 ? `:${pad(rest % 60)}` : ""}`;
   return kind === "date" ? date : kind === "time" ? time : `${date} ${time}`;
 }
 
-/** "C12" → 2 (zero-based column), or undefined. */
-function columnIndex(ref: string | undefined): number | undefined {
-  const letters = ref && /^[A-Za-z]{1,3}/.exec(ref)?.[0];
-  if (!letters) return undefined;
+/** The zero-based column of a cell reference like "C12" at [start, end) of `text` (2 for C), or undefined. */
+function columnIndex(text: string, start: number, end: number): number | undefined {
   let n = 0;
-  for (const ch of letters.toUpperCase()) n = n * 26 + ch.charCodeAt(0) - 64;
-  return n - 1;
+  let i = start;
+  for (; i < end && i < start + 3; i++) {
+    let c = text.charCodeAt(i);
+    if (c >= 97 && c <= 122) c -= 32;
+    if (c < 65 || c > 90) break;
+    n = n * 26 + c - 64;
+  }
+  return i > start ? n - 1 : undefined;
 }
 
 /** Cells further right than this are put right after the previous cell instead of padding the row with tabs. */
@@ -675,114 +801,198 @@ interface SheetContext {
   date1904: boolean;
 }
 
-/** Cell text as Excel shows it (dates formatted, booleans as TRUE/FALSE), on one line. */
-function cellText(type: string | undefined, value: string, inline: string, style: number, ctx: SheetContext): string {
-  let text: string;
-  if (type === "s") text = value.trim() === "" ? "" : (ctx.shared(Number(value)) ?? "");
-  else if (type === "inlineStr") text = inline;
-  else if (type === "b") text = value.trim() === "1" ? "TRUE" : value.trim() === "0" ? "FALSE" : value;
-  else if (type === "str" || type === "e" || type === "d") text = value;
-  else {
-    const n = Number(value);
-    const kind = ctx.dateKinds[style];
-    text = value.trim() === "" || Number.isNaN(n) ? value : ((kind && formatSerial(n, kind, ctx.date1904)) ?? String(Number(n.toPrecision(15))));
-  }
-  return text.replace(/[\t\r\n]+/g, " ");
+/** Text on one line: tabs and line breaks become spaces. */
+const oneLine = (text: string) => text.replace(/[\t\r\n]+/g, " ");
+
+/** A number as Excel shows it: up to 15 significant digits, so binary noise like 0.30000000000000004 doesn't show. */
+function numberText(value: string, n: number): string {
+  // A value of at most 15 characters without an exponent has at most 15 significant digits already, and prints the same.
+  if (value.length <= 15 && !value.includes("e") && !value.includes("E")) return String(n);
+  return String(Number(n.toPrecision(15)));
 }
 
-/** A worksheet as tab-separated rows, each cell in its column (Excel leaves empty cells out of the file). */
-function sheetText(xml: string, limit: number, ctx: SheetContext): Parsed {
-  const sink = new TextSink(limit);
-  let lastRow = 0;
-  let row = 0;
-  let cells: string[] = [];
-  let nextColumn = 0;
-  let cell: { column: number; type?: string; style: number; value: string; inline: string[] } | undefined;
-  let inValue = false;
-  let inInline = false;
-  let inText = false;
-  let phonetic = 0;
-  const flushRow = () => {
+/** Cell text as Excel shows it (dates formatted, booleans as TRUE/FALSE), on one line; shared strings come ready. */
+function cellText(type: string | undefined, value: string, inline: string, style: number, ctx: SheetContext): string {
+  if (type === "s") return value.trim() === "" ? "" : (ctx.shared(Number(value)) ?? "");
+  if (type === "inlineStr") return oneLine(inline);
+  if (type === "b") return value.trim() === "1" ? "TRUE" : value.trim() === "0" ? "FALSE" : oneLine(value);
+  if (type === "str" || type === "e" || type === "d") return oneLine(value);
+  const n = Number(value);
+  if (value.trim() === "" || Number.isNaN(n)) return oneLine(value);
+  const kind = ctx.dateKinds[style];
+  return (kind && formatSerial(n, kind, ctx.date1904)) ?? numberText(value, n);
+}
+
+/**
+ * Reads a worksheet as tab-separated rows, each cell in its column (Excel leaves empty cells out
+ * of the file), from as much of the part as has been read: feed() continues after the last
+ * complete row, so a part can be unpacked a piece at a time until the text limit is reached.
+ */
+class SheetReader {
+  readonly sink: TextSink;
+  /** Where the next feed continues: after the last complete row. */
+  offset = 0;
+  private lastRow = 0;
+  private row = 0;
+  private cells: (string | undefined)[] = [];
+  private nextColumn = 0;
+  // The cell being read (one record, reused: a sheet has many cells).
+  private hasCell = false;
+  private column = 0;
+  private type: string | undefined;
+  private style = 0;
+  private value = "";
+  private inline = "";
+  private inValue = false;
+  private inInline = false;
+  private inText = false;
+  private phonetic = 0;
+
+  constructor(
+    limit: number,
+    private readonly ctx: SheetContext,
+  ) {
+    this.sink = new TextSink(limit);
+  }
+
+  get full() {
+    return this.sink.full;
+  }
+
+  get length() {
+    return this.sink.length;
+  }
+
+  get limit() {
+    return this.sink.limit;
+  }
+
+  /** Reads the rows of `xml` from `offset` on; when `cut` says the part has more, an unfinished last row is left for the next feed. */
+  feed(xml: string, cut: boolean) {
+    this.hasCell = this.inValue = this.inInline = this.inText = false;
+    this.phonetic = 0;
+    let done = this.offset;
+    walkXml(
+      xml,
+      (tag) => {
+        switch (tag.name) {
+          case "row":
+            if (tag.close) {
+              this.flushRow();
+              done = tag.end;
+            } else {
+              this.row = Number(attr(tag, "r")) || this.row + 1;
+              this.cells = [];
+              this.nextColumn = 0;
+              if (tag.empty) {
+                this.flushRow();
+                done = tag.end;
+              }
+            }
+            break;
+          case "c":
+            if (tag.close) {
+              if (this.hasCell) {
+                this.cells[this.column] = cellText(this.type, this.value, this.inline, this.style, this.ctx);
+                this.nextColumn = this.column + 1;
+              }
+              this.hasCell = false;
+            } else {
+              const ref = findAttr(tag, "r", false);
+              const column = ref < 0 ? undefined : columnIndex(tag.xml, ref, attrValueEnd);
+              const at = column !== undefined && column >= this.nextColumn && column - this.nextColumn <= MAX_COLUMN_GAP ? column : this.nextColumn;
+              if (tag.empty) this.nextColumn = at + 1;
+              else {
+                this.hasCell = true;
+                this.column = at;
+                this.type = attr(tag, "t");
+                this.style = Number(attr(tag, "s") ?? 0);
+                this.value = "";
+                this.inline = "";
+              }
+            }
+            break;
+          case "v":
+            this.inValue = !tag.close && !tag.empty;
+            break;
+          case "is":
+            this.inInline = !tag.close && !tag.empty;
+            break;
+          case "t":
+            this.inText = !tag.close && !tag.empty;
+            break;
+          case "rPh":
+            if (!tag.empty) this.phonetic += tag.close ? -1 : 1;
+            break;
+        }
+        return this.sink.full;
+      },
+      (text) => {
+        if (!this.hasCell) return;
+        if (this.inValue) this.value += text;
+        else if (this.inInline && this.inText && !this.phonetic) this.inline += text;
+      },
+      this.offset,
+    );
+    this.offset = cut ? done : xml.length;
+  }
+
+  private flushRow() {
+    const { row, lastRow, cells, sink } = this;
     const gap = row - lastRow - 1;
     if (gap > MAX_BLANK_ROWS) sink.add(`(rows ${lastRow + 1}–${row - 1} are empty)\n`);
     else if (gap > 0) sink.add("\n".repeat(gap));
-    sink.add(`${Array.from(cells, (c) => c ?? "").join("\t").replace(/\t+$/, "")}\n`);
-    lastRow = row;
-  };
-  walkXml(
-    xml,
-    ({ name, close, empty, attrs }) => {
-      switch (name) {
-        case "row":
-          if (close) flushRow();
-          else {
-            row = Number(attr(attrs, "r")) || row + 1;
-            cells = [];
-            nextColumn = 0;
-            if (empty) flushRow();
-          }
-          break;
-        case "c":
-          if (close) {
-            if (cell) {
-              cells[cell.column] = cellText(cell.type, cell.value, cell.inline.join(""), cell.style, ctx);
-              nextColumn = cell.column + 1;
-            }
-            cell = undefined;
-          } else {
-            const column = columnIndex(attr(attrs, "r"));
-            const at = column !== undefined && column >= nextColumn && column - nextColumn <= MAX_COLUMN_GAP ? column : nextColumn;
-            if (empty) nextColumn = at + 1;
-            else cell = { column: at, type: attr(attrs, "t"), style: Number(attr(attrs, "s") ?? 0), value: "", inline: [] };
-          }
-          break;
-        case "v":
-          inValue = !close && !empty;
-          break;
-        case "is":
-          inInline = !close && !empty;
-          break;
-        case "t":
-          inText = !close && !empty;
-          break;
-        case "rPh":
-          if (!empty) phonetic += close ? -1 : 1;
-          break;
-      }
-      return sink.full;
-    },
-    (text) => {
-      if (!cell) return;
-      if (inValue) cell.value += text;
-      else if (inInline && inText && !phonetic) cell.inline.push(text);
-    },
-  );
-  return { text: sink.parts.join("").replace(/\n+$/, ""), full: sink.full };
+    let end = cells.length;
+    while (end > 0 && !cells[end - 1]) end--; // no trailing tabs
+    let line = "";
+    for (let i = 0; i < end; i++) line += i ? `\t${cells[i] ?? ""}` : (cells[i] ?? "");
+    sink.add(`${line}\n`);
+    this.lastRow = row;
+  }
+
+  text(): string {
+    return this.sink.parts.join("").replace(/\n+$/, "");
+  }
 }
 
-/** The shared strings table, without phonetic guides (<rPh>, e.g. Japanese furigana). */
-function sharedStrings(xml: string): string[] {
-  const out: string[] = [];
-  let current: string[] | undefined;
-  let inText = false;
-  let phonetic = 0;
-  walkXml(
-    xml,
-    ({ name, close, empty }) => {
-      if (name === "si") {
-        if (empty) out.push("");
-        else if (close) {
-          out.push(current?.join("") ?? "");
-          current = undefined;
-        } else current = [];
-      } else if (name === "t") inText = !close && !empty;
-      else if (name === "rPh" && !empty) phonetic += close ? -1 : 1;
-    },
-    (text) => {
-      if (current && inText && !phonetic) current.push(text);
-    },
-  );
-  return out;
+/**
+ * The shared strings table, without phonetic guides (<rPh>, e.g. Japanese furigana), each on one
+ * line as cells show them; feed() continues after the last complete string, so the table can be
+ * unpacked a piece at a time, as far as the cells point.
+ */
+class SharedStrings {
+  readonly strings: string[] = [];
+  /** Where the next feed continues: after the last complete <si>. */
+  offset = 0;
+
+  feed(xml: string, cut: boolean) {
+    let current: string | undefined;
+    let inText = false;
+    let phonetic = 0;
+    let done = this.offset;
+    walkXml(
+      xml,
+      ({ name, close, empty, end }) => {
+        if (name === "si") {
+          if (empty) this.strings.push("");
+          else if (close) {
+            this.strings.push(oneLine(current ?? ""));
+            current = undefined;
+          } else {
+            current = "";
+            return;
+          }
+          done = end;
+        } else if (name === "t") inText = !close && !empty;
+        else if (name === "rPh" && !empty) phonetic += close ? -1 : 1;
+      },
+      (text) => {
+        if (current !== undefined && inText && !phonetic) current += text;
+      },
+      this.offset,
+    );
+    this.offset = cut ? done : xml.length;
+  }
 }
 
 /** Which cell styles (by index) show dates or times. */
@@ -792,11 +1002,12 @@ function dateStyles(xml: string): (DateKind | undefined)[] {
   let inCellXfs = false;
   walkXml(
     xml,
-    ({ name, close, empty, attrs }) => {
-      if (name === "numFmt" && !close) custom.set(Number(attr(attrs, "numFmtId")), formatDateKind(attr(attrs, "formatCode") ?? ""));
+    (tag) => {
+      const { name, close, empty } = tag;
+      if (name === "numFmt" && !close) custom.set(Number(attr(tag, "numFmtId")), formatDateKind(attr(tag, "formatCode") ?? ""));
       else if (name === "cellXfs" && !empty) inCellXfs = !close;
       else if (name === "xf" && inCellXfs && !close) {
-        const id = Number(attr(attrs, "numFmtId") ?? 0);
+        const id = Number(attr(tag, "numFmtId") ?? 0);
         kinds.push(custom.has(id) ? custom.get(id) : builtinDateKind(id));
       }
     },
@@ -813,13 +1024,13 @@ function readWorkbook(pkg: Package, workbookPath: string): ReadResult {
   let date1904 = false;
   walkXml(
     pkg.read(workbookPath)?.xml ?? "",
-    ({ name, close, attrs }) => {
-      if (close) return;
-      if (name === "workbookPr") date1904 = /^(1|true)$/i.test(attr(attrs, "date1904") ?? "");
-      if (name !== "sheet") return;
-      const state = attr(attrs, "state");
-      const label = `${attr(attrs, "name") ?? listed.length + 1}${state && state !== "visible" ? " (hidden)" : ""}`;
-      listed.push({ name: label, rel: rels.get(relId(attrs) ?? "") });
+    (tag) => {
+      if (tag.close) return;
+      if (tag.name === "workbookPr") date1904 = /^(1|true)$/i.test(attr(tag, "date1904") ?? "");
+      if (tag.name !== "sheet") return;
+      const state = attr(tag, "state");
+      const label = `${attr(tag, "name") ?? listed.length + 1}${state && state !== "visible" ? " (hidden)" : ""}`;
+      listed.push({ name: label, rel: rels.get(relId(tag) ?? "") });
     },
     () => {},
   );
@@ -835,21 +1046,21 @@ function readWorkbook(pkg: Package, workbookPath: string): ReadResult {
   }
 
   const sharedPath = relOfType("sharedStrings") ?? "xl/sharedStrings.xml";
-  let shared: string[] = [];
-  let sharedWant = 128 * 1024;
+  const shared = new SharedStrings();
+  let sharedWant = FIRST_READ_BYTES / 2;
   let sharedCut = true;
   const loadShared = () => {
     const part = pkg.read(sharedPath, (sharedWant *= 2));
-    shared = part ? sharedStrings(part.xml) : [];
+    if (part) shared.feed(part.xml, part.cut);
     sharedCut = Boolean(part?.cut);
   };
   const stylesXml = pkg.read(relOfType("styles") ?? "xl/styles.xml")?.xml;
   const ctx: SheetContext = {
     shared(index) {
       // The table is read only as far as needed; read more of it when a cell points further.
-      while (index >= shared.length && sharedCut && sharedWant < MAX_PART_BYTES && budget.partBytes > 0) loadShared();
-      if (index >= shared.length && sharedCut) budget.cut(PART_TOO_LARGE);
-      return shared[index];
+      while (index >= shared.strings.length && sharedCut && sharedWant < MAX_PART_BYTES && budget.partBytes > 0) loadShared();
+      if (index >= shared.strings.length && sharedCut) budget.cut(PART_TOO_LARGE);
+      return shared.strings[index];
     },
     dateKinds: stylesXml ? dateStyles(stylesXml) : [],
     date1904,
@@ -859,8 +1070,10 @@ function readWorkbook(pkg: Package, workbookPath: string): ReadResult {
   const parts: string[] = [];
   let length = 0;
   for (const [i, sheet] of sheets.entries()) {
-    const { text, full } = pkg.parseGrowing(sheet.path, budget.chars - length, (xml, max) => sheetText(xml, max, ctx));
-    const part = `--- Sheet: ${sheet.name} ---\n${text}`;
+    const reader = new SheetReader(budget.chars - length, ctx);
+    pkg.feedGrowing(sheet.path, reader);
+    const { full } = reader;
+    const part = `--- Sheet: ${sheet.name} ---\n${reader.text()}`;
     parts.push(part);
     length += part.length + 2;
     if (full) return budget.result(parts.join("\n\n"), true);
@@ -875,8 +1088,8 @@ function readPresentation(pkg: Package, presentationPath: string): ReadResult {
   const slides: string[] = [];
   walkXml(
     pkg.read(presentationPath)?.xml ?? "",
-    ({ name, close, attrs }) => {
-      const rel = name === "sldId" && !close ? rels.get(relId(attrs) ?? "") : undefined;
+    (tag) => {
+      const rel = tag.name === "sldId" && !tag.close ? rels.get(relId(tag) ?? "") : undefined;
       if (rel) slides.push(rel.target);
     },
     () => {},
