@@ -257,7 +257,7 @@ describe("accounts", () => {
     const { call } = await setup();
     const res = await call("get_message", { account: "work", messageId: "p1" });
     assert.equal(res.isError, true);
-    assert.match(res.text, /belong to a single Gmail account/);
+    assert.match(res.text, /\(IDs belong to one account; pass the account that returned them\.\)$/);
   });
 
   test("a revoked account gives a re-link hint", async () => {
@@ -2257,5 +2257,42 @@ describe("attachments on replies and forwards", () => {
     assert.equal(fake.batchCalls, 0, "nothing was downloaded");
     assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")));
     assert.equal(fake.sentBy(WORK).length, 0);
+  });
+});
+
+describe("bulk changes with IDs from another account", () => {
+  const HINT = "IDs belong to one account; pass the account that returned them.";
+
+  test("threads: missing IDs are listed, and nothing but missing IDs is an error", async () => {
+    const { call, fake, work } = await setup();
+    const mixed = await call("bulk_update", { account: "work", threadIds: ["wt1", "pt1"], action: "mark_read", dryRun: true });
+    assert.equal(mixed.isError, false, mixed.text);
+    assert.equal(mixed.json.wouldChange, 1);
+    assert.deepEqual(mixed.json.notFound, ["pt1"]);
+    assert.equal(mixed.json.hint, HINT);
+    const run = await call("bulk_update", { account: "work", threadIds: ["wt1", "pt1"], action: "mark_read" });
+    assert.deepEqual([run.json.changed, run.json.notFound], [1, ["pt1"]]);
+    assert.ok(!work.messages.get("w1")!.labelIds!.includes("UNREAD"));
+
+    const none = await call("bulk_update", { account: "work", threadIds: ["pt1"], action: "mark_read" });
+    assert.equal(none.isError, true);
+    assert.equal(none.text, `None of the 1 thread ID(s) exist in ${WORK}. ${HINT}`);
+    assert.equal(fake.batchModifyCalls.length, 1, "nothing was changed for the missing ones");
+  });
+
+  test("messages: Gmail's refusal of the batch carries the hint, and so does a dry run", async () => {
+    const { call, fake, personal } = await setup();
+    const dry = await call("bulk_update", { account: "work", messageIds: ["p1"], action: "star", dryRun: true });
+    assert.equal(dry.isError, true);
+    assert.equal(dry.text, `None of the first 1 message ID(s) exist in ${WORK}. ${HINT}`);
+    const mixedDry = await call("bulk_update", { account: "work", messageIds: ["w1", "p1"], action: "star", dryRun: true });
+    assert.equal(mixedDry.isError, false, mixedDry.text);
+    assert.deepEqual([mixedDry.json.wouldChange, mixedDry.json.notFound, mixedDry.json.hint], [2, ["p1"], HINT]);
+
+    const run = await call("bulk_update", { account: "work", messageIds: ["w1", "p1"], action: "star" });
+    assert.equal(run.isError, true);
+    assert.match(run.text, /batchModify failed \(404\).*not found\. IDs belong to one account; pass the account that returned them\.$/);
+    assert.ok(!personal.messages.get("p1")!.labelIds!.includes("STARRED"));
+    assert.equal(fake.batchModifyCalls.length, 1);
   });
 });

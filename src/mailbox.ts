@@ -218,6 +218,9 @@ export interface BulkSelector {
   messageIds?: string[];
 }
 
+/** What to tell Claude when an ID isn't found: it usually came from another account's results. */
+export const WRONG_ACCOUNT_HINT = "IDs belong to one account; pass the account that returned them.";
+
 /** The emails a bulk change will touch, plus what's left over beyond maxEmails. */
 type Selection = {
   ids: string[];
@@ -226,7 +229,7 @@ type Selection = {
   unavailable?: Record<string, unknown>;
 } & (
   | { kind: "query"; /** Changed emails stop matching, so running the change again continues. */ resumable: boolean }
-  | { kind: "threads"; remainingThreadIds: string[]; threadOf: Map<string, string> }
+  | { kind: "threads"; remainingThreadIds: string[]; threadOf: Map<string, string>; /** Given IDs that don't exist in this account. */ notFound: string[] }
   | { kind: "messages"; remainingMessageIds: string[] }
 );
 
@@ -1372,6 +1375,11 @@ export class Mailbox {
         threadIds.map((id) => ({ path: `threads/${id}`, query: { format: "minimal" } })),
       );
       const { found, failed } = settle(threadIds, fetched);
+      // IDs Gmail doesn't know are nearly always another account's; saying so beats a silent 0.
+      const notFound = threadIds.filter((_, i) => !fetched[i].ok && fetched[i].error.status === 404);
+      if (notFound.length === threadIds.length) {
+        throw new MimeError(`None of the ${threadIds.length} thread ID(s) exist in ${this.email}. ${WRONG_ACCOUNT_HINT}`);
+      }
       const add = change.add.map((l) => l.id);
       const remove = change.remove.map((l) => l.id);
       const needsChange = (m: ApiMessage) => {
@@ -1390,7 +1398,7 @@ export class Mailbox {
         }
         if (pending.length > room) remainingThreadIds.push(threadId);
       }
-      return { kind: "threads", ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, ...unavailable("threadIds", failed) };
+      return { kind: "threads", ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, notFound, ...unavailable("threadIds", failed) };
     }
     const ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))];
     return { kind: "messages", ids: ids.slice(0, max), more: ids.length > max, remainingMessageIds: ids.slice(max) };
@@ -1410,12 +1418,23 @@ export class Mailbox {
     const remove = await this.resolveLabels(change.remove, labels);
     const selection = await this.selectMessages(sel, { add, remove }, opts.max);
     const { ids } = selection;
-    const extra = { ...bulkLeftOver(selection, opts.max), ...(selection.unavailable ? { unavailable: selection.unavailable } : {}) };
+    const missing = (notFound: string[]) => (notFound.length ? { notFound, hint: WRONG_ACCOUNT_HINT } : {});
+    const extra = {
+      ...bulkLeftOver(selection, opts.max),
+      ...(selection.unavailable ? { unavailable: selection.unavailable } : {}),
+      ...(selection.kind === "threads" ? missing(selection.notFound) : {}),
+    };
     if (opts.dryRun) {
       const sample = ids.slice(0, BULK_PREVIEW);
       const fetched = await this.client.batchGet<ApiMessage>(
         sample.map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: ["Subject", "From", "Date"] } })),
       );
+      // Given message IDs are only looked at here (the change itself is one batch call), so the
+      // preview is where a wrong account shows up.
+      const notFound = selection.kind === "messages" ? sample.filter((_, i) => !fetched[i].ok && fetched[i].error.status === 404) : [];
+      if (notFound.length && notFound.length === sample.length) {
+        throw new MimeError(`None of the first ${sample.length} message ID(s) exist in ${this.email}. ${WRONG_ACCOUNT_HINT}`);
+      }
       const preview = fetched.flatMap((r) =>
         r.ok
           ? [
@@ -1427,7 +1446,7 @@ export class Mailbox {
             ]
           : [],
       );
-      return { dryRun: true, wouldChange: ids.length, ...extra, preview };
+      return { dryRun: true, wouldChange: ids.length, ...extra, ...missing(notFound), preview };
     }
     const addLabelIds = add.map((l) => l.id);
     const removeLabelIds = remove.map((l) => l.id);
@@ -1437,7 +1456,9 @@ export class Mailbox {
       try {
         await this.client.request("POST", "messages/batchModify", { json: { ids: chunk, addLabelIds, removeLabelIds } });
       } catch (err) {
-        if (!changed) throw err;
+        // Gmail refuses the whole batch when an ID is unknown (400 or 404): usually another account's.
+        const wrongId = selection.kind === "messages" && err instanceof GmailApiError && (err.status === 400 || err.status === 404);
+        if (!changed) throw wrongId ? new MimeError(`${err.message} ${WRONG_ACCOUNT_HINT}`) : err;
         // Part of the change went through: say exactly how much, and how to finish.
         const left = ids.slice(i);
         const finish =
@@ -1447,7 +1468,7 @@ export class Mailbox {
         return {
           changed,
           notChanged: left.length,
-          error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${finish}`,
+          error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${wrongId ? `${WRONG_ACCOUNT_HINT} ` : ""}${finish}`,
           ...extra,
           ...bulkLeftOver(selection, opts.max, left),
         };

@@ -336,10 +336,9 @@ export class FakeGmail {
     }
     if (method === "POST" && path === "messages/batchModify") {
       this.batchModifyCalls.push(body);
-      for (const id of body.ids) {
-        const msg = mb.messages.get(id);
-        if (msg) this.applyModify(msg, "modify", body);
-      }
+      // Like Gmail, an unknown ID fails the whole batch and nothing changes.
+      if (!body.ids.every((id: string) => mb.messages.has(id))) return notFound();
+      for (const id of body.ids) this.applyModify(mb.messages.get(id)!, "modify", body);
       return json(204, undefined);
     }
     if (method === "POST" && path === "messages/send") {

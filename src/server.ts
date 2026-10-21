@@ -18,6 +18,7 @@ import {
   unsubscribeOptions,
   type SenderGroup,
   type UnsubscribeOptions,
+  WRONG_ACCOUNT_HINT,
 } from "./mailbox.js";
 
 export const SERVER_NAME = "gmail-multi";
@@ -276,8 +277,7 @@ function ok(value: unknown): CallToolResult {
 function fail(err: unknown): CallToolResult {
   let message = err instanceof Error ? err.message : String(err);
   if (err instanceof GmailApiError && (err.status === 404 || err.status === 400) && /not found|invalid id/i.test(message)) {
-    message +=
-      " (Message, thread, draft and label IDs belong to a single Gmail account. Make sure `account` is the account that returned this ID.)";
+    message += ` (${WRONG_ACCOUNT_HINT})`;
   }
   return { isError: true, content: [{ type: "text", text: message }] };
 }
@@ -1061,10 +1061,14 @@ export function createServer(deps: ServerDeps): McpServer {
       .string()
       .optional()
       .describe(
-        'Gmail search selecting the emails, e.g. "category:promotions older_than:7d", "from:news@shop.com is:unread". Drafts are never included.',
+        'Gmail search selecting the emails, e.g. "category:promotions older_than:7d", "from:news@shop.com is:unread" (the same syntax as search_threads). Drafts are never included.',
       ),
-    threadIds: z.array(z.string()).max(500).optional().describe("Optional. Change every email in these threads (the ones that don't have the change yet)."),
-    messageIds: z.array(z.string()).max(1000).optional().describe("Optional. Change exactly these emails."),
+    threadIds: z
+      .array(z.string())
+      .max(500)
+      .optional()
+      .describe("Optional. Change every email in these threads (the ones that don't have the change yet). IDs the account doesn't have are returned under `notFound`."),
+    messageIds: z.array(z.string()).max(1000).optional().describe("Optional. Change exactly these emails (IDs from the given account)."),
     maxEmails: z
       .number()
       .int()
