@@ -366,8 +366,12 @@ function attachmentPart(att: OutgoingAttachment, index: number): MimeChunk[] {
   return leafPart(headers, att.content);
 }
 
-/** A Content-ID can be used as is when it is printable ASCII without spaces or <>"\\ (and not already taken). */
+/**
+ * A Content-ID can be used as is when it is printable ASCII without spaces or <>"\\, at most
+ * MAX_CONTENT_ID characters (and not already taken): a forwarded image's may be anything.
+ */
 const PLAIN_CONTENT_ID = /^[\x21-\x7e]+$/;
+const MAX_CONTENT_ID = 200;
 const UNSAFE_IN_CONTENT_ID = /[<>"\\]/;
 
 function escapeRegExp(text: string): string {
@@ -386,7 +390,7 @@ function assignContentIds(html: string, inline: OutgoingAttachment[]): { html: s
   const assigned = inline.map((att, i) => {
     const ref = oneLine(att.contentId ?? att.filename ?? `attachment-${i + 1}`).replace(/^<|>$/g, "");
     let cid = ref;
-    if (!PLAIN_CONTENT_ID.test(cid) || UNSAFE_IN_CONTENT_ID.test(cid) || used.has(cid)) {
+    if (cid.length > MAX_CONTENT_ID || !PLAIN_CONTENT_ID.test(cid) || UNSAFE_IN_CONTENT_ID.test(cid) || used.has(cid)) {
       const stem = ref.replace(/[^\w.-]+/g, "_").slice(0, 40) || "image";
       const random = Array.from(crypto.getRandomValues(new Uint8Array(4)), (b) => b.toString(16).padStart(2, "0")).join("");
       cid = `${stem}.${random}`;
@@ -410,6 +414,24 @@ function assignContentIds(html: string, inline: OutgoingAttachment[]): { html: s
 /** The size of an attachment's file in bytes. */
 export function attachmentSize(content: Buffer | Base64UrlData): number {
   return content instanceof Base64UrlData ? content.size : content.length;
+}
+
+/** The longest message ID copied into In-Reply-To or References (RFC 5322 lines stay under 998 characters). */
+const MAX_MESSAGE_ID = 250;
+/** References keeps the thread's first message ID and the latest ones, this many in all. */
+const MAX_REFERENCES = 20;
+
+/**
+ * The message IDs in an In-Reply-To or References value taken from another email: only well-formed
+ * ones ("<…>", printable ASCII without spaces, at most MAX_MESSAGE_ID characters), so that a sender's
+ * odd Message-ID can't break the headers of a reply. A lone bare ID ("id@host") gets its brackets.
+ */
+function messageIds(value: string | undefined): string[] {
+  if (!value) return [];
+  const ids = (value.match(/<[^<>\s]*>/g) ?? []).filter((id) => id.length <= MAX_MESSAGE_ID && /^<[\x21-\x7e]+>$/.test(id));
+  if (ids.length) return ids;
+  const bare = value.trim();
+  return bare.length <= MAX_MESSAGE_ID - 2 && /^[\x21-\x7e]+@[\x21-\x7e]+$/.test(bare) && !/[<>]/.test(bare) ? [`<${bare}>`] : [];
 }
 
 /** Builds a complete RFC 822 message as text. Gmail fills in From, Date and Message-ID on send. */
@@ -444,6 +466,9 @@ export function buildMimeChunks(msg: OutgoingMessage): MimeChunk[] {
   }
 
   const subject = oneLine(msg.subject ?? "");
+  const inReplyTo = messageIds(msg.inReplyTo)[0];
+  const ids = messageIds(msg.references);
+  const references = ids.length > MAX_REFERENCES ? [ids[0], ...ids.slice(1 - MAX_REFERENCES)] : ids;
   // RFC 5322 folds only at spaces: a word too long for one line (e.g. a long URL) needs encoded-words.
   const foldable = isAscii(subject) && !subject.split(" ").some((word) => word.length > 900);
   const headers = [
@@ -452,8 +477,8 @@ export function buildMimeChunks(msg: OutgoingMessage): MimeChunk[] {
     addressHeader("Cc", validateAddresses("cc", msg.cc)),
     addressHeader("Bcc", validateAddresses("bcc", msg.bcc)),
     foldable ? foldHeader("Subject", subject) : `Subject: ${encodeHeaderValue(subject, true)}`,
-    msg.inReplyTo ? `In-Reply-To: ${oneLine(msg.inReplyTo)}` : undefined,
-    msg.references ? foldHeader("References", msg.references) : undefined,
+    inReplyTo ? `In-Reply-To: ${inReplyTo}` : undefined,
+    references.length ? foldHeader("References", references.join(" ")) : undefined,
     "MIME-Version: 1.0",
   ].filter((h): h is string => Boolean(h));
   return joinLines([...headers, body]);

@@ -306,7 +306,8 @@ test("attachment content given as a data: URL is accepted", () => {
 });
 
 test("long References and Subject headers are folded; Content-IDs stay ASCII", () => {
-  const ids = Array.from({ length: 30 }, (_, i) => `<message-${i}-abcdefghijklmnop@mail.example.com>`).join(" ");
+  const list = Array.from({ length: 30 }, (_, i) => `<message-${i}-abcdefghijklmnop@mail.example.com>`);
+  const ids = list.join(" ");
   const raw = buildMime({
     to: ["a@example.com"],
     subject: "A very long subject line ".repeat(8).trim(),
@@ -316,12 +317,40 @@ test("long References and Subject headers are folded; Content-IDs stay ASCII", (
   });
   const headerBlock = raw.slice(0, raw.indexOf("\r\n\r\n"));
   for (const line of headerBlock.split("\r\n")) assert.ok(line.length <= 78, `header line too long: ${line.length}`);
-  assert.equal(parseHeaders(headerBlock).find((h) => h.name === "References")!.value, ids);
+  // The thread's first message ID and the latest 19 are kept.
+  assert.equal(parseHeaders(headerBlock).find((h) => h.name === "References")!.value, [list[0], ...list.slice(11)].join(" "));
   // The Content-ID is plain ASCII, and the HTML's reference was pointed at it.
   const cid = /Content-ID: <([^>]+)>/.exec(raw)![1];
   assert.match(cid, /^caf_photo\.png\.[0-9a-f]{8}$/);
   assert.ok(raw.includes(Buffer.from(`<img src="cid:${cid}">`).toString("base64")), "HTML refers to the new Content-ID");
   assert.ok(!/[^\x00-\x7f]/.test(raw), "message is 7-bit clean");
+});
+
+test("threading headers copied from another email keep only well-formed message IDs; odd Content-IDs are replaced", () => {
+  const headersOf = (raw: string) => raw.slice(0, raw.indexOf("\r\n\r\n"));
+  const raw = buildMime({
+    to: ["a@example.com"],
+    text: "x",
+    inReplyTo: `<é\u200b${"x".repeat(2000)}@x.y>`,
+    references: `<é@x.y> <${"y".repeat(2000)}@x.y> junk <ok-1@x.y> <a b@x.y> <ok-2@x.y>`,
+  });
+  const head = headersOf(raw);
+  assert.ok(!/[^\x00-\x7f]/.test(head), "ASCII only");
+  for (const line of raw.split("\r\n")) assert.ok(line.length <= 998, `line of ${line.length}`);
+  assert.doesNotMatch(head, /In-Reply-To/, "an ID that isn't well-formed is left out");
+  assert.equal(parseHeaders(head).find((h) => h.name === "References")!.value, "<ok-1@x.y> <ok-2@x.y>");
+  // A bare ID gets its angle brackets.
+  assert.match(headersOf(buildMime({ to: ["a@example.com"], text: "x", inReplyTo: " abc@x.y " })), /^In-Reply-To: <abc@x\.y>$/m);
+  // A forwarded inline image whose Content-ID is 2,000 characters long gets a short one, which the HTML points at.
+  const long = buildMime({
+    to: ["a@example.com"],
+    html: `<img src="cid:${"c".repeat(2000)}">`,
+    attachments: [{ content: Buffer.from("png"), filename: "a.png", mimeType: "image/png", inline: true, contentId: "c".repeat(2000) }],
+  });
+  const cid = /Content-ID: <([^>]+)>/.exec(long)![1];
+  assert.ok(cid.length < 60, cid);
+  assert.equal(leafBodies(long).find((l) => l.type === "text/html")!.body, `<img src="cid:${cid}">`);
+  for (const line of long.split("\r\n")) assert.ok(line.length <= 998, `line of ${line.length}`);
 });
 
 test("display names are quoted or encoded as needed", () => {
