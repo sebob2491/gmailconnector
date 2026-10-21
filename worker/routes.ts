@@ -151,6 +151,32 @@ const notConfigured = (origin: string) =>
     { status: 503, kind: "warn", action: { href: `${origin}/`, label: "Open setup page" } },
   );
 
+/** The host name of a redirect URI for a page, or "Claude" if it can't be read. */
+function hostnameOf(uri: string): string {
+  try {
+    return new URL(uri).hostname;
+  } catch {
+    return "Claude";
+  }
+}
+
+/** The accounts page's CSRF token: derived from the session handle, so the page never carries the cookie's own value. */
+const csrfToken = (handle: string) => sha256(`${handle}csrf`);
+
+/**
+ * Whether an owner has signed in, remembered per isolate so the public setup page doesn't cost a
+ * storage read on every visit. Once claimed, a connector stays claimed.
+ */
+let claimedCache: { claimed: boolean; at: number } | undefined;
+const CLAIMED_CACHE_MS = 60_000;
+
+async function isClaimed(env: Env): Promise<boolean> {
+  if (claimedCache && (claimedCache.claimed || Date.now() - claimedCache.at < CLAIMED_CACHE_MS)) return claimedCache.claimed;
+  const claimed = Boolean((await loadOwner(env.OAUTH_KV)).owner);
+  claimedCache = { claimed, at: Date.now() };
+  return claimed;
+}
+
 const signInCookie = (state: string) => `${SIGNIN_COOKIE_PREFIX}${state.slice(0, 16)}`;
 
 /**
@@ -259,9 +285,7 @@ function authorizeError(env: Env, error: unknown): Response {
 }
 
 function notClaude(redirectUri: string): Response {
-  const url = new URL(redirectUri);
-  const target = url.host ? `${url.protocol}//${url.host}` : url.protocol;
-  return messagePage("Can't connect", `This connector only works with Claude, but this request would send access to ${target}.`, {
+  return messagePage("Can't connect", `This connector only works with Claude, but this request would send access to ${safeHost(redirectUri)}.`, {
     status: 403,
   });
 }
@@ -284,6 +308,10 @@ async function authorizeGet(request: Request, env: Env, origin: string): Promise
     // nothing has to be stored until the user has signed in with Google.
     const csrf = randomToken(24);
     const headers = new Headers();
+    // Consent pages that were never answered expire after 30 minutes; if several pile up, clear
+    // them so the Cookie header stays small.
+    const earlier = cookieNamesWithPrefix(request, CONSENT_COOKIE_PREFIX);
+    if (earlier.length >= 4) for (const name of earlier) headers.append("Set-Cookie", clearCookie(name));
     headers.append("Set-Cookie", setCookie(consentCookie(csrf), csrf, CONSENT_TTL));
     return htmlResponse(
       consentPage({
@@ -371,13 +399,15 @@ async function googleCallback(request: Request, env: Env, origin: string): Promi
     const result = await recordSignIn(env, email, tokens, pending.purpose);
     if (!result.ok) {
       if (!result.linked) await revokeToken(tokens.refreshToken);
-      return messagePage("Not allowed", result.message, {
+      return messagePage(result.setup ? "One more setup step" : "Not allowed", result.message, {
         status: 403,
+        ...(result.setup ? { kind: "warn" as const } : {}),
         headers,
         ...(pending.request ? { action: { href: clientErrorUrl(pending.request), label: "Back to Claude" } } : {}),
       });
     }
     linked = result.linked;
+    if (result.claimed) claimedCache = { claimed: true, at: Date.now() };
     // Signing in with an account that isn't linked (e.g. one removed earlier) doesn't re-add it,
     // and the grant Google just created isn't needed.
     if (!linked) await revokeToken(tokens.refreshToken);
@@ -446,10 +476,10 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
     accountsPage({
       accounts: rec.accounts.map((a, i) => ({ email: a.email, health: health[i] })),
       owner: rec.owner,
-      csrf: session.handle,
+      csrf: await csrfToken(session.handle),
       notice: accountsNotice(new URL(request.url)),
       connecting: session.data.request
-        ? { clientName: session.data.clientName ?? "Claude", redirectHost: new URL(session.data.request.redirectUri).hostname }
+        ? { clientName: session.data.clientName ?? "Claude", redirectHost: hostnameOf(session.data.request.redirectUri) }
         : undefined,
     }),
   );
@@ -470,11 +500,11 @@ async function disconnectClaude(env: Env): Promise<number> {
   return count;
 }
 
-/** POST handlers on the accounts page: the session cookie and the form's copy of it must match. */
+/** POST handlers on the accounts page: the form must carry the token derived from the session cookie. */
 async function accountsPost(request: Request, env: Env, origin: string, action: string): Promise<Response> {
   const session = await getSession(env, request);
   const form = await request.formData();
-  if (!session || form.get("csrf") !== session.handle) {
+  if (!session || form.get("csrf") !== (await csrfToken(session.handle))) {
     return messagePage("Session expired", "Please sign in again.", {
       kind: "warn",
       action: { href: `${origin}/accounts`, label: "Sign in" },
@@ -551,15 +581,20 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
   const origin = url.origin;
   const route = `${request.method} ${url.pathname}`;
   switch (route) {
-    case "GET /":
+    case "GET /": {
+      // The copy buttons' script is the only script on any page; the nonce lets just that one run.
+      const nonce = randomToken(16);
       return htmlResponse(
         statusPage({
           origin,
           googleConfigured: Boolean(googleClient(env)),
           allowedEmailsSet: allowedEmails(env).length > 0,
-          claimed: Boolean((await loadOwner(env.OAUTH_KV)).owner),
+          claimed: await isClaimed(env),
+          nonce,
         }),
+        { nonce },
       );
+    }
     case "GET /privacy":
       return htmlResponse(privacyPage(origin));
     case "GET /authorize":

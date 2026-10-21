@@ -420,6 +420,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(consent.status, 200, consent.text);
     assert.match(consent.text, /Connect your Gmail to Claude/);
     assert.match(consent.text, /Access will be sent to <b>claude\.ai<\/b>/);
+    assert.match(consent.text, /You'll choose which Gmail accounts to share on the next page/);
+    assert.match(consent.text, /Only continue if you just started connecting from your own Claude account/);
 
     const toGoogle = await answerConsent(browser, consent.text);
     assert.equal(toGoogle.status, 302, toGoogle.text);
@@ -477,6 +479,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
     accessToken = tokens.access_token;
     const unwrapped = await minter({ unwrap: accessToken });
     assert.deepEqual(unwrapped.grant.props, { email: PERSONAL }, "the connection records who approved it");
+    // The setup page remembers "nobody signed in" for a minute, but a claim updates it at once.
+    assert.match((await new Browser(mf).fetch("/")).text, /✓ Signed in/);
   });
 
   test("Claude can use both accounts through the MCP endpoint", async () => {
@@ -730,6 +734,92 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(forged.text, /This page expired/);
     const wrongToken = await browser.fetch(action, { form: { csrf: "b".repeat(32), decision: "approve" } });
     assert.equal(wrongToken.status, 400);
+  });
+
+  test("lookalike redirect URIs are refused; a registered URI that isn't a URL gets a refusal page, not an error", async () => {
+    const cases: [string, number][] = [
+      ["https://claude.ai.evil.example/cb", 403],
+      ["https://evil.example/claude.ai/cb", 403],
+      ["https://claude.ai@evil.example/cb", 403],
+      ["https://evil.example\\@claude.ai/cb", 403],
+      ["https://claude.ai./cb", 403],
+      ["http://localhost.evil/cb", 403],
+      ["https://claude.ai%2eevil.example/cb", 403],
+      ["http://", 403],
+      ["https://[", 403],
+      ["https://CLAUDE.AI/api/mcp/auth_callback", 200],
+      ["http://[0:0:0:0:0:0:0:1]:9/cb", 200],
+      ["http://127.1/cb", 200],
+    ];
+    const reg = await register({ redirect_uris: cases.map(([uri]) => uri) });
+    assert.equal(reg.status, 201, JSON.stringify(reg.body));
+    for (const [redirect, expected] of cases) {
+      const res = await new Browser(mf).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect));
+      assert.equal(res.status, expected, `${redirect}: ${res.status}\n${res.text.slice(0, 300)}`);
+      if (expected === 403) assert.match(res.text, /only works with Claude/, redirect);
+    }
+    const unreadable = await new Browser(mf).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), "http://"));
+    assert.match(unreadable.text, /would send access to an address that can(&#39;|')t be read/);
+  });
+
+  test("PKCE is required for public clients and the plain method is refused", async () => {
+    const clientId = await registerClient();
+    const noPkce = await new Browser(mf).fetch(authorizeUrl(clientId, "").replace(/&code_challenge=[^&]*&code_challenge_method=S256/, ""));
+    assert.equal(noPkce.status, 302, noPkce.text);
+    assert.match(new URL(noPkce.location).searchParams.get("error_description") ?? "", /Public clients must use PKCE/);
+    const plain = await new Browser(mf).fetch(authorizeUrl(clientId, "x".repeat(43)).replace("code_challenge_method=S256", "code_challenge_method=plain"));
+    assert.equal(plain.status, 302);
+    assert.match(new URL(plain.location).searchParams.get("error_description") ?? "", /plain PKCE method is not allowed/);
+  });
+
+  test("the accounts page's CSRF token is derived from the session, not the cookie's own value", async () => {
+    const { browser, csrf } = await ownerBrowser();
+    const handle = browser.cookies.get("__Host-gmail-connector")!;
+    assert.notEqual(csrf, handle);
+    assert.equal(csrf, createHash("sha256").update(`${handle}csrf`).digest("hex"));
+    const res = await browser.fetch("/accounts/link", { form: { csrf: handle } });
+    assert.match(res.text, /Session expired/, "the cookie's value itself doesn't pass");
+    assert.equal((await browser.fetch("/accounts/link", { form: { csrf } })).status, 302);
+  });
+
+  test("pages allow no scripts but the setup page's copy script, and forms may only post here", async () => {
+    const setup = await new Browser(mf).fetch("/");
+    const csp = setup.headers.get("Content-Security-Policy") ?? "";
+    const nonce = /script-src 'nonce-([^']+)'/.exec(csp)?.[1];
+    assert.ok(nonce, csp);
+    assert.ok(setup.text.includes(`<script nonce="${nonce}">`), "the copy script carries the nonce");
+    assert.match(csp, /form-action 'self'/);
+    assert.doesNotMatch(csp, /script-src[^;]*unsafe-inline/);
+    assert.notEqual(nonce, /nonce-([^']+)/.exec((await new Browser(mf).fetch("/")).headers.get("Content-Security-Policy") ?? "")?.[1], "a new nonce per response");
+    const privacy = await new Browser(mf).fetch("/privacy");
+    assert.doesNotMatch(privacy.headers.get("Content-Security-Policy") ?? "", /script-src/);
+    assert.doesNotMatch(privacy.text, /<script/);
+    assert.match(privacy.text, /unsubscribe request to the unsubscribe address/);
+  });
+
+  test("consent cookies that pile up are cleared, like sign-in cookies", async () => {
+    const browser = new Browser(mf);
+    const url = authorizeUrl(firstClientId, "z".repeat(43));
+    for (let i = 0; i < 4; i++) assert.equal((await browser.fetch(url)).status, 200);
+    assert.equal([...browser.cookies.keys()].filter((k) => k.startsWith("__Host-gmail-consent-")).length, 4);
+    const consent = await browser.fetch(url);
+    assert.equal(consent.status, 200);
+    assert.deepEqual([...browser.cookies.keys()].filter((k) => k.startsWith("__Host-gmail-consent-")).length, 1, "only the newest page's cookie is left");
+    assert.equal((await answerConsent(browser, consent.text)).status, 302, "and the newest page still works");
+  });
+
+  test("a sign-in Google doesn't accept is explained, with a way to try again", async () => {
+    const browser = new Browser(mf);
+    const toGoogle = await browser.fetch("/accounts");
+    const google = new URL(toGoogle.location);
+    const callback = new URL(google.searchParams.get("redirect_uri")!);
+    callback.searchParams.set("code", "not-a-real-code");
+    callback.searchParams.set("state", google.searchParams.get("state")!);
+    const res = await browser.fetch(callback.toString());
+    assert.equal(res.status, 400);
+    assert.match(res.text, /Couldn(&#39;|')t link that account/);
+    assert.match(res.text, /Google didn(&#39;|')t accept this sign-in \(invalid_grant\)\. The sign-in link may have been reused or expired\. Try again\./);
+    assert.match(res.text, /Try again</);
   });
 
   test("connections made before the approving address was recorded keep working", async () => {
@@ -1011,6 +1101,7 @@ describe("a new connector without ALLOWED_EMAILS", () => {
     const browser = new Browser(mf2);
     const refused = await browser.googleSignIn((await browser.fetch("/accounts")).location, fake2, PERSONAL);
     assert.equal(refused.status, 403);
+    assert.match(refused.text, /One more setup step/);
     assert.match(refused.text, /add a variable named ALLOWED_EMAILS with your Gmail address/);
     assert.ok(fake2.revokeCalls.includes("rt-personal"), "the unneeded Google grant is revoked");
     assert.equal(await (await mf2.getKVNamespace("OAUTH_KV")).get("gmail:owner"), null, "nobody became the owner");

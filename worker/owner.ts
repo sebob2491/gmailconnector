@@ -144,7 +144,8 @@ export async function connectionAllowed(env: Env, email: string | undefined): Pr
 
 export type SignInResult =
   | { ok: true; rec: OwnerRecord; claimed: boolean; linked: boolean }
-  | { ok: false; message: string; linked: boolean };
+  /** `setup`: refused only because the connector isn't set up yet (ALLOWED_EMAILS missing), not because of who signed in. */
+  | { ok: false; message: string; linked: boolean; setup?: boolean };
 
 export const SET_ALLOWED_EMAILS =
   "Before signing in for the first time, tell the connector who owns it: in Cloudflare, open this " +
@@ -176,7 +177,7 @@ export async function recordSignIn(
   let claimed = false;
   if (purpose === "signin") {
     if (!rec.owner) {
-      if (!allowed.length) return { ok: false, message: SET_ALLOWED_EMAILS, linked: alreadyLinked };
+      if (!allowed.length) return { ok: false, message: SET_ALLOWED_EMAILS, linked: alreadyLinked, setup: true };
       if (!listed) {
         return { ok: false, message: `${email} is not in this connector's ALLOWED_EMAILS list.`, linked: alreadyLinked };
       }

@@ -52,20 +52,26 @@ ol.steps li{margin:14px 0}
 
 const LOGO = `<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 6l9 7 9-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>`;
 
-const COPY_SCRIPT = `<script>
+/** The copy buttons' script, allowed to run by the nonce (see htmlResponse). */
+const copyScript = (nonce: string) => `<script nonce="${escapeHtml(nonce)}">
 document.addEventListener('click',function(e){var b=e.target.closest('[data-copy]');if(!b)return;
 navigator.clipboard.writeText(b.getAttribute('data-copy')).then(function(){var t=b.textContent;b.textContent='Copied';setTimeout(function(){b.textContent=t},1500)})});
 </script>`;
 
-export function layout(title: string, body: string, opts: { script?: boolean } = {}): string {
+/** A page. With `nonce` (one per response, also passed to htmlResponse) it includes the copy buttons' script. */
+export function layout(title: string, body: string, opts: { nonce?: string } = {}): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${escapeHtml(title)}</title><style>${CSS}</style></head>
-<body><main><div class="brand">${LOGO}<span>Gmail · multiple accounts</span></div>${body}</main>${opts.script ? COPY_SCRIPT : ""}</body></html>`;
+<body><main><div class="brand">${LOGO}<span>Gmail · multiple accounts</span></div>${body}</main>${opts.nonce ? copyScript(opts.nonce) : ""}</body></html>`;
 }
 
-export function htmlResponse(html: string, init: { status?: number; headers?: Headers } = {}): Response {
+/**
+ * Serves a page with no caching, no framing, and a policy that allows no scripts at all, except
+ * (with `nonce`) the one script tag carrying that nonce. Forms may only post to this site.
+ */
+export function htmlResponse(html: string, init: { status?: number; headers?: Headers; nonce?: string } = {}): Response {
   const headers = init.headers ?? new Headers();
   headers.set("Content-Type", "text/html; charset=utf-8");
   headers.set("Cache-Control", "no-store");
@@ -73,7 +79,7 @@ export function htmlResponse(html: string, init: { status?: number; headers?: He
   headers.set("Referrer-Policy", "no-referrer");
   headers.set(
     "Content-Security-Policy",
-    "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'; base-uri 'none'",
+    `default-src 'none'; style-src 'unsafe-inline'; ${init.nonce ? `script-src 'nonce-${init.nonce}'; ` : ""}img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
   );
   return new Response(html, { status: init.status ?? 200, headers });
 }
@@ -111,6 +117,8 @@ export function statusPage(opts: {
   /** Whether ALLOWED_EMAILS is set (its addresses aren't shown: this page is public). */
   allowedEmailsSet: boolean;
   claimed: boolean;
+  /** This response's script nonce (the page has copy buttons). */
+  nonce: string;
 }): string {
   const mcpUrl = `${opts.origin}/mcp`;
   const callback = `${opts.origin}/google/callback`;
@@ -120,6 +128,7 @@ export function statusPage(opts: {
 <p class="muted">Finish these steps to use it in Claude. This page updates as you go.</p>
 <ol class="steps">
 <li><h2>Connect Google ${check(opts.googleConfigured)}</h2>
+<p>First: enable the Gmail API, add the scope <code>https://www.googleapis.com/auth/gmail.modify</code> under <b>Data access</b>, and <b>Publish</b> the app (Audience). See README step 2.</p>
 <p>In Google Cloud's <b>Branding</b> page, under <b>App domain</b>, use these. Google needs them before you can publish the app.</p>
 <p class="muted">Application home page</p>${copyRow(`${opts.origin}/`)}
 <p class="muted">Application privacy policy link</p>${copyRow(`${opts.origin}/privacy`)}
@@ -131,12 +140,12 @@ export function statusPage(opts: {
 <p>with your Gmail address as its value (several addresses: separate them with commas), then deploy.</p>
 <p class="muted">Only these Google accounts can sign in. The connector refuses every sign-in until this is set, so nobody else who finds this page can claim it.</p></li>
 <li><h2>Add it to Claude ${check(opts.claimed, "Signed in", "Not signed in yet")}</h2>
-<p>In Claude, open <b>Customize → Connectors → Add custom connector</b> and paste this URL:</p>${copyRow(mcpUrl)}
+<p>In Claude, open <b>Settings → Connectors → Add custom connector</b> and paste this URL:</p>${copyRow(mcpUrl)}
 <p class="muted">Then press <b>Connect</b> and sign in with Google, using an address from <code>ALLOWED_EMAILS</code>. The first one to sign in becomes this connector's owner.</p></li>
 <li><h2>Link more Gmail accounts</h2>
 <p>While connecting, tap <b>Link another Gmail account</b> for each extra inbox. You can also manage them any time at:</p>${copyRow(`${opts.origin}/accounts`)}</li>
 </ol></div>`;
-  return layout("Gmail connector setup", body, { script: true });
+  return layout("Gmail connector setup", body, { nonce: opts.nonce });
 }
 
 export function privacyPage(origin: string): string {
@@ -149,6 +158,7 @@ export function privacyPage(origin: string): string {
 <p>For each linked account it stores the email address and a Google sign-in token, in the owner's Cloudflare storage. It does not keep copies of your email. Email content passes through only while answering a request.</p>
 <h2>Sharing</h2>
 <p>Data is sent only to Google (to carry out your requests) and to Claude (to show you the results). It is never sold, used for advertising, or shared with anyone else.</p>
+<p>When you ask Claude to unsubscribe you from a sender, the connector sends that sender's standard unsubscribe request to the unsubscribe address given in its emails, or sends an unsubscribe email from your account; it does this only when you ask.</p>
 <h2>Removing access</h2>
 <p>Remove an account at <a href="${escapeHtml(origin)}/accounts">${escapeHtml(origin)}/accounts</a>, which also revokes its token, or revoke access at any time at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>. The same page can disconnect Claude, which ends Claude's access to the connector.</p>
 <p class="muted">Use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.</p>
@@ -166,7 +176,8 @@ export function consentPage(opts: {
 }): string {
   const body = `<div class="card"><h1>Connect your Gmail to ${escapeHtml(opts.clientName)}</h1>
 <p><b>${escapeHtml(opts.clientName)}</b> is asking to read, send and organize email in the Gmail accounts you link here.</p>
-<p class="muted">Access will be sent to <b>${escapeHtml(opts.redirectHost)}</b>. Next you'll sign in with Google; you can link more accounts after that.</p>
+<p class="muted">Access will be sent to <b>${escapeHtml(opts.redirectHost)}</b>. Next you'll sign in with Google. You'll choose which Gmail accounts to share on the next page.</p>
+<p class="muted">Only continue if you just started connecting from your own Claude account.</p>
 ${opts.local ? `<div class="notice warn">This sends access to an app on your computer. Continue only if you just started connecting from it.</div>` : ""}
 <form method="post" action="${escapeHtml(opts.action)}" class="actions">
 <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">

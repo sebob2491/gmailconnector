@@ -139,7 +139,7 @@ Reload the setup page: steps 1 and 2 should now show **✓ Done**.
 
 ### 3. Add it to Claude and sign in (about 2 minutes)
 
-1. In claude.ai, go to **Customize → Connectors → Add custom connector**. Name it (e.g.
+1. In claude.ai, go to **Settings → Connectors → Add custom connector**. Name it (e.g.
    "Gmail (all accounts)") and paste the connector URL from the setup page (`…workers.dev/mcp`).
 2. Press **Connect**. You'll see a consent page. Press **Continue with Google** and sign in with
    the Gmail account you put in `ALLOWED_EMAILS`. Google will warn "Google hasn't verified this app"; that's expected for

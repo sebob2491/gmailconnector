@@ -144,7 +144,13 @@ export async function exchangeCode(
     code_verifier: opts.codeVerifier,
   });
   const body = (await res.json().catch(() => ({}))) as TokenResponse & { error?: string; error_description?: string };
-  if (!res.ok) throw new AuthError(`Code exchange failed: ${body.error_description ?? body.error ?? res.status}`);
+  if (!res.ok && body.error === "invalid_grant") {
+    throw new AuthError(
+      "Google didn't accept this sign-in (invalid_grant). The sign-in link may have been reused or expired. Try again.",
+      body.error,
+    );
+  }
+  if (!res.ok) throw new AuthError(`Code exchange failed: ${body.error_description ?? body.error ?? res.status}`, body.error);
   if (!body.refresh_token) {
     throw new AuthError(
       "Google did not return a refresh token. Remove the app at https://myaccount.google.com/permissions and try again.",
