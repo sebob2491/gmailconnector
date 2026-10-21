@@ -29,7 +29,9 @@ const INSTRUCTIONS = `This server connects several Gmail accounts at once.
 - search_threads, list_drafts and list_labels cover every linked account when \`account\` is omitted. search_threads merges the results into one list, newest first, and each thread's \`account\` says which inbox it's in; list_drafts and list_labels group results by account.
 - Message, thread, draft and label IDs belong to one account. When you act on an ID, pass the same \`account\` that returned it.
 - send_message, reply and forward require \`account\` whenever more than one account is linked. If the user has not said which address to send from, ask them.
-- Emails the user sent carry the SENT label and \`fromMe: true\`; use them to answer "did I reply?".`;
+- Emails the user sent carry the SENT label and \`fromMe: true\`; use them to answer "did I reply?".
+- Dates are ISO 8601 in UTC. Convert them to the user's timezone before saying things like "this morning" or "yesterday".
+- A search_threads page holds the newest threads across all accounts in true order (the next page continues where it stopped), so a page can be shorter than pageSize × accounts.`;
 
 /** Resolves the `account` argument of a tool call to one or more mailboxes. */
 export class AccountRouter {
@@ -338,6 +340,12 @@ const multiAccountArg = z
   .describe(
     'Email address or alias of one linked account, or "all". Defaults to all linked accounts, with results grouped per account.',
   );
+const searchAccountArg = z
+  .string()
+  .optional()
+  .describe(
+    'Email address or alias of one linked account, or "all" (default). With several accounts the results are merged into one newest-first list and each thread carries its `account`.',
+  );
 const addressList = (what: string) =>
   z.array(z.string()).optional().describe(`Optional. ${what} Each string MUST be a plain email address (e.g. "user@example.com").`);
 const messageFormatArg = z
@@ -411,7 +419,7 @@ const messageListVisibilityArg = z
   .optional()
   .describe("Optional. Visibility of the label on messages in Gmail's message list.");
 
-const SEARCH_QUERY_HELP = `Optional. Gmail search syntax, e.g. "from:alice@example.com", "subject:invoice newer_than:7d", "is:unread in:inbox", "has:attachment", "label:Receipts", "after:2026/01/01". Use OR and ( ) to broaden. Natural language must be converted to Gmail syntax first. Drafts are excluded unless the query mentions in:draft.`;
+const SEARCH_QUERY_HELP = `Optional. A Gmail search, as typed into Gmail's search box; turn natural language into it first. Plain words match anywhere in the email: prefer a few concise keywords, and broaden with OR rather than adding words. "an exact phrase" in quotes matches those words in that order; +word requires that exact word. Operators: from:/to:/cc:/bcc: (an address, part of one, or a name), deliveredto:, list: (a mailing list's address); subject:; after:/before: and newer:/older: with a YYYY/MM/DD date, or newer_than:/older_than: with a period such as 1d, 2w, 1m, 1y; label: with a label's display name (quote names with spaces: label:"Board Prep"; label IDs such as Label_123 match nothing); category: with primary, social, promotions, updates, forums, reservations or purchases; in: with inbox, archive, sent, snoozed, trash, spam or anywhere (Trash and Spam are only searched when the query asks for them); drafts are left out unless the query says in:draft; is: with unread, read, starred, important or muted; has: with attachment, drive, document, spreadsheet, presentation, youtube, userlabels, nouserlabels or a star such as yellow-star; filename: (a name or extension, e.g. filename:pdf); size:, larger:, smaller: with a size such as 10M; rfc822msgid: for a Message-ID header; "word1 AROUND 3 word2" finds the words within 3 words of each other. Terms are ANDed by default; OR (in capitals) or { } means any of them; a leading - excludes a term; ( ) groups terms. Gmail matches whole threads: a thread is returned when any of its emails matches, so -is:starred still returns threads that contain a starred email.`;
 
 export const LOCAL_MANAGE_HINT =
   "To link one, run `node dist/src/index.js accounts add` in the connector's folder (or `gmail-multi-mcp accounts add` after `npm link`), once per Gmail account.";
@@ -532,9 +540,15 @@ export function createServer(deps: ServerDeps): McpServer {
       description:
         "Searches email threads in one or all linked Gmail accounts. Without `account` (or with \"all\"), every linked account is searched and the results are merged into one `threads` list, newest first, where each thread's `account` says which inbox it's in: mention it to the user, and pass it back when opening the thread. The pages come in true newest-first order across accounts: a page holds the newest threads of all accounts together and the next page continues where it stopped, so a page can hold fewer than pageSize × accounts threads; an account's problems are listed under `errors`, and `accountsWithMore` says which accounts have more. A thread with one email is shown flat (subject, sender, date, snippet, labels); longer threads list their 5 most recent messages under `messages`, and `totalMessages` says how many there are. Recipients are listed only when an email wasn't addressed to just that account. Use get_thread to read full bodies. For more results, pass the returned `nextPageToken` (it covers all accounts at once). Threads Gmail couldn't return just then are listed under `unavailable`; search again shortly to get them.",
       inputSchema: {
-        account: multiAccountArg,
+        account: searchAccountArg,
         query: z.string().optional().describe(SEARCH_QUERY_HELP),
-        pageSize: z.number().int().min(1).max(50).optional().describe("Optional. Threads per account (default 20, max 50)."),
+        pageSize: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Optional. Threads read per account and page (default 20, max 50). A merged page shows the newest of them, so it can be shorter."),
         pageToken: z.string().optional().describe("Optional. nextPageToken from a previous search_threads call with the same query and account."),
         includeTrash: z.boolean().optional().describe("Optional. Include threads in Trash/Spam. Defaults to false."),
         view: z
@@ -547,7 +561,8 @@ export function createServer(deps: ServerDeps): McpServer {
     async (args) =>
       run(async () => {
         const { account, pageToken, ...search } = args;
-        return searchTimeline(await router.many(account), pageToken, search);
+        const result = await searchTimeline(await router.many(account), pageToken, search);
+        return result.threads.length || ("errors" in result && result.errors) ? result : { ...result, note: "No threads matched." };
       }),
   );
 
@@ -556,7 +571,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Get email thread",
       description:
-        "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads. In PLAIN_TEXT, each reply's quoted copy of earlier messages is hidden, since those messages are in the result; get_message shows one email in full. With bodies, the thread's `subject` is given once; a message has its own `subject` only when it differs.",
+        "Retrieves a full email thread (all messages, drafts omitted) from one Gmail account, including each message's `viewUrl`. Use the thread ID and `account` from search_threads. In PLAIN_TEXT, each reply's quoted copy of earlier messages is hidden when it can be recognised (Gmail, Apple Mail and Outlook quote styles), since those messages are in the result; get_message shows one email in full. With bodies, the thread's `subject` is given once; a message has its own `subject` only when it differs.",
       inputSchema: {
         account: accountArg,
         threadId: z.string().describe("Required. The thread ID."),
@@ -624,9 +639,12 @@ export function createServer(deps: ServerDeps): McpServer {
       annotations: read,
     },
     async (args) =>
-      run(async () =>
-        fanOut(await router.many(args.account), args.pageToken, (mb, pageToken) => mb.listDrafts({ ...args, pageToken })),
-      ),
+      run(async () => {
+        const result = await fanOut(await router.many(args.account), args.pageToken, (mb, pageToken) => mb.listDrafts({ ...args, pageToken }));
+        const listed = "accounts" in result ? result.accounts : [result];
+        const empty = listed.every((a) => "drafts" in a && !(a.drafts as unknown[]).length);
+        return empty ? { ...result, note: args.query?.trim() ? "No drafts matched." : "No drafts." } : result;
+      }),
   );
 
   server.registerTool(
@@ -759,7 +777,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Reply to email",
       description:
-        "Replies to a message from the Gmail account that received it (`account` is required when several are linked). Replies to the sender by default, or to everyone with `replyAll`. The original message is quoted below your text and the reply stays in the same thread. To reply to a thread, use get_thread and pass the ID of its latest message.",
+        "Replies to a message from the Gmail account that received it (`account` is required when several are linked). Replies to the sender by default, or to everyone with `replyAll`. The original message is quoted below your text and the reply stays in the same thread. To reply to a thread, use get_thread and pass the ID of its latest message. `to`/`cc` replace the computed recipients; the user's own addresses are never included.",
       inputSchema: {
         account: sendAccountArg,
         messageId: z.string().describe("Required. ID of the message to reply to."),
@@ -817,7 +835,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "List labels",
       description:
-        "Lists labels (system and user) with their IDs for one or all linked Gmail accounts. Label IDs differ between accounts.",
+        "Lists labels (system and user) with their IDs for one or all linked Gmail accounts (grouped by account when several). Label IDs differ between accounts.",
       inputSchema: { account: multiAccountArg },
       annotations: read,
     },

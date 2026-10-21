@@ -2296,3 +2296,39 @@ describe("bulk changes with IDs from another account", () => {
     assert.equal(fake.batchModifyCalls.length, 1);
   });
 });
+
+describe("descriptions and empty results", () => {
+  test("a search or draft list with nothing in it says so", async () => {
+    const { call } = await setup();
+    const none = await call("search_threads", { query: "from:nobody@nowhere.example" });
+    assert.equal(none.isError, false, none.text);
+    assert.deepEqual(none.json, { threads: [], note: "No threads matched." });
+    const one = await call("search_threads", { account: "work", query: "from:nobody@nowhere.example" });
+    assert.deepEqual(one.json, { account: WORK, threads: [], note: "No threads matched." });
+    assert.equal((await call("search_threads", { account: "work", query: "from:boss" })).json.note, undefined);
+    const drafts = await call("list_drafts", {});
+    assert.equal(drafts.json.note, "No drafts.");
+    assert.equal((await call("list_drafts", { account: "work", query: "subject:nothing" })).json.note, "No drafts matched.");
+    await call("create_draft", { account: "work", to: ["a@example.com"], subject: "W", body: "w" });
+    assert.equal((await call("list_drafts", {})).json.note, undefined);
+  });
+
+  test("the search help covers Gmail's operators, and the account arguments say how results come back", async () => {
+    const { client } = await setup();
+    const { tools } = await client.listTools();
+    const prop = (tool: string, name: string) => ((tools.find((t) => t.name === tool)!.inputSchema.properties as any)[name].description as string);
+    const help = prop("search_threads", "query");
+    for (const op of ["from:", "deliveredto:", "list:", "older_than:", "newer_than:", "subject:", "rfc822msgid:", "AROUND", "label:\"Board Prep\"", "category:", "in:", "in:draft", "is:", "has:", "filename:", "larger:", "{ }", "-is:starred"]) {
+      assert.ok(help.includes(op), `search help mentions ${op}`);
+    }
+    assert.match(prop("search_threads", "account"), /merged into one newest-first list/);
+    assert.match(prop("list_drafts", "account"), /grouped per account/);
+    assert.match(prop("bulk_update", "query"), /same syntax as search_threads/);
+    assert.match(tools.find((t) => t.name === "reply")!.description!, /the user's own addresses are never included/);
+    assert.match(tools.find((t) => t.name === "get_thread")!.description!, /Gmail, Apple Mail and Outlook quote styles/);
+    const { instructions } = { instructions: (client.getInstructions() ?? "") };
+    assert.match(instructions, /ISO 8601 in UTC/);
+    assert.match(instructions, /fromMe: true/);
+    assert.match(instructions, /shorter than pageSize/);
+  });
+});
