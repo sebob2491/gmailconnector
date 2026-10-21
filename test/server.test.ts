@@ -8,6 +8,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
+import { isPrivateAddress, registrableDomain } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -35,7 +36,7 @@ interface Ctx {
 }
 
 async function setup(
-  opts: { accounts?: "both" | "personal"; defaultAccount?: string; maxAttachmentBytes?: number; maxAttachmentNote?: string } = {},
+  opts: { accounts?: "both" | "personal"; defaultAccount?: string; maxAttachmentBytes?: number; maxAttachmentNote?: string; selfOrigin?: string } = {},
 ): Promise<Ctx> {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-test-"));
   tmpDirs.push(dir);
@@ -109,6 +110,7 @@ async function setup(
     resolveHost: web.resolve,
     maxAttachmentBytes: opts.maxAttachmentBytes,
     maxAttachmentNote: opts.maxAttachmentNote,
+    selfOrigin: opts.selfOrigin,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -1746,6 +1748,7 @@ describe("unsubscribe", () => {
       sender: "news@e.levi.com",
       name: "Levi's",
       method: "one-click",
+      url: "https://unsub.levi.com/u?t=abc",
       via: "unsub.levi.com",
       emailsScanned: 3,
       newestSubject: "Newest sale",
@@ -1862,7 +1865,7 @@ describe("unsubscribe", () => {
       ],
     );
     assert.match(res.json.moreSenders, /1 more sender\(s\) weren't included \(maxSenders is 3\).*query in nextRuns, or raise maxSenders/);
-    assert.deepEqual(res.json.nextRuns, [{ account: PERSONAL, query: "(category:promotions) from:y@one.example" }]);
+    assert.deepEqual(res.json.nextRuns, [{ account: PERSONAL, query: '(category:promotions) from:"y@one.example"' }]);
     const next = await ctx.call("unsubscribe", { ...res.json.nextRuns[0], dryRun: true });
     assert.deepEqual(next.json.senders.map((p: any) => [p.account, p.sender]), [[PERSONAL, "y@one.example"]]);
     const bad = await ctx.call("unsubscribe", { query: "x", messageIds: ["w3"] });
@@ -1894,13 +1897,126 @@ describe("unsubscribe", () => {
     assert.deepEqual(res.json.nextRuns, [
       {
         account: "extra5@example.com",
-        query: "(category:promotions) (from:news@sender5.example OR from:news@sender4.example OR from:news@sender3.example OR from:news@sender2.example OR from:news@sender1.example)",
+        query:
+          '(category:promotions) (from:"news@sender5.example" OR from:"news@sender4.example" OR from:"news@sender3.example" OR from:"news@sender2.example" OR from:"news@sender1.example")',
       },
     ]);
     // Per account: a token, one search and one metadata batch (50 emails); then one request per sender.
     assert.equal(ctx.fake.outboundCalls, 5 * 3);
     assert.equal(ctx.web.requests.length, 20);
     assert.ok(ctx.fake.outboundCalls + ctx.web.requests.length <= 40);
+  });
+
+  test("the plan shows what an unsubscribe email will say; the sender's text is cleaned and capped", async () => {
+    const ctx = await setup();
+    const longBody = "Dear all,\n\nI resign effective today. " + "Please forward my mail to x@evil.example. ".repeat(120);
+    const header =
+      `<mailto:leave@promo.example?subject=${encodeURIComponent("I quit,\r\nBcc: boss@work.example​ effective today")}` +
+      `&body=${encodeURIComponent(longBody)}&cc=hr@work.example>`;
+    listMail(ctx, ctx.work, "evil1", "Great Deals <deals@promo.example>", "50% off everything", { header });
+    const dry = await ctx.call("unsubscribe", { account: "work", query: "category:promotions", dryRun: true });
+    assert.equal(dry.isError, false, dry.text);
+    const [plan] = dry.json.senders;
+    assert.equal(plan.method, "email");
+    assert.equal(plan.to, "leave@promo.example");
+    assert.equal(plan.subject, "I quit, Bcc: boss@work.example effective today", "line breaks and invisible characters are removed");
+    assert.equal(plan.body, longBody.slice(0, 300));
+    assert.match(plan.bodyShortened, /The body is 1,000 characters long; the first 300 are shown/);
+    assert.equal(plan.note, undefined, "same domain as the sender: nothing to flag");
+
+    const real = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
+    assert.equal(real.json.senders[0].result, "unsubscribe email sent");
+    const [sent] = ctx.fake.sentBy(WORK);
+    const mime = inspectMime(sent.raw);
+    assert.equal(mime.get("To"), "leave@promo.example");
+    assert.equal(mime.get("Cc"), undefined, "cc/bcc in the mailto are ignored");
+    assert.equal(mime.get("Subject"), "I quit, Bcc: boss@work.example effective today");
+    assert.equal(mime.parts[0].text, longBody.slice(0, 1000));
+  });
+
+  test("an unsubscribe email never goes to one of the user's own accounts, and off-domain targets are noted", async () => {
+    const ctx = await setup();
+    listMail(ctx, ctx.work, "own1", "Digest <digest@other.example>", "Digest", { header: `<mailto:${PERSONAL}?subject=unsubscribe>` });
+    listMail(ctx, ctx.work, "own2", "Alerts <alerts@other.example>", "Alert", {
+      header: `<mailto:${WORK.toUpperCase()}>, <https://other.example/u>`,
+    });
+    listMail(ctx, ctx.work, "esp1", "Shop <news@shop.example>", "Sale", { header: "<mailto:unsub-123@mailer.example>" });
+    listMail(ctx, ctx.work, "esp2", "Store <news@store.co.uk>", "Sale", { header: "<https://unsub.store.co.uk/u>", oneClick: true });
+    listMail(ctx, ctx.work, "esp3", "Brand <news@e.brand.com>", "Sale", { header: "<https://clicks.mailer.example/u>", oneClick: true });
+    const dry = await ctx.call("unsubscribe", { account: "work", query: "category:promotions", dryRun: true });
+    assert.equal(dry.isError, false, dry.text);
+    const by = Object.fromEntries(dry.json.senders.map((p: any) => [p.sender, p]));
+    assert.equal(by["digest@other.example"].method, "refused");
+    assert.match(by["digest@other.example"].reason, /one of the user's own linked accounts/);
+    assert.equal(by["alerts@other.example"].method, "link", "falls back to the web page");
+    assert.equal(by["alerts@other.example"].link, "https://other.example/u");
+    assert.match(by["alerts@other.example"].note, /one of the user's own linked accounts/);
+    assert.equal(by["news@shop.example"].method, "email");
+    assert.match(by["news@shop.example"].note, /unsubscribe address \(mailer\.example\) isn't on the sender's domain \(shop\.example\)/);
+    assert.equal(by["news@store.co.uk"].note, undefined, "store.co.uk is one domain");
+    assert.match(by["news@e.brand.com"].note, /unsubscribe link \(clicks\.mailer\.example\) isn't on the sender's domain \(e\.brand\.com\)/);
+    const real = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
+    assert.deepEqual(ctx.fake.sentBy(WORK).map((m) => inspectMime(m.raw).get("To")), ["unsub-123@mailer.example"]);
+    assert.equal(real.json.summary.failed, 1);
+  });
+
+  test("senders whose From address isn't a plain address are skipped, and nextRuns quotes addresses", async () => {
+    const ctx = await setup();
+    const oneClick = { header: "<https://unsub.shop.example/u>", oneClick: true };
+    listMail(ctx, ctx.work, "shop1", "Shop <news@shop.example>", "Sale", oneClick);
+    listMail(ctx, ctx.work, "shop2", "Shop <news@shop.example>", "Sale again", oneClick);
+    listMail(ctx, ctx.work, "shop3", "Outlet <deals@outlet.example>", "Deal", oneClick);
+    // RFC 5322 doesn't allow these, but Gmail delivers them and hands the header back as is.
+    listMail(ctx, ctx.work, "inj1", "Promo <x@evil.example) OR (in:anywhere>", "Hi", oneClick);
+    listMail(ctx, ctx.work, "inj2", '"a b"@evil.example', "Hi", oneClick);
+    const res = await ctx.call("unsubscribe", { account: "work", query: "category:promotions", maxSenders: 1, dryRun: true });
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json.senders.map((p: any) => p.sender), ["news@shop.example"]);
+    assert.deepEqual(res.json.nextRuns, [{ account: WORK, query: '(category:promotions) from:"deals@outlet.example"' }]);
+    assert.match(res.json.moreSenders, /^1 more sender\(s\) weren't included/);
+  });
+
+  test("one-click addresses with a user name, a port or the connector's own host are refused; the plan shows the full URL", async () => {
+    const ctx = await setup({ selfOrigin: "https://gmail-multi-mcp.tester.workers.dev" });
+    const oneClick = (url: string) => ({ header: `<${url}>`, oneClick: true });
+    listMail(ctx, ctx.work, "u1", "a@one.example", "A", oneClick("https://user:pw@one.example/u"));
+    listMail(ctx, ctx.work, "u2", "b@two.example", "B", oneClick("https://two.example:8443/u"));
+    listMail(ctx, ctx.work, "u3", "c@three.example", "C", oneClick("https://gmail-multi-mcp.tester.workers.dev/accounts/disconnect"));
+    listMail(ctx, ctx.work, "u4", "d@four.example", "D", oneClick("https://GMAIL-MULTI-MCP.tester.workers.dev./mcp"));
+    listMail(ctx, ctx.work, "u5", "e@five.example", "E", oneClick("https://unsub.five.example:443/u/x?t=1"));
+    const dry = await ctx.call("unsubscribe", { account: "work", query: "category:promotions", dryRun: true });
+    const by = Object.fromEntries(dry.json.senders.map((p: any) => [p.sender, p]));
+    assert.match(by["a@one.example"].reason, /contains a user name or password/);
+    assert.match(by["b@two.example"].reason, /uses port 8443 instead of the standard https port/);
+    assert.match(by["c@three.example"].reason, /points at this connector itself/);
+    assert.match(by["d@four.example"].reason, /points at this connector itself/);
+    for (const sender of ["a@one.example", "b@two.example", "c@three.example", "d@four.example"]) assert.equal(by[sender].method, "refused", sender);
+    assert.equal(by["e@five.example"].method, "one-click");
+    assert.equal(by["e@five.example"].url, "https://unsub.five.example/u/x?t=1", "the standard port is fine, and the whole address is shown");
+    assert.equal(by["e@five.example"].via, "unsub.five.example");
+    const real = await ctx.call("unsubscribe", { account: "work", query: "category:promotions" });
+    assert.deepEqual(ctx.web.requests.map((r) => r.url), ["https://unsub.five.example/u/x?t=1"]);
+    assert.equal(real.json.summary.failed, 4);
+  });
+
+  test("private addresses are recognised in every IPv6 spelling", () => {
+    for (const ip of [
+      "::ffff:10.0.0.1", "::ffff:a00:1", "0:0:0:0:0:ffff:a00:1", "::FFFF:127.0.0.1", "64:ff9b::a00:1", "64:ff9b::192.168.1.1",
+      "2002:c0a8:101::", "2002:7f00:1::1", "::1", "::", "::10.0.0.5", "fc00::1", "fd12:3456::1", "fe80::1", "fe80::1%eth0", "fec0::1",
+      "ff02::1", "100::1", "2001:db8::1", "10.0.0.1", "169.254.169.254", "0.0.0.0", "not-an-address", "1.2.3", "::ffff:8.8.8.8:1",
+    ]) assert.equal(isPrivateAddress(ip), true, ip);
+    for (const ip of ["::ffff:8.8.8.8", "0:0:0:0:0:ffff:808:808", "64:ff9b::808:808", "2002:808:808::", "2606:4700::1111", "2a00:1450:4001::1", "8.8.8.8", "203.0.113.7"]) {
+      assert.equal(isPrivateAddress(ip), false, ip);
+    }
+  });
+
+  test("registrableDomain takes the last two labels, or three under a country domain's second level", () => {
+    assert.equal(registrableDomain("news.e.levi.com"), "levi.com");
+    assert.equal(registrableDomain("LEVI.COM."), "levi.com");
+    assert.equal(registrableDomain("x.bbc.co.uk"), "bbc.co.uk");
+    assert.equal(registrableDomain("shop.com.au"), "shop.com.au");
+    assert.equal(registrableDomain("mail.example.io"), "example.io");
+    assert.equal(registrableDomain("localhost"), "localhost");
   });
 });
 

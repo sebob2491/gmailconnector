@@ -7,11 +7,12 @@ import { AccountError, describeAccount, findAccount, type AccountSource, type Li
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, type FetchLike } from "./google.js";
 import { attachmentResult, FileTooLargeError, kindOf, readOffice, readPdf, readTextFile, sniffType, type ReadResult } from "./attachments.js";
-import { attachmentCharset, DEFAULT_MAX_BODY_CHARS, viewUrl } from "./format.js";
+import { attachmentCharset, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
 import {
   isPrivateAddress,
   Mailbox,
   mapLimit,
+  registrableDomain,
   unsafeUnsubscribeHost,
   type MailboxOptions,
   unsubscribeOptions,
@@ -340,6 +341,11 @@ export interface ServerDeps {
   /** Looks up a host's IP addresses so private ones can be refused. Defaults to systemResolveHost. */
   resolveHost?: (hostname: string) => Promise<string[]>;
   /**
+   * The hosted connector's own origin (e.g. https://name.sub.workers.dev), so a one-click
+   * unsubscribe request is never sent to the connector itself. The local version has none.
+   */
+  selfOrigin?: string;
+  /**
    * Most attachment bytes forward and update_draft re-attach, when lower than Gmail's 25 MB (the
    * hosted connector's CPU and memory limits), with a note telling the user how it can be raised.
    */
@@ -348,8 +354,12 @@ export interface ServerDeps {
 }
 
 /**
- * Looks up a host with the system resolver (Node). Skipped in Cloudflare Workers, whose fetch already
- * refuses private addresses (global_fetch_strictly_public) and where a lookup would cost a subrequest.
+ * Looks up a host with the system resolver (Node), so a name that points into the local network can
+ * be refused. Skipped in Cloudflare Workers, where a lookup would cost a subrequest and Cloudflare's
+ * network does not route to private addresses anyway. (The Worker's global_fetch_strictly_public
+ * flag is not a private-address filter: it makes fetch() treat every request as one from the public
+ * Internet, including requests to the Worker's own zone, instead of routing those straight to the
+ * origin.) The host-name checks in unsafeUnsubscribeHost still apply everywhere, as defence in depth.
  */
 export async function systemResolveHost(hostname: string): Promise<string[]> {
   if ((globalThis as { navigator?: { userAgent?: string } }).navigator?.userAgent === "Cloudflare-Workers") return [];
@@ -362,17 +372,20 @@ export async function systemResolveHost(hostname: string): Promise<string[]> {
   }
 }
 
-/** How one sender will be unsubscribed from, or why it can't be. */
-type UnsubscribePlan =
+/** How one sender will be unsubscribed from, or why it can't be, with anything the user should know. */
+type UnsubscribePlan = (
   | { method: "one-click"; url: string }
-  | { method: "email"; mail: NonNullable<UnsubscribeOptions["mailto"]>; note?: string }
+  | { method: "email"; mail: NonNullable<UnsubscribeOptions["mailto"]> }
   | { method: "link"; link: string }
   | { method: "refused"; reason: string }
-  | { method: "none" };
+  | { method: "none" }
+) & { note?: string };
 
 const NO_UNSUBSCRIBE_NOTE =
   "This sender's emails have no unsubscribe header. Clear them with bulk_trash or bulk_update, or set up a Gmail filter for this sender.";
 const ONE_CLICK_TIMEOUT_MS = 10_000;
+/** How much of an unsubscribe email's body the plan shows. */
+const PLAN_BODY_CHARS = 300;
 
 export function createServer(deps: ServerDeps): McpServer {
   const fetchImpl = deps.fetchImpl ?? defaultFetch;
@@ -1061,26 +1074,65 @@ export function createServer(deps: ServerDeps): McpServer {
 
   const webFetch = deps.webFetch ?? defaultFetch;
   const resolveHost = deps.resolveHost ?? systemResolveHost;
+  const ownHost = deps.selfOrigin ? new URL(deps.selfOrigin).hostname : undefined;
 
   /** Why a one-click URL must not be contacted (an IP address, a local name, or a name for a private address). */
   const oneClickRefusal = async (href: string): Promise<string | undefined> => {
     const url = new URL(href);
-    const unsafe = unsafeUnsubscribeHost(url);
+    const unsafe = unsafeUnsubscribeHost(url, { ownHost });
     if (unsafe) return unsafe;
     const addresses = await resolveHost(url.hostname).catch(() => [] as string[]);
     const internal = addresses.find(isPrivateAddress);
     return internal ? `${url.hostname} leads to a private network address (${internal})` : undefined;
   };
 
-  const planFor = async (group: SenderGroup): Promise<UnsubscribePlan> => {
+  /** A hint when an unsubscribe target isn't on the sender's own domain (many senders use a mailing service, so only a hint). */
+  const offDomain = (what: "address" | "link", targetHost: string, sender: string): string | undefined => {
+    const senderHost = sender.split("@")[1];
+    if (!senderHost || registrableDomain(targetHost) === registrableDomain(senderHost)) return undefined;
+    return `The unsubscribe ${what} (${targetHost}) isn't on the sender's domain (${senderHost}); many senders use a mailing service for this, but check that it looks right.`;
+  };
+
+  /**
+   * The plan for one sender: the one-click request when its address is safe to contact, else the
+   * unsubscribe email unless it would go to one of the user's own accounts (`linked`), else a link
+   * for the user (never one that was just refused).
+   */
+  const planFor = async (group: SenderGroup, linked: Set<string>): Promise<UnsubscribePlan> => {
     const options = unsubscribeOptions(group.newest.listUnsubscribe, group.newest.listUnsubscribePost);
-    const refused = options.oneClick ? await oneClickRefusal(options.oneClick) : undefined;
-    if (options.oneClick && !refused) return { method: "one-click", url: options.oneClick };
-    const why = refused && `The one-click address wasn't used: ${refused}.`;
-    if (options.mailto) return { method: "email", mail: options.mailto, ...(why ? { note: why } : {}) };
-    if (why) return { method: "refused", reason: why };
-    if (options.link) return { method: "link", link: options.link };
+    const notes: string[] = [];
+    const withNotes = <T extends UnsubscribePlan>(plan: T, hint?: string): T => {
+      const all = [...notes, ...(hint ? [hint] : [])];
+      return all.length ? { ...plan, note: all.join(" ") } : plan;
+    };
+    let refusedUrl: string | undefined;
+    if (options.oneClick) {
+      const refused = await oneClickRefusal(options.oneClick);
+      if (!refused) return withNotes({ method: "one-click", url: options.oneClick }, offDomain("link", new URL(options.oneClick).hostname, group.address));
+      refusedUrl = options.oneClick;
+      notes.push(`The one-click address wasn't used: ${refused}.`);
+    }
+    if (options.mailto) {
+      if (linked.has(options.mailto.to.toLowerCase())) {
+        notes.push(`The unsubscribe email wasn't used: its address (${options.mailto.to}) is one of the user's own linked accounts.`);
+      } else {
+        return withNotes({ method: "email", mail: options.mailto }, offDomain("address", options.mailto.to.split("@")[1], group.address));
+      }
+    }
+    if (options.link && options.link !== refusedUrl) return withNotes({ method: "link", link: options.link });
+    if (notes.length) return { method: "refused", reason: notes.join(" ") };
     return { method: "none" };
+  };
+
+  /** What an unsubscribe email will say, so the user can judge it before it is sent. */
+  const describeMail = (mail: NonNullable<UnsubscribeOptions["mailto"]>) => {
+    const { text, omitted } = limitLength(mail.body, PLAN_BODY_CHARS);
+    return {
+      to: mail.to,
+      subject: mail.subject,
+      body: text,
+      ...(omitted ? { bodyShortened: `The body is ${mail.body.length.toLocaleString("en-US")} characters long; the first ${PLAN_BODY_CHARS} are shown.` } : {}),
+    };
   };
 
   const describePlan = (account: string, group: SenderGroup, plan: UnsubscribePlan) => ({
@@ -1088,11 +1140,11 @@ export function createServer(deps: ServerDeps): McpServer {
     sender: group.address,
     ...(group.name ? { name: group.name } : {}),
     method: plan.method,
-    ...(plan.method === "one-click" ? { via: new URL(plan.url).hostname } : {}),
-    ...(plan.method === "email" ? { to: plan.mail.to, ...(plan.note ? { note: plan.note } : {}) } : {}),
+    ...(plan.method === "one-click" ? { url: plan.url, via: new URL(plan.url).hostname } : {}),
+    ...(plan.method === "email" ? describeMail(plan.mail) : {}),
     ...(plan.method === "link" ? { link: plan.link } : {}),
     ...(plan.method === "refused" ? { reason: plan.reason } : {}),
-    ...(plan.method === "none" ? { note: NO_UNSUBSCRIBE_NOTE } : {}),
+    ...(plan.method === "none" ? { note: NO_UNSUBSCRIBE_NOTE } : plan.note ? { note: plan.note } : {}),
     emailsScanned: group.count,
     newestSubject: group.newest.subject,
     ...(group.newest.date ? { newestDate: group.newest.date } : {}),
@@ -1150,7 +1202,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Unsubscribe from senders",
       description:
-        "Unsubscribes the user from newsletters and store or alert emails, in one or every linked account. Choose the emails with a Gmail search `query` (e.g. \"from:levi.com\" or \"category:promotions newer_than:30d\"; every account by default) or `messageIds` from one account. The newest matching emails are grouped by account and sender, and each sender is unsubscribed once, the way its emails' List-Unsubscribe header offers: `one-click` (the connector sends the sender's standard one-click request), `email` (sends an unsubscribe email from that account; it shows up in Sent), `link` (the sender only offers a web page: give the user the link; the connector never opens links), or `none` (no unsubscribe option: suggest bulk_trash or bulk_update, or a Gmail filter). ALWAYS run with dryRun: true first, show the user the plan (account, sender, method) and get their OK before running it for real. Afterwards, bulk_update (archive) or bulk_trash with the same query can clear the emails already received. Don't use it on spam: unsubscribing confirms the address to spammers, so mark it as spam with bulk_trash instead.",
+        "Unsubscribes the user from newsletters and store or alert emails, in one or every linked account. Choose the emails with a Gmail search `query` (e.g. \"from:levi.com\" or \"category:promotions newer_than:30d\"; every account by default) or `messageIds` from one account. The newest matching emails are grouped by account and sender, and each sender is unsubscribed once, the way its emails' List-Unsubscribe header offers: `one-click` (the connector sends the sender's standard one-click request to the `url` in the plan), `email` (sends a message written by the sender to an address the sender chose, from that account; it shows up in Sent: show the user `to`, `subject` and `body` before running it), `link` (the sender only offers a web page: give the user the link; the connector never opens links), or `none` (no unsubscribe option: suggest bulk_trash or bulk_update, or a Gmail filter). Senders with `method: none` are often transactional (orders, invites, receipts): don't suggest trashing them without asking. A plan's `note` says when something about it looks off. ALWAYS run with dryRun: true first, show the user the plan (account, sender, method and where the request goes) and get their OK before running it for real. Afterwards, bulk_update (archive) or bulk_trash with the same query can clear the emails already received. Don't use it on spam: unsubscribing confirms the address to spammers, so mark it as spam with bulk_trash instead.",
       inputSchema: {
         account: z
           .string()
@@ -1194,13 +1246,16 @@ export function createServer(deps: ServerDeps): McpServer {
         const found = scans
           .flatMap((s) => s.senders.map((group) => ({ mb: s.mb, group })))
           .sort((x, y) => y.group.count - x.group.count || y.group.newest.time - x.group.newest.time);
-        const chosen = await Promise.all(found.slice(0, maxSenders).map(async (f) => ({ ...f, plan: await planFor(f.group) })));
+        // An unsubscribe email must never go to one of the user's own inboxes.
+        const linked = new Set((await store.load()).accounts.map((a) => a.email.toLowerCase()));
+        const chosen = await Promise.all(found.slice(0, maxSenders).map(async (f) => ({ ...f, plan: await planFor(f.group, linked) })));
         // Their emails stay in the mailbox, so the same query would find the same senders first again:
-        // the rest are handed back as a search for just them, per account.
+        // the rest are handed back as a search for just them, per account. Addresses are quoted so
+        // nothing in them can be read as a search operator.
         const rest = new Map<string, string[]>();
         for (const f of found.slice(maxSenders)) rest.set(f.mb.email, [...(rest.get(f.mb.email) ?? []), f.group.address]);
         const nextRuns = [...rest].map(([account, senders]) => {
-          const from = senders.length === 1 ? `from:${senders[0]}` : `(${senders.map((a) => `from:${a}`).join(" OR ")})`;
+          const from = senders.length === 1 ? `from:"${senders[0]}"` : `(${senders.map((a) => `from:"${a}"`).join(" OR ")})`;
           return { account, query: args.query?.trim() ? `(${args.query}) ${from}` : from };
         });
         const extra = {

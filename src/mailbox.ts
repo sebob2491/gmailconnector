@@ -9,6 +9,7 @@ import {
   extractContent,
   formatMessage,
   header,
+  limitLength,
   parseMailboxes,
   recipientsFrom,
   viewUrl,
@@ -344,6 +345,21 @@ export interface UnsubscribeOptions {
   link?: string;
 }
 
+/** Longest subject and body taken from a mailto: unsubscribe link; the rest is cut off. */
+export const MAX_UNSUBSCRIBE_SUBJECT = 200;
+export const MAX_UNSUBSCRIBE_BODY = 1000;
+
+/**
+ * Text from a mailto: link, fit to be sent: control and invisible format characters removed (line
+ * breaks and tabs stay in a body), cut to `max` characters.
+ */
+function unsubscribeText(text: string, max: number, multiline: boolean): string {
+  const clean = multiline
+    ? text.replace(/\r\n?/g, "\n").replace(/[^\P{Cc}\n\t]|\p{Cf}/gu, "")
+    : text.replace(/[\r\n]+/g, " ").replace(/[\p{Cc}\p{Cf}]/gu, "");
+  return limitLength(clean.trim(), max).text;
+}
+
 export function unsubscribeOptions(listUnsubscribe: string | undefined, listUnsubscribePost: string | undefined): UnsubscribeOptions {
   if (!listUnsubscribe) return {};
   // Entries are <uri>, comma separated; a few senders leave out the angle brackets.
@@ -371,8 +387,8 @@ export function unsubscribeOptions(listUnsubscribe: string | undefined, listUnsu
       if (!isValidAddress(to)) continue;
       out.mailto = {
         to,
-        subject: url.searchParams.get("subject")?.trim() || "unsubscribe",
-        body: url.searchParams.get("body") ?? "unsubscribe",
+        subject: unsubscribeText(url.searchParams.get("subject") ?? "", MAX_UNSUBSCRIBE_SUBJECT, false) || "unsubscribe",
+        body: unsubscribeText(url.searchParams.get("body") ?? "unsubscribe", MAX_UNSUBSCRIBE_BODY, true),
       };
     }
   }
@@ -382,38 +398,110 @@ export function unsubscribeOptions(listUnsubscribe: string | undefined, listUnsu
 const LOCAL_SUFFIXES = [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain"];
 
 /**
- * Why a one-click unsubscribe URL must not be contacted, or undefined if it may. Only https to a
- * named public host is allowed: no IP addresses (which also covers every private and link-local
- * range) and no local names. A name that resolves to a private address is checked separately.
+ * Why a one-click unsubscribe URL must not be contacted, or undefined if it may. Only plain https
+ * (standard port, no user name) to a named public host is allowed: no IP addresses (which also
+ * covers every private and link-local range), no local names, and never the connector's own host
+ * (`ownHost`). A name that resolves to a private address is checked separately.
  */
-export function unsafeUnsubscribeHost(url: URL): string | undefined {
+export function unsafeUnsubscribeHost(url: URL, opts: { ownHost?: string } = {}): string | undefined {
   if (url.protocol !== "https:") return "it isn't an https address";
+  if (url.username || url.password) return "it contains a user name or password";
+  // The parser drops the standard port, so any port left is a non-standard one.
+  if (url.port) return `it uses port ${url.port} instead of the standard https port`;
   // The URL parser already turned forms like 0x7f.1 or 2130706433 into 127.0.0.1.
   const host = url.hostname.toLowerCase().replace(/\.$/, "");
   if (host.startsWith("[") || /^\d+(\.\d+){3}$/.test(host)) return `it points to an IP address (${host}), not a website`;
   if (host === "localhost" || !host.includes(".") || LOCAL_SUFFIXES.some((s) => host.endsWith(s))) {
     return `it points to a local network name (${host}), not a website`;
   }
+  if (opts.ownHost && host === opts.ownHost.toLowerCase().replace(/\.$/, "")) return "it points at this connector itself";
   return undefined;
 }
 
-/** True for loopback, private, link-local, shared (CGNAT), multicast and other non-public addresses. */
-export function isPrivateAddress(ip: string): boolean {
-  const v4 = /^(?:::ffff:)?(\d+)\.(\d+)\.(\d+)\.(\d+)$/i.exec(ip);
-  if (v4) {
-    const [a, b, c] = [Number(v4[1]), Number(v4[2]), Number(v4[3])];
-    return (
-      a === 0 || a === 10 || a === 127 || a >= 224 ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 192 && b === 0 && c === 0) ||
-      (a === 198 && (b === 18 || b === 19))
-    );
+/** Labels under which two-letter country domains hand out names (co.uk, com.au, …): a hint, not the public suffix list. */
+const COUNTRY_SECOND_LEVEL = new Set(["com", "co", "org", "net", "gov", "edu", "ac", "ne", "or", "go", "gob", "mil"]);
+
+/**
+ * The part of a host name its owner registered, by a simple rule: the last two labels, or three
+ * under a country domain's second level ("news.e.levi.com" → "levi.com", "x.bbc.co.uk" → "bbc.co.uk").
+ */
+export function registrableDomain(host: string): string {
+  const labels = host.toLowerCase().replace(/\.$/, "").split(".");
+  const take = labels.length > 2 && labels[labels.length - 1].length === 2 && COUNTRY_SECOND_LEVEL.has(labels[labels.length - 2]) ? 3 : 2;
+  return labels.slice(-take).join(".");
+}
+
+/** The four bytes of a dotted-quad IPv4 address, or undefined. */
+function ipv4Bytes(ip: string): number[] | undefined {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  const bytes = m?.slice(1).map(Number);
+  return bytes?.every((b) => b <= 255) ? bytes : undefined;
+}
+
+/**
+ * The 16 bytes of an IPv6 address in any textual form (compressed or not, with an embedded IPv4
+ * address such as ::ffff:10.0.0.1, with a zone id), or undefined if it isn't one.
+ */
+function ipv6Bytes(ip: string): number[] | undefined {
+  let text = ip.replace(/%.*$/, "").toLowerCase();
+  const embedded = /(?<=:)\d{1,3}(?:\.\d{1,3}){3}$/.exec(text);
+  if (embedded) {
+    const b = ipv4Bytes(embedded[0]);
+    if (!b) return undefined;
+    text = `${text.slice(0, embedded.index)}${((b[0] << 8) | b[1]).toString(16)}:${((b[2] << 8) | b[3]).toString(16)}`;
   }
-  const v6 = ip.toLowerCase();
-  return v6 === "::" || v6 === "::1" || /^f[cd]/.test(v6) || /^fe[89ab]/.test(v6) || v6.startsWith("ff") || v6.startsWith("::ffff:");
+  const halves = text.split("::");
+  if (halves.length > 2) return undefined;
+  const groups = (part: string) => (part ? part.split(":") : []).map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN));
+  const head = groups(halves[0]);
+  const tail = halves.length === 2 ? groups(halves[1]) : [];
+  const missing = 8 - head.length - tail.length;
+  if ([...head, ...tail].some(Number.isNaN) || missing < 0 || (halves.length === 1 && missing !== 0)) return undefined;
+  return [...head, ...new Array<number>(missing).fill(0), ...tail].flatMap((g) => [g >> 8, g & 0xff]);
+}
+
+/** Loopback, private, link-local, shared (CGNAT), multicast, benchmark and other non-public IPv4 ranges. */
+function privateV4(bytes: number[]): boolean {
+  const [a, b, c] = bytes;
+  return (
+    a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 0) ||
+    (a === 198 && (b === 18 || b === 19))
+  );
+}
+
+/**
+ * True for loopback, private, link-local, shared (CGNAT), multicast and other non-public addresses,
+ * IPv4 or IPv6. IPv6 forms that carry an IPv4 address (IPv4-mapped ::ffff:0:0/96, NAT64 64:ff9b::/96,
+ * 6to4 2002::/16, and the old IPv4-compatible ::/96) are judged by that address. Anything that
+ * isn't an address at all counts as private.
+ */
+export function isPrivateAddress(ip: string): boolean {
+  const v4 = ipv4Bytes(ip);
+  if (v4) return privateV4(v4);
+  const v6 = ipv6Bytes(ip);
+  if (!v6) return true;
+  const startsWith = (...prefix: number[]) => prefix.every((b, i) => v6[i] === b);
+  if (startsWith(...new Array<number>(10).fill(0), 0xff, 0xff)) return privateV4(v6.slice(12)); // ::ffff:a.b.c.d
+  if (startsWith(0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0)) return privateV4(v6.slice(12)); // 64:ff9b::a.b.c.d (NAT64)
+  if (startsWith(...new Array<number>(12).fill(0))) {
+    const last = v6.slice(12);
+    return last.every((b) => b === 0) || (last[0] === 0 && last[1] === 0 && last[2] === 0 && last[3] === 1) || privateV4(last); // ::, ::1, ::a.b.c.d
+  }
+  if (startsWith(0x20, 0x02)) return privateV4(v6.slice(2, 6)); // 2002:a.b.c.d:: (6to4)
+  return (
+    (v6[0] & 0xfe) === 0xfc || // fc00::/7 unique local
+    (v6[0] === 0xfe && (v6[1] & 0xc0) === 0x80) || // fe80::/10 link-local
+    (v6[0] === 0xfe && (v6[1] & 0xc0) === 0xc0) || // fec0::/10 site-local (deprecated)
+    v6[0] === 0xff || // multicast
+    v6[0] === 0 || // the rest of ::/8 (reserved)
+    startsWith(0x01, 0, 0, 0, 0, 0, 0, 0) || // 100::/64 discard
+    startsWith(0x20, 0x01, 0x0d, 0xb8) // 2001:db8::/32 documentation
+  );
 }
 
 export interface MailboxOptions {
@@ -1138,7 +1226,9 @@ export class Mailbox {
       if (msg.labelIds?.includes("DRAFT")) continue;
       const from = parseMailboxes(header(msg.payload, "From"))[0];
       const address = from?.address.toLowerCase();
-      if (!address || address === self) continue;
+      // A From header that isn't a plain address (a crafted one can hold search operators or quotes)
+      // can't be searched for or unsubscribed from safely, so it is left out like this account's own mail.
+      if (!address || address === self || !isValidAddress(address) || address.includes('"')) continue;
       scanned++;
       const time = Number(msg.internalDate ?? 0);
       const group = senders.get(address) ?? { address, count: 0, newest: { id: "", subject: "", time: -1 } };

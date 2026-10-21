@@ -51,8 +51,14 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   put in their emails' headers: the standard one-click request (sent by the connector, only to public
   https addresses), an unsubscribe email from that account (it shows in Sent), or, when the sender only
   offers a web page, the link for you to open (the connector never opens links). Claude is told to show
-  you the plan first (`dryRun`) and to ask before doing it. Up to 10 senders per run (`maxSenders` up to
-  20); the emails you already have stay until you archive or trash them with the bulk tools.
+  you the plan first (`dryRun`) and to ask before doing it. The plan shows where each request goes: the
+  full one-click address, or the recipient, subject and body of an unsubscribe email (all three come
+  from the sender's own email, so the subject and body are capped at 200 and 1,000 characters). One-click
+  requests only go to public https sites on the standard port, never to the connector itself or to an
+  address inside a private network; an unsubscribe email is never sent to one of your own linked
+  accounts; and the plan notes when an unsubscribe address isn't on the sender's own domain. Up to 10
+  senders per run (`maxSenders` up to 20); the emails you already have stay until you archive or trash
+  them with the bulk tools.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`.
   Results are compact: one-email threads are shown flat, previews are cleaned of the invisible padding

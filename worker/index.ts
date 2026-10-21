@@ -96,6 +96,7 @@ const mcpHandler = {
       tokens: tokenProviderFor(env, origin),
       manageHint: `To link or remove Gmail accounts, open ${origin}/accounts`,
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
+      selfOrigin: origin,
       ...forwardLimit(env),
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
