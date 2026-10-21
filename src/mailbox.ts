@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { sameMailbox } from "./accounts.js";
 import { GmailApiError, GmailClient, type BatchResult } from "./gmailClient.js";
 import { AuthError } from "./google.js";
 import {
@@ -12,8 +13,10 @@ import {
   limitLength,
   parseMailboxes,
   recipientsFrom,
+  stripInvisible,
   viewUrl,
   type ApiMessage,
+  type ApiMessagePart,
   type AttachmentInfo,
   type ExtractedContent,
   type FormatOptions,
@@ -21,12 +24,14 @@ import {
   type MessageFormat,
 } from "./format.js";
 import {
+  attachmentSize,
   Base64UrlData,
   buildMimeChunks,
   decodeBase64,
   escapeHtml,
   htmlToText,
   isValidAddress,
+  latin1,
   MAX_ATTACHMENT_BYTES,
   MimeError,
   type MimeChunk,
@@ -50,9 +55,21 @@ export interface ComposeInput {
   body?: string;
   htmlBody?: string;
   attachments?: AttachmentInput[];
+  /** Append the account's Gmail signature (see Mailbox.signature). */
+  includeSignature?: boolean;
 }
 
 export type ThreadView = "THREAD_VIEW_MINIMAL" | "THREAD_VIEW_METADATA_ONLY";
+
+export interface SearchOptions {
+  query?: string;
+  pageSize?: number;
+  pageToken?: string;
+  includeTrash?: boolean;
+  view?: ThreadView;
+  /** Leave out this many threads at the start of the page (ones a merged timeline already showed). */
+  skip?: number;
+}
 export type DraftView = "DRAFT_VIEW_METADATA_ONLY" | "DRAFT_VIEW_FULL";
 
 export const LABEL_COLOR_PRESETS: Record<string, { backgroundColor: string; textColor: string }> = {
@@ -113,6 +130,18 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) =>
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+/**
+ * Recipient arguments as given ("user@example.com") or with a display name ("Ann Lee <ann@example.com>",
+ * which is kept for the header). A value that holds no address at all is passed on as it is, so the
+ * address check names it.
+ */
+function recipients(values: string[] | undefined): Recipient[] | undefined {
+  return values?.flatMap((value): Recipient[] => {
+    const parsed = parseMailboxes(value);
+    return parsed.length ? parsed : [value];
+  });
 }
 
 function toAttachments(inputs: AttachmentInput[] | undefined): OutgoingAttachment[] {
@@ -205,6 +234,9 @@ export interface BulkSelector {
   messageIds?: string[];
 }
 
+/** What to tell Claude when an ID isn't found: it usually came from another account's results. */
+export const WRONG_ACCOUNT_HINT = "IDs belong to one account; pass the account that returned them.";
+
 /** The emails a bulk change will touch, plus what's left over beyond maxEmails. */
 type Selection = {
   ids: string[];
@@ -213,41 +245,61 @@ type Selection = {
   unavailable?: Record<string, unknown>;
 } & (
   | { kind: "query"; /** Changed emails stop matching, so running the change again continues. */ resumable: boolean }
-  | { kind: "threads"; remainingThreadIds: string[]; threadOf: Map<string, string> }
+  | {
+      kind: "threads";
+      /** The given thread IDs, duplicates removed. */
+      threadIds: string[];
+      remainingThreadIds: string[];
+      threadOf: Map<string, string>;
+      /** Given IDs that don't exist in this account. */
+      notFound: string[];
+    }
   | { kind: "messages"; remainingMessageIds: string[] }
 );
 
+/** Lists of IDs to pass next time are returned in full up to this many; beyond that, their count and where they start. */
+const REMAINING_LIST_MAX = 100;
+
 /**
  * Says how to continue a bulk change that didn't cover everything: emails beyond maxEmails, and
- * `notDone` emails a failed run didn't get to. ID selections get the IDs to pass next time.
+ * `notDone` emails a failed run didn't get to. ID selections get the IDs to pass next time, or when
+ * there are many, their count and where they start in the given list (which Claude still holds).
+ * `resume` is the instruction itself, for messages that explain how to go on.
  */
-function bulkLeftOver(selection: Selection, max: number, notDone: string[] = []) {
+function bulkLeftOver(selection: Selection, max: number, notDone: string[] = []): { fields: Record<string, unknown>; resume?: string } {
   const limit = `maxEmails can go up to 2,000.`;
   if (selection.kind === "query") {
-    if (!selection.more) return {};
+    if (!selection.more) return { fields: {} };
     return {
-      more: selection.resumable
-        ? `More emails match than the limit of ${max}; each run changes the newest ${max}. Run the same change again to continue (emails already changed no longer match). ${limit}`
-        : `More emails match than the limit of ${max}; each run changes the newest ${max}. Running it again would pick the same emails, so raise maxEmails or narrow the query. ${limit}`,
+      fields: {
+        more: selection.resumable
+          ? `More emails match than the limit of ${max}; each run changes the newest ${max}. Run the same change again to continue (emails already changed no longer match). ${limit}`
+          : `More emails match than the limit of ${max}; each run changes the newest ${max}. Running it again would pick the same emails, so raise maxEmails or narrow the query. ${limit}`,
+      },
     };
   }
-  if (selection.kind === "threads") {
-    const remainingThreadIds = [...new Set([...notDone.map((id) => selection.threadOf.get(id)!), ...selection.remainingThreadIds])];
-    if (!remainingThreadIds.length) return {};
-    return {
-      ...(selection.more
-        ? { more: `These threads hold more than ${max} emails to change; each run changes ${max}. To continue, run it again with threadIds set to remainingThreadIds. ${limit}` }
-        : {}),
-      remainingThreadIds,
-    };
-  }
-  const remainingMessageIds = [...notDone, ...selection.remainingMessageIds];
-  if (!remainingMessageIds.length) return {};
+  const threads = selection.kind === "threads";
+  const given = threads ? selection.threadIds : [...selection.ids, ...selection.remainingMessageIds];
+  const remaining = threads
+    ? [...new Set([...notDone.map((id) => selection.threadOf.get(id)!), ...selection.remainingThreadIds])]
+    : [...notDone, ...selection.remainingMessageIds];
+  if (!remaining.length) return { fields: {} };
+  // What's left is the given list from its first unfinished ID on (duplicates removed), so a long
+  // list needn't be echoed back: Claude has it.
+  const key = threads ? "threadIds" : "messageIds";
+  const field = threads ? "remainingThreadIds" : "remainingMessageIds";
+  const listed = remaining.length <= REMAINING_LIST_MAX;
+  const which = listed ? field : `the ${remaining.length} IDs after the first ${given.indexOf(remaining[0])} you gave (duplicates removed)`;
+  const resume = `run it again with ${key} set to ${which}`;
+  const why = threads
+    ? `These threads hold more than ${max} emails to change; each run changes ${max}.`
+    : `Only ${max} of the given emails are changed per run (maxEmails).`;
   return {
-    ...(selection.more
-      ? { more: `Only ${max} of the given emails are changed per run (maxEmails). To continue, run it again with messageIds set to remainingMessageIds. ${limit}` }
-      : {}),
-    remainingMessageIds,
+    fields: {
+      ...(selection.more ? { more: `${why} To continue, ${resume}. ${limit}` } : {}),
+      ...(listed ? { [field]: remaining } : { remainingCount: remaining.length, remainingHint: `Pass ${which} as ${key} next time.` }),
+    },
+    resume,
   };
 }
 
@@ -519,23 +571,147 @@ const DIRECT_FETCH_BYTES = 64 * 1024;
 const MAX_DIRECT_FETCHES = 8;
 
 /**
+ * The attachments of a message, read from its part tree alone (no body is decoded), by the same
+ * rules as extractContent: attached emails, and any part with a file name or an attachment ID that
+ * isn't the body text.
+ */
+export function listAttachments(payload: ApiMessagePart | undefined): AttachmentInfo[] {
+  const attachments: AttachmentInfo[] = [];
+  const add = (part: ApiMessagePart, fallbackName: string) => {
+    const disposition = (header(part, "Content-Disposition") ?? "").toLowerCase();
+    const contentId = header(part, "Content-ID")?.replace(/^<|>$/g, "");
+    attachments.push({
+      id: part.body?.attachmentId,
+      partId: part.partId,
+      filename: part.filename || fallbackName,
+      mimeType: part.mimeType ?? "application/octet-stream",
+      size: part.body?.size ?? 0,
+      inline: disposition.startsWith("inline") || (!disposition && Boolean(contentId)),
+      ...(contentId ? { contentId } : {}),
+    });
+  };
+  const walk = (part: ApiMessagePart) => {
+    const mimeType = (part.mimeType ?? "").toLowerCase();
+    if (mimeType.startsWith("message/")) {
+      if (part.body?.attachmentId || part.filename) add(part, "attached-message.eml");
+      else for (const child of part.parts ?? []) walk(child);
+      return;
+    }
+    if (part.parts?.length) {
+      for (const child of part.parts) walk(child);
+      return;
+    }
+    const disposition = (header(part, "Content-Disposition") ?? "").toLowerCase();
+    const isBodyText = (mimeType === "text/plain" || mimeType === "text/html") && !part.filename && !disposition.startsWith("attachment");
+    if (!isBodyText && (part.filename || part.body?.attachmentId)) add(part, "(unnamed)");
+  };
+  if (payload) walk(payload);
+  return attachments;
+}
+
+/** Base64url text is decoded natively in pieces of this many characters (a multiple of 4). */
+const DECODE_CHUNK = 3 * 1024 * 1024;
+
+/**
+ * Decodes base64url text given as bytes, piece by piece into one buffer sized for the result, so
+ * that no string of the whole text is ever built: the peak is the text plus the file.
+ */
+export function decodeBase64Url(data: Uint8Array): Buffer {
+  let n = data.length;
+  while (n && data[n - 1] === 0x3d) n--; // "=" padding
+  const out = Buffer.allocUnsafe(Math.floor((n * 3) / 4));
+  let written = 0;
+  for (let start = 0; start < n; start += DECODE_CHUNK) {
+    written += Buffer.from(latin1(data.subarray(start, Math.min(start + DECODE_CHUNK, n))), "base64url").copy(out, written);
+  }
+  return written === out.length ? out : out.subarray(0, written);
+}
+
+/** Where the base64url value of a `"data"` key starts and ends in raw JSON, from `from` on. */
+function dataValueAt(json: Uint8Array, from: number): { key: number; start: number; end: number } | undefined {
+  const view = Buffer.from(json.buffer, json.byteOffset, json.byteLength);
+  for (let key = view.indexOf('"data"', from); key >= 0; key = view.indexOf('"data"', key + 6)) {
+    let start = key + 6;
+    const space = (b: number) => b === 0x20 || b === 0x0a || b === 0x0d || b === 0x09;
+    while (start < json.length && space(json[start])) start++;
+    if (json[start] !== 0x3a) continue; // not a key
+    start++;
+    while (start < json.length && space(json[start])) start++;
+    if (json[start] !== 0x22) continue;
+    const end = view.indexOf(0x22, start + 1); // base64url holds no quotes or escapes
+    if (end > start) return { key, start: start + 1, end };
+  }
+  return undefined;
+}
+
+/**
  * The base64url text of an attachments.get answer, sliced out of the raw JSON without parsing it
  * (base64url has no characters JSON would escape). Falls back to parsing for any other shape.
  */
 export function attachmentDataOf(json: Uint8Array): Uint8Array {
-  const view = Buffer.from(json.buffer, json.byteOffset, json.byteLength);
-  const key = view.indexOf('"data"');
-  if (key >= 0) {
-    let start = key + 6;
-    while (start < json.length && (json[start] === 0x20 || json[start] === 0x3a || json[start] === 0x0a || json[start] === 0x0d || json[start] === 0x09)) start++;
-    const end = json[start] === 0x22 ? view.indexOf(0x22, start + 1) : -1;
-    if (end > start) return json.subarray(start + 1, end);
-  }
+  const found = dataValueAt(json, 0);
+  if (found) return json.subarray(found.start, found.end);
   return Buffer.from((JSON.parse(new TextDecoder().decode(json)) as { data?: string }).data ?? "", "latin1");
+}
+
+/**
+ * A message's raw JSON with every body's `data` blanked out, so that its structure (headers, parts,
+ * attachment IDs and sizes) can be parsed without the bodies: a 2 MB newsletter then parses in a
+ * fraction of a millisecond instead of being decoded from text and parsed whole.
+ */
+export function withoutBodyData(json: Uint8Array): Uint8Array {
+  const kept: Uint8Array[] = [];
+  let pos = 0;
+  for (let found = dataValueAt(json, 0); found; found = dataValueAt(json, found.end)) {
+    kept.push(json.subarray(pos, found.start));
+    pos = found.end;
+  }
+  if (!kept.length) return json;
+  kept.push(json.subarray(pos));
+  return Buffer.concat(kept);
+}
+
+
+// ---------- send-as addresses ----------
+
+/** One of the addresses an account can send from (users.settings.sendAs). */
+export interface SendAsEntry {
+  sendAsEmail: string;
+  displayName?: string;
+  /** Gmail's signature for this address, as HTML. */
+  signature?: string;
+  isPrimary?: boolean;
+  isDefault?: boolean;
+  treatAsAlias?: boolean;
+  verificationStatus?: string;
+}
+
+const SEND_AS_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Each account's send-as list, kept for an hour per isolate (like access tokens), so that reply-all,
+ * signatures and list_accounts cost one settings call per cold account. Keyed by the address and a
+ * fingerprint of the account's grant, so a re-linked account is read again. Exported for tests.
+ */
+export const sendAsCache = new Map<string, { entries: SendAsEntry[]; expiresAt: number }>();
+
+/** A short one-way fingerprint of a secret (two FNV-1a style rounds), for use in a cache key. */
+function fingerprint(secret: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x5bd1e995;
+  for (let i = 0; i < secret.length; i++) {
+    const c = secret.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ c, 0x01000193) ^ (h2 >>> 13);
+  }
+  return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
 }
 
 /** All Gmail operations for a single linked account. */
 export class Mailbox {
+  /** A send-as lookup in progress, so one tool call never asks twice. */
+  private sendAsLookup?: Promise<SendAsEntry[]>;
+
   constructor(
     readonly client: GmailClient,
     private readonly options: MailboxOptions = {},
@@ -543,6 +719,79 @@ export class Mailbox {
 
   get email(): string {
     return this.client.email;
+  }
+
+  // ---------- the user's own addresses ----------
+
+  private get sendAsKey(): string {
+    return `${this.email.toLowerCase()}\n${fingerprint(this.client.account.refreshToken)}`;
+  }
+
+  /** The send-as list, if it is in the cache. */
+  private cachedSendAs(): SendAsEntry[] | undefined {
+    const hit = sendAsCache.get(this.sendAsKey);
+    if (!hit) return undefined;
+    if (hit.expiresAt <= Date.now()) {
+      sendAsCache.delete(this.sendAsKey);
+      return undefined;
+    }
+    return hit.entries;
+  }
+
+  /**
+   * The addresses this account can send from (users.settings.sendAs), the primary first. One settings
+   * call per account and hour per isolate; if it fails for any reason, just the primary address.
+   */
+  async sendAs(): Promise<SendAsEntry[]> {
+    const cached = this.cachedSendAs();
+    if (cached) return cached;
+    this.sendAsLookup ??= this.client
+      .request("GET", "settings/sendAs")
+      .then((res) => {
+        const listed = ((res?.sendAs ?? []) as Partial<SendAsEntry>[]).filter(
+          (e): e is SendAsEntry => typeof e.sendAsEmail === "string" && e.sendAsEmail.includes("@"),
+        );
+        // The account's own entry comes first; it is made up if the list somehow lacks it.
+        const own =
+          listed.find((e) => sameMailbox(e.sendAsEmail, this.email)) ??
+          ({ sendAsEmail: this.email, isPrimary: true, isDefault: !listed.some((e) => e.isDefault) } satisfies SendAsEntry);
+        const entries = [own, ...listed.filter((e) => e !== own)];
+        sendAsCache.set(this.sendAsKey, { entries, expiresAt: Date.now() + SEND_AS_TTL_MS });
+        return entries;
+      })
+      .catch((): SendAsEntry[] => [{ sendAsEmail: this.email, isPrimary: true, isDefault: true }])
+      .finally(() => {
+        this.sendAsLookup = undefined;
+      });
+    return this.sendAsLookup;
+  }
+
+  /** The addresses known to be the user's without asking Gmail: the primary, plus any cached send-as ones. */
+  private ownAddresses(): string[] {
+    return [this.email, ...(this.cachedSendAs() ?? []).map((e) => e.sendAsEmail)];
+  }
+
+  /** True when the address is one of the user's own (see ownAddresses; Gmail dot and +tag variants count). */
+  private isMine(address: string): boolean {
+    return this.ownAddresses().some((own) => sameMailbox(own, address));
+  }
+
+  /** The signature Gmail adds for this account: its own send-as entry's, or the default entry's when its own has none. */
+  async signature(): Promise<string> {
+    const entries = await this.sendAs();
+    const own = entries.find((e) => sameMailbox(e.sendAsEmail, this.email))?.signature?.trim();
+    return own || (entries.find((e) => e.isDefault)?.signature?.trim() ?? "");
+  }
+
+  /** Adds `fromMe: true` (right after `sender`) to an email the user sent from any of their addresses. */
+  private markFromMe<T extends { sender?: string }>(msg: T): T & { fromMe?: true } {
+    if (!msg.sender || !this.isMine(bareAddress(msg.sender))) return msg;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(msg)) {
+      out[key] = value;
+      if (key === "sender") out.fromMe = true;
+    }
+    return out as T & { fromMe: true };
   }
 
   private loader(messageId: string) {
@@ -570,13 +819,16 @@ export class Mailbox {
 
   // ---------- threads & messages ----------
 
-  async searchThreads(opts: {
-    query?: string;
-    pageSize?: number;
-    pageToken?: string;
-    includeTrash?: boolean;
-    view?: ThreadView;
-  }) {
+  async searchThreads(opts: SearchOptions) {
+    const { ids: _ids, ...page } = await this.searchPage(opts);
+    return page;
+  }
+
+  /**
+   * One page of a thread search. `ids` are the thread IDs Gmail listed (after `skip`), in Gmail's
+   * order, newest first; `threads` are those of them that could be read.
+   */
+  async searchPage(opts: SearchOptions) {
     const includeDrafts = mentionsDrafts(opts.query);
     const q = opts.query?.trim()
       ? includeDrafts
@@ -592,24 +844,26 @@ export class Mailbox {
       },
     });
     const format: MessageFormat = opts.view === "THREAD_VIEW_METADATA_ONLY" ? "METADATA_ONLY" : "MINIMAL";
-    const ids = (list.threads ?? []) as { id: string }[];
+    const ids = ((list.threads ?? []) as { id: string }[]).map((t) => t.id).slice(opts.skip ?? 0);
     const fetched = await this.client.batchGet<{ messages?: ApiMessage[] }>(
-      ids.map((t) => ({ path: `threads/${t.id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
+      ids.map((id) => ({ path: `threads/${id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
     );
-    const { found, failed } = settle(ids.map((t) => t.id), fetched);
+    const { found, failed } = settle(ids, fetched);
     const threads = await mapLimit(found, 8, async ({ id, value: thread }) => {
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
       const recent = messages.slice(-THREAD_PREVIEW_MESSAGES);
-      const summaries = (await Promise.all(recent.map((m) => this.format(m, format)))).map((m) => this.searchSummary(m));
+      const summaries = (await Promise.all(recent.map((m) => this.format(m, format)))).map((m) => this.markFromMe(this.searchSummary(m)));
       const link = viewUrl(this.email, `all/${id}`);
       // Most threads hold one email: show it flat instead of a thread wrapping a one-item list.
       if (summaries.length === 1) {
         const { id: messageId, ...message } = summaries[0];
         return { id, ...(messageId !== id ? { messageId } : {}), totalMessages: 1, ...message, viewUrl: link };
       }
-      // Replies repeat the subject with "Re:"; list it once for the thread.
-      const subject = summaries[0]?.subject;
+      // Replies repeat the subject with "Re:"; list it once for the thread, as its first email had it
+      // (the preview only shows the latest emails).
+      const subject =
+        format === "METADATA_ONLY" || !messages.length ? undefined : stripInvisible(header(messages[0].payload, "Subject") ?? "").trim();
       const base = normalizeSubject(subject);
       return {
         id,
@@ -621,9 +875,10 @@ export class Mailbox {
       };
     });
     return {
+      ids,
       threads,
       ...unavailable("threadIds", failed),
-      ...(list.nextPageToken ? { nextPageToken: list.nextPageToken } : {}),
+      ...(list.nextPageToken ? { nextPageToken: list.nextPageToken as string } : {}),
     };
   }
 
@@ -634,7 +889,9 @@ export class Mailbox {
     });
     const messages = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT"));
     // The first message keeps any quote: what it quotes isn't in this thread.
-    const formatted = await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts)));
+    const formatted = (
+      await Promise.all(messages.map((m, i) => this.format(m, format, i === 0 ? { ...opts, hideQuotedHistory: false } : opts)))
+    ).map((m) => this.markFromMe(m));
     const base = {
       id: thread.id as string,
       viewUrl: viewUrl(this.email, `all/${thread.id}`),
@@ -664,22 +921,31 @@ export class Mailbox {
     const msg: ApiMessage = await this.client.request("GET", `messages/${checkId(messageId, "message")}`, {
       query: { format: apiFormat(format), metadataHeaders: apiFormat(format) === "metadata" ? METADATA_HEADERS : undefined },
     });
-    return this.format(msg, format, opts);
+    const formatted = this.markFromMe(await this.format(msg, format, opts));
+    if (format !== "PLAIN_TEXT" && format !== "FULL_CONTENT") return formatted;
+    // With the body there, the snippet only repeats its start.
+    const { snippet: _s, ...rest } = formatted;
+    return rest;
   }
 
   /**
    * Downloads every attachment of a message so it can be re-attached (forwarding, draft edits),
    * keeping each as Gmail's base64url text so it is never decoded and encoded again. Attachments
-   * over the limit are refused from their listed sizes before downloading anything. Large ones are
-   * fetched on their own as bytes (no batch text to split, no JSON to parse); small ones share a batch.
+   * over the limit are refused from their listed sizes before downloading anything; attachments
+   * being `added` to the same email count towards it. Large ones are fetched on their own as bytes
+   * (no batch text to split, no JSON to parse); small ones share a batch.
    */
   private async downloadAttachments(
     msg: ApiMessage,
     content: ExtractedContent,
     tooBig: (size: string, limit: string, note?: string) => string,
+    added: OutgoingAttachment[] = [],
   ): Promise<OutgoingAttachment[]> {
-    const total = content.attachments.reduce((sum, a) => sum + a.size, 0);
-    const size = `${(total / 1048576).toFixed(1)} MB`;
+    const mb = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MB`;
+    const listed = content.attachments.reduce((sum, a) => sum + a.size, 0);
+    const extra = added.reduce((sum, a) => sum + attachmentSize(a.content), 0);
+    const total = listed + extra;
+    const size = extra ? `${mb(total)} (${mb(listed)} on the email and ${mb(extra)} being added)` : mb(total);
     if (total > MAX_ATTACHMENT_BYTES) throw new MimeError(tooBig(size, "25 MB Gmail allows in one email"));
     const limit = this.options.maxAttachmentBytes;
     if (limit !== undefined && total > limit) {
@@ -730,20 +996,25 @@ export class Mailbox {
     return this.client.request(method, path, { upload });
   }
 
-  /** Threading headers and default recipients for replying to `messageId`. */
+  /**
+   * Threading headers and default recipients for replying to `messageId`. The user's own addresses
+   * never end up among the recipients: for reply-all that means every send-as address (one settings
+   * call per cold account); otherwise the primary address and whatever send-as list is cached.
+   */
   async replyContext(messageId: string, replyAll = false) {
     const original = await this.getRawMessage(messageId, "full");
     const p = original.payload;
-    const self = this.email.toLowerCase();
     const from = header(p, "From") ?? "";
     const toHeader = header(p, "To");
     const ccHeader = header(p, "Cc");
+    const own = replyAll ? [this.email, ...(await this.sendAs()).map((e) => e.sendAsEmail)] : this.ownAddresses();
+    const mine = (address: string) => own.some((a) => sameMailbox(a, address));
     // Derived recipients skip anything that isn't a real address (e.g. "undisclosed-recipients:;").
-    const sentBySelf = bareAddress(from) === self;
+    const sentBySelf = mine(bareAddress(from));
     const to = sentBySelf ? recipientsFrom(toHeader) : recipientsFrom(header(p, "Reply-To") || from);
     const toAddresses = to.map((m) => m.address);
     const cc = replyAll
-      ? recipientsFrom(sentBySelf ? ccHeader : [toHeader, ccHeader].filter(Boolean).join(", "), [self, ...toAddresses])
+      ? recipientsFrom(sentBySelf ? ccHeader : [toHeader, ccHeader].filter(Boolean).join(", "), toAddresses).filter((m) => !mine(m.address))
       : [];
     const content = await extractContent(p, this.loader(original.id));
     return {
@@ -762,19 +1033,36 @@ export class Mailbox {
     };
   }
 
+  /**
+   * The user's own text and HTML for an email, with the account's Gmail signature appended when asked
+   * for: in the HTML as Gmail marks it up, in the text after a "-- " line. A signature gives even a
+   * plain-text email an HTML part, so its formatting and links survive.
+   */
+  private async bodies(input: { body?: string; htmlBody?: string; includeSignature?: boolean }): Promise<{ text: string; html?: string }> {
+    const text = input.body ?? (input.htmlBody ? htmlToText(input.htmlBody) : "");
+    const signature = input.includeSignature ? await this.signature() : "";
+    if (!signature) return { text, html: input.htmlBody };
+    const html = input.htmlBody ?? escapeHtml(text).replace(/\n/g, "<br>");
+    return {
+      text: [text, `-- \n${htmlToText(signature)}`].filter(Boolean).join("\n\n"),
+      html: `${html}<br><br><div dir="ltr" class="gmail_signature" data-smartmail="gmail_signature">${signature}</div>`,
+    };
+  }
+
+  /** Puts the quoted original (attribution and all) below the user's own text and HTML. */
   private withQuote(
-    input: ComposeInput,
+    own: { text: string; html?: string },
     quote: { attribution: string; text: string; html?: string },
-  ): { text?: string; html?: string } {
+  ): { text: string; html?: string } {
     const quotedText = `${quote.attribution}\n${quote.text
       .split(/\r?\n/)
       .map((line) => `> ${line}`)
       .join("\n")}`;
-    const text = `${input.body ?? (input.htmlBody ? htmlToText(input.htmlBody) : "")}\n\n${quotedText}`;
-    if (!input.htmlBody) return { text };
+    const text = `${own.text}\n\n${quotedText}`;
+    if (!own.html) return { text };
     const quotedHtml = quote.html ?? escapeHtml(quote.text).replace(/\n/g, "<br>");
     const html =
-      `${input.htmlBody}<br><div class="gmail_quote"><div class="gmail_attr">${escapeHtml(quote.attribution)}<br></div>` +
+      `${own.html}<br><div class="gmail_quote"><div class="gmail_attr">${escapeHtml(quote.attribution)}<br></div>` +
       `<blockquote class="gmail_quote" style="margin:0 0 0 .8ex;border-left:1px #ccc solid;padding-left:1ex">${quotedHtml}</blockquote></div>`;
     return { text, html };
   }
@@ -782,29 +1070,34 @@ export class Mailbox {
   async sendMessage(input: ComposeInput & { draftId?: string; replyThreadId?: string; replyToMessageId?: string }) {
     if (input.draftId) {
       const id = checkId(input.draftId, "draft");
-      const sent = await this.sendMail(() => this.client.request("POST", "drafts/send", { json: { id } }));
+      const sent = await this.sendMail(() => this.client.request("POST", "drafts/send", { json: { id } }).catch((err) => this.draftGone(id, err)));
       return this.sentResult(sent);
     }
-    const to = input.to ?? [];
+    const to = recipients(input.to) ?? [];
     if (!to.length && !input.cc?.length && !input.bcc?.length) {
       throw new MimeError("Provide at least one recipient in to, cc or bcc (or a draftId).");
     }
+    if (!input.body && !input.htmlBody && !input.attachments?.length) {
+      throw new MimeError("The email has no content: give it a body (`body` or `htmlBody`) or attachments, or pass a draftId to send a draft.");
+    }
+    const own = await this.bodies(input);
     const msg: OutgoingMessage = {
       to,
-      cc: input.cc,
-      bcc: input.bcc,
+      cc: recipients(input.cc),
+      bcc: recipients(input.bcc),
       subject: input.subject,
-      text: input.body,
-      html: input.htmlBody,
+      text: own.text,
+      html: own.html,
       attachments: toAttachments(input.attachments),
     };
     let threadId = input.replyThreadId;
     if (input.replyToMessageId) {
-      const ctx = await this.replyContext(input.replyToMessageId);
-      msg.inReplyTo = ctx.inReplyTo;
-      msg.references = ctx.references;
-      msg.subject ||= ctx.subject;
-      threadId = ctx.threadId;
+      // Only the threading headers are needed, not the body (reply and create_draft quote it).
+      const original = await this.getRawMessage(input.replyToMessageId, "metadata");
+      msg.inReplyTo = header(original.payload, "Message-ID");
+      msg.references = referencesFor(original.payload);
+      msg.subject ||= replySubject(header(original.payload, "Subject"));
+      threadId = original.threadId;
     } else if (input.replyThreadId) {
       // Gmail only threads a message that also carries In-Reply-To/References and a matching
       // subject, so take them from the thread's latest message.
@@ -826,16 +1119,17 @@ export class Mailbox {
   async reply(input: ComposeInput & { messageId: string; replyAll?: boolean }) {
     if (!input.body && !input.htmlBody) throw new MimeError("Provide body or htmlBody for the reply.");
     const ctx = await this.replyContext(input.messageId, input.replyAll);
-    const { text, html } = this.withQuote(input, ctx.quote);
+    const { text, html } = this.withQuote(await this.bodies(input), ctx.quote);
     const mime = buildMimeChunks({
-      to: input.to?.length ? input.to : ctx.to,
-      cc: input.cc?.length ? input.cc : ctx.cc,
-      bcc: input.bcc,
+      to: input.to?.length ? recipients(input.to) : ctx.to,
+      cc: input.cc?.length ? recipients(input.cc) : ctx.cc,
+      bcc: recipients(input.bcc),
       subject: ctx.subject,
       text,
       html,
       inReplyTo: ctx.inReplyTo,
       references: ctx.references,
+      attachments: toAttachments(input.attachments),
     });
     const upload = GmailClient.uploadBody({ threadId: ctx.threadId }, mime);
     const sent = await this.sendMail(() => this.client.request("POST", "messages/send", { upload }));
@@ -849,10 +1143,14 @@ export class Mailbox {
     bcc?: string[];
     forwardText?: string;
     htmlBody?: string;
+    includeSignature?: boolean;
+    /** Attachments to send along with the original's. */
+    attachments?: AttachmentInput[];
   }) {
     if (!input.to?.length && !input.cc?.length && !input.bcc?.length) {
       throw new MimeError("Provide at least one recipient in to, cc or bcc.");
     }
+    const added = toAttachments(input.attachments);
     const original = await this.getRawMessage(input.messageId, "full");
     const p = original.payload;
     const content = await extractContent(p, this.loader(original.id));
@@ -865,34 +1163,38 @@ export class Mailbox {
       ["Cc", header(p, "Cc")],
     ];
     const present = meta.filter((m): m is [string, string] => Boolean(m[1]));
-    const intro = input.forwardText ?? (input.htmlBody ? htmlToText(input.htmlBody) : "");
+    const own = await this.bodies({ body: input.forwardText, htmlBody: input.htmlBody, includeSignature: input.includeSignature });
     const text =
-      `${intro}\n\n---------- Forwarded message ---------\n` +
+      `${own.text}\n\n---------- Forwarded message ---------\n` +
       present.map(([k, v]) => `${k}: ${v}`).join("\n") +
       `\n\n${origText}`;
-    const introHtml = input.htmlBody ?? escapeHtml(input.forwardText ?? "").replace(/\n/g, "<br>");
+    const introHtml = own.html ?? escapeHtml(own.text).replace(/\n/g, "<br>");
     const html =
       `${introHtml}<br><br><div class="gmail_quote">---------- Forwarded message ---------<br>` +
       present.map(([k, v]) => `${k}: ${escapeHtml(v)}<br>`).join("") +
       `<br>${content.html ?? escapeHtml(origText).replace(/\n/g, "<br>")}</div>`;
     const subject = header(p, "Subject") ?? "";
     const mime = buildMimeChunks({
-      to: input.to,
-      cc: input.cc,
-      bcc: input.bcc,
+      to: recipients(input.to),
+      cc: recipients(input.cc),
+      bcc: recipients(input.bcc),
       subject: /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`.trim(),
       text,
       html,
       inReplyTo: header(p, "Message-ID"),
       references: referencesFor(p),
-      attachments: await this.downloadAttachments(
-        original,
-        content,
-        (size, limit, note) =>
-          `This email's attachments add up to ${size}, more than the ${limit}, so it can't be forwarded with them from here. ` +
-          `Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.` +
-          (note ? ` ${note}` : ""),
-      ),
+      attachments: [
+        ...(await this.downloadAttachments(
+          original,
+          content,
+          (size, limit, note) =>
+            `This email's attachments add up to ${size}, more than the ${limit}, so it can't be forwarded with them from here. ` +
+            `Forward it in Gmail instead (${viewUrl(this.email, `all/${original.id}`)}), which sends large files as Google Drive links.` +
+            (note ? ` ${note}` : ""),
+          added,
+        )),
+        ...added,
+      ],
     });
     // Only the assembled bytes stay alive while sending: the attachment text they were built from can go.
     const upload = GmailClient.uploadBody({ threadId: original.threadId }, mime);
@@ -963,8 +1265,9 @@ export class Mailbox {
       // A list shows a preview of each draft; get_draft returns the whole thing.
       const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY", { maxBodyChars: LIST_BODY_CHARS });
       if (full) {
-        const { htmlBody: _h, snippet: _s, attachments: _a, labelIds: _l, ...rest } = formatted as FormattedMessage;
-        return rest;
+        const { htmlBody: _h, snippet: _s, attachments, labelIds: _l, ...rest } = formatted as FormattedMessage;
+        const files = (attachments ?? []).map(({ filename, mimeType, size, partId }) => ({ filename, mimeType, size, ...(partId !== undefined ? { partId } : {}) }));
+        return { ...rest, ...(files.length ? { attachments: files } : {}) };
       }
       const { labelIds: _l, ...rest } = formatted as FormattedMessage;
       return rest;
@@ -976,26 +1279,38 @@ export class Mailbox {
     };
   }
 
+  /** Turns Gmail's 404 for a draft into a message saying what probably happened; other errors pass through. */
+  private draftGone(draftId: string, err: unknown): never {
+    if (err instanceof GmailApiError && err.status === 404) {
+      throw new MimeError(
+        `Draft ${draftId} no longer exists in ${this.email} (it may have been sent or deleted). If the ID came from another account, pass that account.`,
+      );
+    }
+    throw err;
+  }
+
   async getDraft(draftId: string, format: MessageFormat, opts: FormatOptions = {}) {
+    const id = checkId(draftId, "draft");
     // drafts.get has no metadataHeaders parameter; metadata format returns every header.
-    const draft = await this.client.request("GET", `drafts/${checkId(draftId, "draft")}`, { query: { format: apiFormat(format) } });
+    const draft = await this.client.request("GET", `drafts/${id}`, { query: { format: apiFormat(format) } }).catch((err) => this.draftGone(id, err));
     return this.formatDraft(draft, format, opts);
   }
 
   async createDraft(input: ComposeInput & { replyToMessageId?: string }) {
+    const own = await this.bodies(input);
     const msg: OutgoingMessage = {
-      to: input.to,
-      cc: input.cc,
-      bcc: input.bcc,
+      to: recipients(input.to),
+      cc: recipients(input.cc),
+      bcc: recipients(input.bcc),
       subject: input.subject,
-      text: input.body,
-      html: input.htmlBody,
+      text: own.text,
+      html: own.html,
       attachments: toAttachments(input.attachments),
     };
     let threadId: string | undefined;
     if (input.replyToMessageId) {
       const ctx = await this.replyContext(input.replyToMessageId);
-      Object.assign(msg, this.withQuote(input, ctx.quote));
+      Object.assign(msg, this.withQuote(own, ctx.quote));
       msg.inReplyTo = ctx.inReplyTo;
       msg.references = ctx.references;
       msg.subject = input.subject || ctx.subject;
@@ -1012,13 +1327,13 @@ export class Mailbox {
    */
   async updateDraft(input: ComposeInput & { draftId: string }) {
     const draftId = checkId(input.draftId, "draft");
-    const existing = await this.client.request("GET", `drafts/${draftId}`, { query: { format: "full" } });
+    const existing = await this.client.request("GET", `drafts/${draftId}`, { query: { format: "full" } }).catch((err) => this.draftGone(draftId, err));
     const msg = existing.message as ApiMessage;
     const p = msg.payload;
     const content = await extractContent(p, this.loader(msg.id));
     // Keep the draft's recipients (with their display names) unless new ones are given.
     const pick = (value: string[] | undefined, headerName: string): Recipient[] =>
-      value?.length ? value : recipientsFrom(header(p, headerName));
+      value?.length ? recipients(value)! : recipientsFrom(header(p, headerName));
     const bodyChanged = Boolean(input.body || input.htmlBody);
     const inReplyTo = header(p, "In-Reply-To");
     // Keep a chosen send-as address; without From, Gmail would send from the primary address.
@@ -1048,7 +1363,8 @@ export class Mailbox {
   }
 
   async deleteDraft(draftId: string) {
-    await this.client.request("DELETE", `drafts/${checkId(draftId, "draft")}`);
+    const id = checkId(draftId, "draft");
+    await this.client.request("DELETE", `drafts/${id}`).catch((err) => this.draftGone(id, err));
     return { deleted: draftId };
   }
 
@@ -1110,15 +1426,23 @@ export class Mailbox {
     return { ...label, ...(created.length ? { createdParentLabels: created } : {}) };
   }
 
+  /** Only user labels can be changed or deleted; Gmail refuses for its own (INBOX, STARRED, CATEGORY_…). */
+  private userLabel(label: ApiLabel): ApiLabel {
+    if (label.type === "system" || isSystemLabelId(label.id)) {
+      throw new MimeError(`${label.name} is a system label that Gmail manages: it can't be renamed, recolored or deleted. Only user labels can be (see list_labels).`);
+    }
+    return label;
+  }
+
   async updateLabel(labelRef: string, input: LabelInput) {
-    const [labelId] = await this.resolveLabelIds([labelRef]);
-    return this.client.request("PATCH", `labels/${labelId}`, { json: this.labelBody(input) });
+    const [label] = await this.resolveLabels([labelRef]);
+    return this.client.request("PATCH", `labels/${this.userLabel(label).id}`, { json: this.labelBody(input) });
   }
 
   async deleteLabel(labelRef: string) {
-    const [labelId] = await this.resolveLabelIds([labelRef]);
-    await this.client.request("DELETE", `labels/${labelId}`);
-    return { deleted: labelId };
+    const [label] = await this.resolveLabels([labelRef]);
+    await this.client.request("DELETE", `labels/${this.userLabel(label).id}`);
+    return { deleted: label.id };
   }
 
   /** Accepts label IDs or display names (case-insensitive) and returns IDs for this account. */
@@ -1139,10 +1463,17 @@ export class Mailbox {
     });
   }
 
+  /**
+   * The labels needed to resolve `refs`: system label IDs (INBOX, UNREAD, CATEGORY_…) stand for
+   * themselves, so only names and user labels cost a read of the account's label list.
+   */
+  private async labelsFor(refs: string[]): Promise<ApiLabel[]> {
+    if (refs.every(isSystemLabelId)) return refs.map((id): ApiLabel => ({ id, name: id, type: "system" }));
+    return ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
+  }
+
   async modify(kind: "messages" | "threads", id: string, add: string[] | undefined, remove: string[] | undefined) {
-    const labels = add?.length || remove?.length
-      ? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[])
-      : [];
+    const labels = await this.labelsFor([...(add ?? []), ...(remove ?? [])]);
     const addLabelIds = await this.resolveLabelIds(add, labels);
     const removeLabelIds = await this.resolveLabelIds(remove, labels);
     if (!addLabelIds.length && !removeLabelIds.length) throw new MimeError("Provide at least one label to add or remove.");
@@ -1158,12 +1489,31 @@ export class Mailbox {
   // ---------- attachments ----------
 
   /**
-   * Downloads one attachment. Identify it by `partId` (stable), `filename`, or `attachmentId`;
-   * with none of these, a message's only attachment is used.
+   * The bytes of an attachment, fetched as bytes and decoded straight from the answer (no JSON
+   * parsing, no string of the file), so the peak memory is about the file plus a third.
    */
-  async getAttachment(messageId: string, ref: { partId?: string; filename?: string; attachmentId?: string }) {
-    const msg = await this.getRawMessage(messageId, "full");
-    const { attachments } = await extractContent(msg.payload, this.loader(msg.id));
+  private async attachmentBytes(messageId: string, attachmentId: string): Promise<Buffer> {
+    const json = await this.client.getBytes(`messages/${checkId(messageId, "message")}/attachments/${checkId(attachmentId, "attachment")}`);
+    return decodeBase64Url(attachmentDataOf(json));
+  }
+
+  /**
+   * A message's structure (headers, parts, attachment IDs and sizes) with the bodies' `data` left
+   * out: fetched as bytes and parsed after blanking the data (see withoutBodyData).
+   */
+  private async getMessageSkeleton(messageId: string): Promise<ApiMessage> {
+    const json = await this.client.getBytes(`messages/${checkId(messageId, "message")}`, { format: "full" });
+    return JSON.parse(new TextDecoder().decode(withoutBodyData(json))) as ApiMessage;
+  }
+
+  /**
+   * Finds one attachment of a message without downloading it: by `partId` (stable), `filename`, or
+   * `attachmentId`; with none of these, a message's only attachment. Only the message's part tree
+   * is read (no body is decoded or even parsed). `download()` then fetches the file's bytes.
+   */
+  async findAttachment(messageId: string, ref: { partId?: string; filename?: string; attachmentId?: string }) {
+    const msg = await this.getMessageSkeleton(messageId);
+    const attachments = listAttachments(msg.payload);
     const byName = ref.filename?.trim().toLowerCase();
     const attachment =
       (ref.partId !== undefined && attachments.find((a) => a.partId === ref.partId)) ||
@@ -1172,26 +1522,26 @@ export class Mailbox {
       (!ref.partId && !byName && !ref.attachmentId && attachments.length === 1 ? attachments[0] : undefined);
     // Gmail issues new attachment IDs on every read, but old ones keep working, so a stale ID is still
     // usable. Its name and type are recovered from the attachment of the same size (or the only one),
-    // since the file's type decides how it can be read.
+    // since the file's type decides how it can be read; that takes the download.
     if (!attachment && ref.attachmentId) {
-      const bytes = Buffer.from((await this.loader(msg.id)(ref.attachmentId)) as string, "base64url");
+      const bytes = await this.attachmentBytes(msg.id, ref.attachmentId);
       const sameSize = attachments.filter((a) => a.size === bytes.length);
       const match = sameSize.length === 1 ? sameSize[0] : attachments.length === 1 ? attachments[0] : undefined;
       const fallback: AttachmentInfo = { id: ref.attachmentId, filename: "attachment", mimeType: "application/octet-stream", size: bytes.length, inline: false };
-      return {
-        info: match ?? fallback,
-        bytes,
-        message: msg,
-      };
+      return { info: match ?? fallback, message: msg, download: async () => bytes };
     }
     if (!attachment) {
       const list = attachments.map((a) => `${a.filename} (partId ${a.partId})`).join(", ") || "none";
       throw new MimeError(`No matching attachment on message ${messageId}. Its attachments: ${list}.`);
     }
-    const data = attachment.id
-      ? await this.loader(msg.id)(attachment.id)
-      : (findPart(msg, attachment.partId)?.body?.data ?? "");
-    return { info: attachment, bytes: Buffer.from(data, "base64url"), message: msg };
+    const download = async () => {
+      if (attachment.id) return this.attachmentBytes(msg.id, attachment.id);
+      // A file kept inline in the message (rare: Gmail stores attachments separately) was blanked
+      // out with the bodies, so the message is read once more for it.
+      const full = attachment.size ? await this.getRawMessage(messageId, "full") : msg;
+      return Buffer.from(findPart(full, attachment.partId)?.body?.data ?? "", "base64url");
+    };
+    return { info: attachment, message: msg, download };
   }
 
   // ---------- unsubscribing ----------
@@ -1293,6 +1643,11 @@ export class Mailbox {
         threadIds.map((id) => ({ path: `threads/${id}`, query: { format: "minimal" } })),
       );
       const { found, failed } = settle(threadIds, fetched);
+      // IDs Gmail doesn't know are nearly always another account's; saying so beats a silent 0.
+      const notFound = threadIds.filter((_, i) => !fetched[i].ok && fetched[i].error.status === 404);
+      if (notFound.length === threadIds.length) {
+        throw new MimeError(`None of the ${threadIds.length} thread ID(s) exist in ${this.email}. ${WRONG_ACCOUNT_HINT}`);
+      }
       const add = change.add.map((l) => l.id);
       const remove = change.remove.map((l) => l.id);
       const needsChange = (m: ApiMessage) => {
@@ -1311,7 +1666,7 @@ export class Mailbox {
         }
         if (pending.length > room) remainingThreadIds.push(threadId);
       }
-      return { kind: "threads", ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, ...unavailable("threadIds", failed) };
+      return { kind: "threads", threadIds, ids, more: remainingThreadIds.length > 0, remainingThreadIds, threadOf, notFound, ...unavailable("threadIds", failed) };
     }
     const ids = [...new Set((sel.messageIds ?? []).map((id) => checkId(id, "message")))];
     return { kind: "messages", ids: ids.slice(0, max), more: ids.length > max, remainingMessageIds: ids.slice(max) };
@@ -1322,21 +1677,28 @@ export class Mailbox {
     // Check IDs before any call, so a bad one doesn't leave the change half done.
     sel.threadIds?.forEach((id) => checkId(id, "thread"));
     sel.messageIds?.forEach((id) => checkId(id, "message"));
-    // System labels (INBOX, UNREAD, …) need no lookup; only names and user labels do.
-    const refs = [...change.add, ...change.remove];
-    const labels = refs.every(isSystemLabelId)
-      ? refs.map((id): ApiLabel => ({ id, name: id, type: "system" }))
-      : (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[]);
+    const labels = await this.labelsFor([...change.add, ...change.remove]);
     const add = await this.resolveLabels(change.add, labels);
     const remove = await this.resolveLabels(change.remove, labels);
     const selection = await this.selectMessages(sel, { add, remove }, opts.max);
     const { ids } = selection;
-    const extra = { ...bulkLeftOver(selection, opts.max), ...(selection.unavailable ? { unavailable: selection.unavailable } : {}) };
+    const missing = (notFound: string[]) => (notFound.length ? { notFound, hint: WRONG_ACCOUNT_HINT } : {});
+    const extra = {
+      ...bulkLeftOver(selection, opts.max).fields,
+      ...(selection.unavailable ? { unavailable: selection.unavailable } : {}),
+      ...(selection.kind === "threads" ? missing(selection.notFound) : {}),
+    };
     if (opts.dryRun) {
       const sample = ids.slice(0, BULK_PREVIEW);
       const fetched = await this.client.batchGet<ApiMessage>(
         sample.map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: ["Subject", "From", "Date"] } })),
       );
+      // Given message IDs are only looked at here (the change itself is one batch call), so the
+      // preview is where a wrong account shows up.
+      const notFound = selection.kind === "messages" ? sample.filter((_, i) => !fetched[i].ok && fetched[i].error.status === 404) : [];
+      if (notFound.length && notFound.length === sample.length) {
+        throw new MimeError(`None of the first ${sample.length} message ID(s) exist in ${this.email}. ${WRONG_ACCOUNT_HINT}`);
+      }
       const preview = fetched.flatMap((r) =>
         r.ok
           ? [
@@ -1348,7 +1710,7 @@ export class Mailbox {
             ]
           : [],
       );
-      return { dryRun: true, wouldChange: ids.length, ...extra, preview };
+      return { dryRun: true, wouldChange: ids.length, ...extra, ...missing(notFound), preview };
     }
     const addLabelIds = add.map((l) => l.id);
     const removeLabelIds = remove.map((l) => l.id);
@@ -1358,19 +1720,19 @@ export class Mailbox {
       try {
         await this.client.request("POST", "messages/batchModify", { json: { ids: chunk, addLabelIds, removeLabelIds } });
       } catch (err) {
-        if (!changed) throw err;
+        // Gmail refuses the whole batch when an ID is unknown (400 or 404): usually another account's.
+        const wrongId = selection.kind === "messages" && err instanceof GmailApiError && (err.status === 400 || err.status === 404);
+        if (!changed) throw wrongId ? new MimeError(`${err.message} ${WRONG_ACCOUNT_HINT}`) : err;
         // Part of the change went through: say exactly how much, and how to finish.
         const left = ids.slice(i);
-        const finish =
-          selection.kind === "query"
-            ? "Run the same change again to finish."
-            : `Run it again with ${selection.kind === "threads" ? "threadIds set to remainingThreadIds" : "messageIds set to remainingMessageIds"} to finish.`;
+        const rest = bulkLeftOver(selection, opts.max, left);
+        const finish = rest.resume ? `${rest.resume[0].toUpperCase()}${rest.resume.slice(1)} to finish.` : "Run the same change again to finish.";
         return {
           changed,
           notChanged: left.length,
-          error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${finish}`,
+          error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${wrongId ? `${WRONG_ACCOUNT_HINT} ` : ""}${finish}`,
           ...extra,
-          ...bulkLeftOver(selection, opts.max, left),
+          ...rest.fields,
         };
       }
       changed += chunk.length;
@@ -1386,10 +1748,9 @@ export class Mailbox {
 
   private modifyResult(kind: "messages" | "threads", res: any) {
     if (kind === "messages") return { id: res.id, threadId: res.threadId, labelIds: res.labelIds ?? [] };
-    return {
-      id: res.id,
-      messages: ((res.messages ?? []) as ApiMessage[]).map((m) => ({ id: m.id, labelIds: m.labelIds ?? [] })),
-    };
+    // Listing every message's labels would repeat the same few IDs a hundred times for a long thread.
+    const messages = (res.messages ?? []) as ApiMessage[];
+    return { id: res.id, messagesChanged: messages.length, labelIds: [...new Set(messages.flatMap((m) => m.labelIds ?? []))] };
   }
 }
 

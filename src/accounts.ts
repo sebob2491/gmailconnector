@@ -27,6 +27,26 @@ export function sameEmail(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
+/**
+ * An address in the form that tells mailboxes apart: lower-cased, and for Gmail addresses without
+ * the dots and "+tag" in the local part that Gmail ignores, with googlemail.com read as gmail.com.
+ */
+export function canonicalAddress(address: string): string {
+  const lower = address.trim().toLowerCase();
+  const at = lower.lastIndexOf("@");
+  if (at < 0) return lower;
+  let local = lower.slice(0, at);
+  let domain = lower.slice(at + 1);
+  if (domain === "googlemail.com") domain = "gmail.com";
+  if (domain === "gmail.com") local = local.split("+")[0].replace(/\./g, "");
+  return `${local}@${domain}`;
+}
+
+/** True when two addresses reach the same mailbox (see canonicalAddress). */
+export function sameMailbox(a: string, b: string): boolean {
+  return canonicalAddress(a) === canonicalAddress(b);
+}
+
 /** Finds an account by email address or alias (case-insensitive). */
 export function findAccount(data: AccountsFile, ref: string): LinkedAccount {
   const needle = ref.trim().toLowerCase();

@@ -20,6 +20,8 @@ export interface FakeMailbox {
   attachments: Map<string, string>; // `${messageId}/${attachmentId}` -> base64url data
   sent: { metadata: any; raw: string; message: ApiMessage }[];
   pageSize?: number;
+  /** The account's send-as settings; when unset, just the primary address. */
+  sendAs?: { sendAsEmail: string; displayName?: string; signature?: string; isPrimary?: boolean; isDefault?: boolean }[];
 }
 
 export interface RecordedRequest {
@@ -291,7 +293,11 @@ export class FakeGmail {
 
     // threads
     if (method === "GET" && path === "threads") {
-      const threadIds = [...new Set([...mb.messages.values()].reverse().map((m) => m.threadId))];
+      // Like Gmail, a thread is listed when any of its messages matches the search.
+      const q = url.searchParams.get("q") ?? "";
+      const includeSpamTrash = url.searchParams.get("includeSpamTrash") === "true";
+      const matching = [...mb.messages.values()].reverse().filter((m) => this.matches(mb, m, q, includeSpamTrash));
+      const threadIds = [...new Set(matching.map((m) => m.threadId))];
       const start = Number(url.searchParams.get("pageToken") ?? 0);
       const size = mb.pageSize ?? Number(url.searchParams.get("maxResults") ?? 20);
       const page = threadIds.slice(start, start + size);
@@ -330,10 +336,9 @@ export class FakeGmail {
     }
     if (method === "POST" && path === "messages/batchModify") {
       this.batchModifyCalls.push(body);
-      for (const id of body.ids) {
-        const msg = mb.messages.get(id);
-        if (msg) this.applyModify(msg, "modify", body);
-      }
+      // Like Gmail, an unknown ID fails the whole batch and nothing changes.
+      if (!body.ids.every((id: string) => mb.messages.has(id))) return notFound();
+      for (const id of body.ids) this.applyModify(mb.messages.get(id)!, "modify", body);
       return json(204, undefined);
     }
     if (method === "POST" && path === "messages/send") {
@@ -379,7 +384,14 @@ export class FakeGmail {
 
     // drafts
     if (path === "drafts" && method === "GET") {
-      return json(200, { drafts: [...mb.drafts.entries()].map(([id, messageId]) => ({ id, message: { id: messageId } })) });
+      const q = url.searchParams.get("q") ?? "";
+      const drafts = [...mb.drafts.entries()]
+        .filter(([, messageId]) => {
+          const m = mb.messages.get(messageId);
+          return m ? this.matches(mb, m, q, true) : false;
+        })
+        .map(([id, messageId]) => ({ id, message: { id: messageId } }));
+      return json(200, { drafts });
     }
     if (path === "drafts" && method === "POST") {
       const { metadata, raw } = body;
@@ -418,12 +430,16 @@ export class FakeGmail {
     }
 
     if (path === "profile") return json(200, { emailAddress: mb.email });
+    if (path === "settings/sendAs" && method === "GET") {
+      return json(200, { sendAs: mb.sendAs ?? [{ sendAsEmail: mb.email, isPrimary: true, isDefault: true }] });
+    }
     return json(400, { error: { message: `fake: unhandled ${method} ${path}` } });
   };
 
   /**
-   * A small subset of Gmail search: category:, from:, is:, in:, label: (quoted names too), "-" to
-   * negate, ( ) and OR, which as in Gmail binds tighter than the implicit AND. Other terms match all.
+   * A small subset of Gmail search: category:, from:, to:, subject:, is:, in:, label: (quoted names
+   * too), "-" to negate, ( ) and OR, which as in Gmail binds tighter than the implicit AND. Other
+   * terms match all. Thread and draft lists honour it too, so query behaviour is testable.
    */
   private matches(mb: FakeMailbox, msg: ApiMessage, q: string, includeSpamTrash: boolean): boolean {
     const labels = msg.labelIds ?? [];
@@ -441,6 +457,8 @@ export class FakeGmail {
       else if (key === "from") hit = (msg.payload?.headers?.find((h) => h.name === "From")?.value ?? "").toLowerCase().includes(value.toLowerCase());
       else if (key === "is") hit = labels.includes(value.toUpperCase());
       else if (key === "in") hit = value === "anywhere" || labels.includes(value.toUpperCase());
+      else if (key === "subject") hit = (msg.payload?.headers?.find((h) => h.name === "Subject")?.value ?? "").toLowerCase().includes(value.toLowerCase());
+      else if (key === "to") hit = (msg.payload?.headers?.find((h) => h.name === "To")?.value ?? "").toLowerCase().includes(value.toLowerCase());
       else if (key === "label") hit = labels.some((l) => l === value || mb.labels.find((x) => x.id === l)?.name.toLowerCase() === value.toLowerCase());
       else return true;
       return hit !== negate;

@@ -6,9 +6,9 @@ import { after, beforeEach, describe, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
-import { TokenProvider } from "../src/gmailClient.js";
+import { setRetryWait, TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
-import { isPrivateAddress, registrableDomain } from "../src/mailbox.js";
+import { decodeBase64Url, isPrivateAddress, registrableDomain, sendAsCache, withoutBodyData } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -18,6 +18,12 @@ const WORK = "me@work.example";
 
 const tmpDirs: string[] = [];
 after(() => tmpDirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+
+/** The waits the client asked for before retries; none of them is actually waited for. */
+const retryWaits: number[] = [];
+setRetryWait(async (ms) => {
+  retryWaits.push(ms);
+});
 
 function crlf(lines: string[]): string {
   return lines.join("\r\n");
@@ -40,6 +46,7 @@ async function setup(
 ): Promise<Ctx> {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-test-"));
   tmpDirs.push(dir);
+  sendAsCache.clear(); // kept per process, like in a Worker isolate
   const store = new AccountStore(dir);
   const fake = new FakeGmail();
   const personal = fake.addMailbox(PERSONAL, "rt-personal");
@@ -195,6 +202,7 @@ describe("tool catalogue", () => {
     for (const tool of tools.filter((t) => t.name !== "list_accounts")) {
       assert.ok((tool.inputSchema.properties as Record<string, unknown>).account, `${tool.name} takes an account`);
     }
+    for (const tool of tools) assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} refuses unknown arguments`);
     const labelThread = tools.find((t) => t.name === "label_thread")!;
     assert.deepEqual(labelThread.inputSchema.required?.sort(), ["labelIds", "threadId"]);
   });
@@ -221,6 +229,17 @@ describe("tool catalogue", () => {
 });
 
 describe("accounts", () => {
+  test("a misspelt argument is an error, not silently dropped", async () => {
+    const { call, fake } = await setup();
+    const res = await call("search_threads", { account: "work", quary: "from:boss" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /Invalid arguments for tool search_threads.*quary/s);
+    assert.ok(!fake.requests.some((r) => r.path === "threads"), "nothing was searched");
+    const labelled = await call("label_thread", { account: "work", threadId: "wt1", labels: ["STARRED"] });
+    assert.match(labelled.text, /labels/);
+    assert.equal((await call("list_accounts", { verbose: true })).isError, true);
+  });
+
   test("list_accounts shows every linked account", async () => {
     const { call } = await setup({ defaultAccount: "work" });
     const res = await call("list_accounts");
@@ -280,7 +299,7 @@ describe("accounts", () => {
     const { call } = await setup();
     const res = await call("get_message", { account: "work", messageId: "p1" });
     assert.equal(res.isError, true);
-    assert.match(res.text, /belong to a single Gmail account/);
+    assert.match(res.text, /\(IDs belong to one account; pass the account that returned them\.\)$/);
   });
 
   test("a revoked account gives a re-link hint", async () => {
@@ -338,20 +357,24 @@ describe("search_threads", () => {
     assert.deepEqual(res.json.threads[0].toRecipients, [PERSONAL, '"Doe, Bob" <bob@example.com>']);
   });
 
-  test("the combined page token continues only the accounts that have more", async () => {
+  test("the combined page token continues the accounts with more, holding back what may not be next", async () => {
     const { call, fake, work } = await setup();
     work.pageSize = 1;
+    // The work emails are newer than the personal one, and work has another page that could hold
+    // something newer still, so the personal thread waits for the next page.
     const first = await call("search_threads", {});
     assert.ok(first.json.nextPageToken.startsWith("multi:"));
-    assert.deepEqual(first.json.accountsWithMore, [WORK]);
-    assert.equal(first.json.threads.filter((t: any) => t.account === WORK).length, 1);
+    assert.deepEqual(first.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt2"]]);
+    assert.deepEqual(first.json.accountsWithMore, [PERSONAL, WORK]);
 
     fake.requests.length = 0;
     const second = await call("search_threads", { pageToken: first.json.nextPageToken });
-    assert.deepEqual(second.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt1"]]);
+    assert.deepEqual(second.json.threads.map((t: any) => [t.account, t.id]), [[WORK, "wt1"], [PERSONAL, "pt1"]]);
     assert.equal(second.json.accountsWithMore, undefined);
     assert.equal(second.json.nextPageToken, undefined);
-    assert.ok(fake.requests.every((r) => r.email === WORK));
+    // The personal page is listed again (one call), and only the thread not shown yet is read.
+    const personalCalls = fake.requests.filter((r) => r.email === PERSONAL).map((r) => r.path);
+    assert.deepEqual(personalCalls, ["threads", "threads/pt1"]);
   });
 
   test("one failing account doesn't hide the others' results", async () => {
@@ -433,11 +456,33 @@ describe("sending", () => {
     assert.equal(mime.get("Subject"), "Hi Bcc: evil@example.com");
   });
 
-  test("non-plain addresses are rejected", async () => {
-    const { call } = await setup();
-    const res = await call("send_message", { account: "work", to: ["Bob <bob@example.com>"], body: "b" });
-    assert.equal(res.isError, true);
-    assert.match(res.text, /Invalid email address/);
+  test("recipients may carry a display name; anything that isn't an address is rejected", async () => {
+    const { call, fake } = await setup();
+    const res = await call("send_message", {
+      account: "work",
+      to: ["Bob <bob@example.com>", "carol@example.com"],
+      cc: ['"Doe, Jane" <jane@example.com>'],
+      bcc: ["dan@example.com (Dan)"],
+      body: "b",
+    });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(WORK)[0].raw);
+    assert.equal(mime.get("To"), "Bob <bob@example.com>, carol@example.com");
+    assert.equal(mime.get("Cc"), '"Doe, Jane" <jane@example.com>');
+    assert.equal(mime.get("Bcc"), "Dan <dan@example.com>");
+    const named = ["Ann Lee <ann@example.com>"];
+    for (const [tool, args] of [
+      ["reply", { messageId: "w1", to: named, body: "x" }],
+      ["create_draft", { to: named, body: "x" }],
+      ["forward", { messageId: "w1", to: named, forwardText: "x" }],
+    ] as const) {
+      const r = await call(tool, { account: "work", ...args });
+      assert.equal(r.isError, false, `${tool}: ${r.text}`);
+    }
+    assert.equal(inspectMime(fake.sentBy(WORK)[1].raw).get("To"), "Ann Lee <ann@example.com>");
+    const bad = await call("send_message", { account: "work", to: ["bob"], body: "b" });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /Invalid email address in "to": "bob"/);
   });
 
   test("send_message can send an existing draft", async () => {
@@ -577,6 +622,21 @@ describe("labels, trash and spam", () => {
     assert.deepEqual(personal.messages.get("p1")!.labelIds, ["INBOX"]);
   });
 
+  test("system labels are applied without reading the label list; names and user labels read it once", async () => {
+    const { call, fake, work } = await setup();
+    const labelReads = () => fake.requests.filter((r) => r.path === "labels" && r.method === "GET").length;
+    await call("label_message", { account: "work", messageId: "w2", labelIds: ["STARRED", "IMPORTANT"] });
+    await call("update_message_labels", { account: "work", messageId: "w2", addLabelIds: ["CATEGORY_UPDATES"], removeLabelIds: ["INBOX"] });
+    await call("unlabel_thread", { account: "work", threadId: "wt1", labelIds: ["UNREAD"] });
+    assert.equal(labelReads(), 0);
+    assert.deepEqual(work.messages.get("w2")!.labelIds, ["UNREAD", "STARRED", "IMPORTANT", "CATEGORY_UPDATES"]);
+    await call("label_message", { account: "work", messageId: "w2", labelIds: ["Reports", "STARRED"] });
+    assert.equal(labelReads(), 1);
+    await call("label_message", { account: "work", messageId: "w2", labelIds: ["inbox"] });
+    assert.equal(labelReads(), 2, "a name in another case is looked up");
+    assert.ok(work.messages.get("w2")!.labelIds!.includes("INBOX"));
+  });
+
   test("update_message_labels moves a message in one call", async () => {
     const { call, work } = await setup();
     const res = await call("update_message_labels", {
@@ -704,6 +764,23 @@ describe("fixes from the code review", () => {
     const [first, second] = fake.sentBy(PERSONAL).map((s) => inspectMime(s.raw));
     assert.equal(first.get("To"), "Cron Daemon <root@server.example>");
     assert.equal(second.get("To"), '"Help <help@vendor.com>" <noreply@vendor.com>');
+  });
+
+  test("send_message with replyToMessageId reads only the original's headers", async () => {
+    const { call, fake } = await setup();
+    fake.requests.length = 0;
+    const res = await call("send_message", { account: "work", replyToMessageId: "w1", to: ["boss@work.example"], body: "Done." });
+    assert.equal(res.isError, false, res.text);
+    const read = fake.requests.find((r) => r.path === "messages/w1")!;
+    assert.equal(read.query.get("format"), "metadata");
+    assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")), "the attachment isn't downloaded");
+    const [sent] = fake.sentBy(WORK);
+    assert.equal(sent.metadata.threadId, "wt1");
+    const mime = inspectMime(sent.raw);
+    assert.equal(mime.get("In-Reply-To"), "<q3@work.example>");
+    assert.equal(mime.get("References"), "<q3@work.example>");
+    assert.equal(mime.get("Subject"), "Re: Q3 report");
+    assert.equal(mime.parts[0].text, "Done.", "nothing is quoted");
   });
 
   test("send_message with only replyThreadId adds the headers Gmail needs to thread it", async () => {
@@ -907,8 +984,24 @@ describe("fixes from the code review", () => {
     assert.equal(res.isError, false, res.text);
   });
 
+  test("retries back off: 400 ms then 1,200 ms, and 500 ms per round inside a batch", async () => {
+    const { call, fake } = await setup();
+    retryWaits.length = 0;
+    fake.failAlways.set("messages/w2", 429);
+    const res = await call("get_message", { account: "work", messageId: "w2" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /429/);
+    assert.deepEqual(retryWaits, [400, 1200]);
+    fake.failAlways.clear();
+    retryWaits.length = 0;
+    fake.failAlways.set("threads/wt1", 429);
+    const search = await call("search_threads", { account: "work" });
+    assert.deepEqual(search.json.unavailable.threadIds, ["wt1"]);
+    assert.deepEqual(retryWaits, [500]);
+  });
+
   test("page tokens are checked against the accounts being searched", async () => {
-    const { call, work } = await setup();
+    const { call, personal, work } = await setup();
     work.pageSize = 1;
     const single = await call("search_threads", { account: "work" });
     assert.ok(single.json.nextPageToken && !single.json.nextPageToken.startsWith("multi:"));
@@ -916,7 +1009,10 @@ describe("fixes from the code review", () => {
     assert.equal(reused.isError, true);
     assert.match(reused.text, /single-account call/);
 
+    // With the personal thread newest, page 1 shows it, and the token only continues work.
+    personal.messages.get("p1")!.internalDate = String(Date.now());
     const combined = await call("search_threads", {});
+    assert.deepEqual(combined.json.accountsWithMore, [WORK]);
     const wrongAccount = await call("search_threads", { account: "personal", pageToken: combined.json.nextPageToken });
     assert.equal(wrongAccount.isError, true);
     assert.match(wrongAccount.text, /doesn't continue/);
@@ -1388,17 +1484,15 @@ describe("fixes from the second review", () => {
       for (let t = 0; t < 2; t++) fake.deliver(mb, crlf(["From: s@x.example", `To: ${mb.email}`, `Subject: T${t}`, "", "x"]), { threadId: `${mb === work ? "w" : "p"}x${t}` });
     }
     const page1 = await call("search_threads", {});
-    const workPage1 = page1.json.threads.find((t: any) => t.account === WORK).id;
+    assert.deepEqual(page1.json.threads.map((t: any) => t.id), ["wx1"], "the newest thread; personal's newest may not be next");
     fake.failAlways.set("threads", 500);
     const failed = await call("search_threads", { pageToken: page1.json.nextPageToken });
     assert.deepEqual(failed.json.errors.map((e: any) => e.account), [PERSONAL, WORK], failed.text);
     assert.deepEqual(failed.json.accountsWithMore, [PERSONAL, WORK]);
     assert.ok(failed.json.nextPageToken, "the token still continues both accounts");
     fake.failAlways.clear();
-    const page2 = await call("search_threads", { pageToken: failed.json.nextPageToken });
-    assert.deepEqual(page2.json.threads.map((t: any) => t.account).sort(), [PERSONAL, WORK].sort());
-    const workPage2 = page2.json.threads.find((t: any) => t.account === WORK).id;
-    assert.notEqual(workPage2, workPage1, "it continues where page 1 stopped");
+    const rest = await allPages(call, failed.json.nextPageToken);
+    assert.deepEqual([...page1.json.threads, ...rest].map((t: any) => t.id), ["wx1", "wx0", "px1", "px0", "wt2", "wt1", "pt1"], "nothing lost or repeated");
   });
 
   test("excluding Spam or Trash in a bulk query doesn't pull in the other", async () => {
@@ -1705,7 +1799,64 @@ describe("smaller thread views", () => {
   });
 });
 
+/** Follows nextPageToken from `pageToken` to the end, returning the threads of every page in order. */
+async function allPages(call: Ctx["call"], pageToken: string | undefined, args: Record<string, unknown> = {}): Promise<any[]> {
+  const threads: any[] = [];
+  for (let i = 0; i < 20; i++) {
+    const res = await call("search_threads", { ...args, pageToken });
+    assert.equal(res.isError, false, res.text);
+    threads.push(...res.json.threads);
+    pageToken = res.json.nextPageToken;
+    if (!pageToken) return threads;
+  }
+  throw new Error("more than 20 pages");
+}
+
 describe("combined search timeline", () => {
+  test("pages come in true newest-first order across accounts, with nothing missing or repeated", async () => {
+    const { call, fake, personal, work } = await setup();
+    const day = (d: number) => String(Date.UTC(2026, 9, d, 12, 0, 0));
+    // Gmail lists newest first; the fake lists in reverse delivery order, so deliver oldest first.
+    personal.messages.get("p1")!.internalDate = day(3);
+    work.messages.get("w1")!.internalDate = day(2);
+    work.messages.get("w2")!.internalDate = day(10);
+    const dates: Record<string, number[]> = { p: [12, 20], w: [11, 13, 14, 15, 16, 17, 18, 19] };
+    for (const [prefix, days] of Object.entries(dates)) {
+      for (const d of days) {
+        const mb = prefix === "p" ? personal : work;
+        fake.deliver(mb, crlf([`From: s@x.example`, `To: ${mb.email}`, `Subject: Day ${d}`, "", "x"]), { threadId: `${prefix}d${d}` }).internalDate = day(d);
+      }
+    }
+    const pages: any[][] = [];
+    let pageToken: string | undefined;
+    do {
+      const res = await call("search_threads", { pageSize: 3, pageToken });
+      assert.equal(res.isError, false, res.text);
+      pages.push(res.json.threads);
+      pageToken = res.json.nextPageToken;
+    } while (pageToken);
+    assert.deepEqual(
+      pages.map((p) => p.map((t: any) => t.id)),
+      [
+        ["pd20", "wd19", "wd18", "wd17"], // personal's older threads wait: work's next page could be newer
+        ["wd16", "wd15", "wd14"],
+        ["wd13", "pd12", "wd11", "wt2"],
+        ["pt1", "wt1"],
+      ],
+    );
+    const all = pages.flat();
+    assert.equal(new Set(all.map((t: any) => t.id)).size, 13, "no duplicates");
+    assert.equal(all.length, personal.messages.size + work.messages.size, "no gaps");
+    const times = all.map((t: any) => Date.parse(t.date));
+    assert.ok(times.every((t, i) => i === 0 || t <= times[i - 1]), "newest first throughout");
+    // A page of a single account is a plain Gmail page, as before.
+    work.pageSize = 4;
+    const single = await call("search_threads", { account: "work" });
+    assert.ok(!single.json.nextPageToken.startsWith("multi:"));
+    assert.deepEqual(single.json.threads.map((t: any) => t.id), ["wd19", "wd18", "wd17", "wd16"]);
+    assert.equal((await allPages(call, single.json.nextPageToken, { account: "work" })).length, 6);
+  });
+
   test("problems with one account are listed at the top, with the account", async () => {
     const { call, fake } = await setup();
     fake.failAlways.set("threads/wt1", 429);
@@ -2122,3 +2273,539 @@ describe("cheaper forwarding", () => {
   });
 });
 
+
+describe("send-as awareness", () => {
+  const SIGNATURE = '<div dir="ltr">Me<br><a href="https://work.example">https://work.example</a></div>';
+  const sendAsCalls = (fake: FakeGmail) => fake.requests.filter((r) => r.path === "settings/sendAs").length;
+
+  test("reply-all never includes the user's own addresses: aliases, dots, +tags and googlemail", async () => {
+    const { call, fake, personal } = await setup();
+    personal.sendAs = [
+      { sendAsEmail: PERSONAL, isPrimary: true, isDefault: true },
+      { sendAsEmail: "me@mydomain.example", displayName: "Me" },
+    ];
+    fake.deliver(
+      personal,
+      crlf([
+        "From: Alice <alice@example.com>",
+        "To: Me.Personal@Gmail.com, mepersonal@gmail.com, bob@example.com",
+        "Cc: me.personal+tag@gmail.com, me.personal@googlemail.com, Me <me@mydomain.example>, carol@example.com",
+        "Subject: Variants",
+        "Message-ID: <v1@example.com>",
+        "Content-Type: text/plain",
+        "",
+        "hi",
+      ]),
+      { id: "v1", threadId: "vt1" },
+    );
+    const res = await call("reply", { account: "personal", messageId: "v1", body: "ok", replyAll: true });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(PERSONAL)[0].raw);
+    assert.equal(mime.get("To"), "Alice <alice@example.com>");
+    assert.equal(mime.get("Cc"), "bob@example.com, carol@example.com");
+    assert.equal(sendAsCalls(fake), 1, "one settings call for a cold account");
+    await call("reply", { account: "personal", messageId: "v1", body: "again", replyAll: true });
+    assert.equal(sendAsCalls(fake), 1, "the send-as list is cached");
+    assert.equal(inspectMime(fake.sentBy(PERSONAL)[1].raw).get("Cc"), "bob@example.com, carol@example.com");
+
+    // An email the user sent from an alias is answered to its recipients, not to the alias.
+    fake.deliver(personal, crlf(["From: Me <me@mydomain.example>", "To: dana@example.com", "Cc: me.personal@gmail.com", "Subject: Mine", "", "x"]), { id: "v2" });
+    await call("reply", { account: "personal", messageId: "v2", body: "ps", replyAll: true });
+    const own = inspectMime(fake.sentBy(PERSONAL)[2].raw);
+    assert.equal(own.get("To"), "dana@example.com");
+    assert.equal(own.get("Cc"), undefined);
+
+    // Without the settings (a failed call), the primary address and its Gmail variants still never appear.
+    const other = await setup();
+    other.fake.intercept = (_method, path) => (path === "settings/sendAs" ? 403 : undefined);
+    other.fake.deliver(
+      other.personal,
+      crlf(["From: alice@example.com", "To: Me.Personal+x@gmail.com, bob@example.com", "Cc: me@mydomain.example", "Subject: V", "", "hi"]),
+      { id: "v3" },
+    );
+    const fallback = await other.call("reply", { account: "personal", messageId: "v3", body: "ok", replyAll: true });
+    assert.equal(fallback.isError, false, fallback.text);
+    assert.equal(inspectMime(other.fake.sentBy(PERSONAL)[0].raw).get("Cc"), "bob@example.com, me@mydomain.example");
+  });
+
+  test("emails the user sent carry fromMe, from an alias too once the send-as list is known", async () => {
+    const { call, fake, personal } = await setup();
+    personal.sendAs = [{ sendAsEmail: PERSONAL, isPrimary: true, isDefault: true }, { sendAsEmail: "me@mydomain.example" }];
+    fake.deliver(personal, crlf(["From: Me <Me.Personal+work@gmail.com>", "To: alice@example.com", "Subject: Re: Lunch?", "", "Noon?"]), {
+      id: "p2",
+      threadId: "pt1",
+      labelIds: ["SENT"],
+    });
+    fake.deliver(personal, crlf(["From: me@mydomain.example", "To: alice@example.com", "Subject: Re: Lunch?", "", "Or one?"]), {
+      id: "p3",
+      threadId: "pt1",
+      labelIds: ["SENT"],
+    });
+    const fromMe = (res: any) => res.json.threads.find((t: any) => t.id === "pt1").messages.map((m: any) => m.fromMe);
+    assert.deepEqual(fromMe(await call("search_threads", { account: "personal" })), [undefined, true, undefined]);
+    assert.equal(sendAsCalls(fake), 0, "search never asks for the send-as list");
+    // Once something fetched the list (here list_accounts), emails sent from an alias count too.
+    await call("list_accounts");
+    assert.equal(sendAsCalls(fake), 2);
+    assert.deepEqual(fromMe(await call("search_threads", { account: "personal" })), [undefined, true, true]);
+    assert.equal(sendAsCalls(fake), 2);
+    const thread = await call("get_thread", { account: "personal", threadId: "pt1" });
+    assert.deepEqual(thread.json.messages.map((m: any) => m.fromMe), [undefined, true, true]);
+    const msg = await call("get_message", { account: "personal", messageId: "p3" });
+    const keys = Object.keys(msg.json);
+    assert.equal(keys[keys.indexOf("sender") + 1], "fromMe", "right after the sender");
+    assert.equal((await call("get_message", { account: "personal", messageId: "p1" })).json.fromMe, undefined);
+  });
+
+  test("list_accounts lists send-as addresses and checks the grant itself, not a cached token", async () => {
+    const { call, fake, work } = await setup();
+    work.sendAs = [{ sendAsEmail: WORK, isPrimary: true, isDefault: true }, { sendAsEmail: "team@work.example", displayName: "Team" }];
+    assert.equal((await call("get_thread", { account: "work", threadId: "wt1" })).isError, false);
+    const before = fake.tokenCalls;
+    const first = await call("list_accounts");
+    assert.equal(first.isError, false, first.text);
+    assert.deepEqual(first.json.accounts.find((a: any) => a.email === WORK).addresses, ["team@work.example"]);
+    assert.equal(first.json.accounts.find((a: any) => a.email === PERSONAL).addresses, undefined);
+    assert.equal(fake.tokenCalls, before + 2, "a fresh token per account");
+    // The work account's access token is cached and still valid, but Google has revoked the grant.
+    fake.revoked.add("rt-work");
+    fake.requests.length = 0;
+    const second = await call("list_accounts");
+    const status = Object.fromEntries(second.json.accounts.map((a: any) => [a.email, a.status]));
+    assert.deepEqual(status, { [PERSONAL]: "ok", [WORK]: "needs re-link" });
+    assert.ok(fake.requests.every((r) => r.email === PERSONAL), "nothing else is tried on the revoked account");
+  });
+
+  test("includeSignature puts the account's Gmail signature below the text and above any quote", async () => {
+    const { call, fake, work } = await setup();
+    work.sendAs = [{ sendAsEmail: WORK, isPrimary: true, isDefault: true, signature: SIGNATURE }];
+    const sigHtml = `<br><br><div dir="ltr" class="gmail_signature" data-smartmail="gmail_signature">${SIGNATURE}</div>`;
+    const sigText = "-- \nMe\nhttps://work.example";
+
+    await call("send_message", { account: "work", to: ["x@example.com"], subject: "s", body: "Hello", includeSignature: true });
+    const sent = inspectMime(fake.sentBy(WORK)[0].raw);
+    assert.deepEqual(
+      sent.parts.map((p) => [p.type, p.text]),
+      [
+        ["text/plain", `Hello\n\n${sigText}`],
+        ["text/html", `Hello${sigHtml}`],
+      ],
+    );
+
+    await call("reply", { account: "work", messageId: "w1", htmlBody: "<p>Thanks</p>", includeSignature: true });
+    const reply = inspectMime(fake.sentBy(WORK)[1].raw);
+    assert.match(reply.parts[0].text, new RegExp(`^Thanks\\n\\n${sigText}\\n\\nOn Tue, 2 Sep 2026 09:00:00 \\+0000, Boss <boss@work\\.example> wrote:\\n> Please review`));
+    assert.ok(reply.parts[1].text.startsWith(`<p>Thanks</p>${sigHtml}<br><div class="gmail_quote">`), reply.parts[1].text);
+
+    await call("forward", { account: "work", messageId: "w1", to: ["y@example.com"], forwardText: "FYI", includeSignature: true });
+    const fwd = inspectMime(fake.sentBy(WORK)[2].raw);
+    assert.match(fwd.parts[0].text, new RegExp(`^FYI\\n\\n${sigText}\\n\\n---------- Forwarded message ---------\\nFrom: Boss`));
+    assert.ok(fwd.parts[1].text.startsWith(`FYI${sigHtml}<br><br><div class="gmail_quote">`), fwd.parts[1].text);
+
+    const draft = await call("create_draft", { account: "work", to: ["z@example.com"], subject: "d", body: "Draft", includeSignature: true });
+    assert.equal(draft.isError, false, draft.text);
+    const stored = inspectMime(fake.requests.find((r) => r.path === "drafts" && r.method === "POST")!.body.raw);
+    assert.equal(stored.parts[0].text, `Draft\n\n${sigText}`);
+
+    // No signature in Gmail: nothing is added, and the email stays plain text.
+    sendAsCache.clear();
+    work.sendAs = [{ sendAsEmail: WORK, isPrimary: true, isDefault: true, signature: "" }];
+    await call("send_message", { account: "work", to: ["x@example.com"], subject: "s", body: "Hello", includeSignature: true });
+    assert.deepEqual(inspectMime(fake.sentBy(WORK)[3].raw).parts.map((p) => [p.type, p.text]), [["text/plain", "Hello"]]);
+    // Without a send-as entry of its own, the account gets the default entry's signature.
+    sendAsCache.clear();
+    work.sendAs = [{ sendAsEmail: "team@work.example", isDefault: true, signature: "<b>Team</b>" }];
+    await call("send_message", { account: "work", to: ["x@example.com"], subject: "s", body: "Hello", includeSignature: true });
+    assert.equal(inspectMime(fake.sentBy(WORK)[4].raw).parts[0].text, "Hello\n\n-- \nTeam");
+    assert.equal(sendAsCalls(fake), 3);
+  });
+});
+
+describe("attachments on replies and forwards", () => {
+  test("reply takes attachments like send_message", async () => {
+    const { call, fake } = await setup();
+    const res = await call("reply", {
+      account: "personal",
+      messageId: "p1",
+      body: "Here's the menu.",
+      attachments: [{ content: b64("menu-bytes"), filename: "menu.txt", mimeType: "text/plain" }],
+    });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(PERSONAL)[0].raw);
+    assert.equal(mime.get("In-Reply-To"), "<lunch-1@example.com>");
+    assert.match(mime.parts[0].text, /^Here's the menu\.\n\nOn Mon, 1 Sep 2026/);
+    const file = mime.parts.find((p) => p.filename === "menu.txt")!;
+    assert.deepEqual([file.type, file.text], ["text/plain", "menu-bytes"]);
+  });
+
+  test("forward sends extra attachments along with the original's", async () => {
+    const { call, fake } = await setup();
+    const res = await call("forward", {
+      account: "work",
+      messageId: "w1",
+      to: ["accountant@example.com"],
+      forwardText: "With my notes.",
+      attachments: [{ content: b64("notes-bytes"), filename: "notes.txt", mimeType: "text/plain" }],
+    });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(WORK)[0].raw);
+    const files = mime.parts.filter((p) => p.filename);
+    assert.deepEqual(files.map((f) => [f.filename, f.text]), [
+      ["report.pdf", "%PDF-1.4 fake pdf bytes"],
+      ["notes.txt", "notes-bytes"],
+    ]);
+  });
+
+  test("the size limits count the original's attachments and the added ones together", async () => {
+    const note = "The connector's owner can raise this limit with MAX_FORWARD_MB.";
+    const { call, fake, work } = await setup({ maxAttachmentBytes: 2 * 1048576, maxAttachmentNote: note });
+    work.messages.set("s1", {
+      id: "s1",
+      threadId: "s1",
+      labelIds: ["INBOX"],
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Slides" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/plain", filename: "", headers: [], body: { data: Buffer.from("see").toString("base64url"), size: 3 } },
+          { partId: "1", mimeType: "application/pdf", filename: "deck.pdf", headers: [], body: { attachmentId: "ATT1", size: 1.5 * 1048576 } },
+        ],
+      },
+    });
+    fake.batchCalls = 0;
+    const extra = { content: Buffer.alloc(1048576, 7).toString("base64"), filename: "more.bin" };
+    const res = await call("forward", { account: "work", messageId: "s1", to: ["x@example.com"], attachments: [extra] });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /^This email's attachments add up to 2\.5 MB \(1\.5 MB on the email and 1\.0 MB being added\), more than the 2 MB this connector re-attaches/);
+    assert.equal(fake.batchCalls, 0, "nothing was downloaded");
+    assert.ok(!fake.requests.some((r) => r.path.includes("/attachments/")));
+    assert.equal(fake.sentBy(WORK).length, 0);
+  });
+});
+
+describe("bulk changes with IDs from another account", () => {
+  const HINT = "IDs belong to one account; pass the account that returned them.";
+
+  test("threads: missing IDs are listed, and nothing but missing IDs is an error", async () => {
+    const { call, fake, work } = await setup();
+    const mixed = await call("bulk_update", { account: "work", threadIds: ["wt1", "pt1"], action: "mark_read", dryRun: true });
+    assert.equal(mixed.isError, false, mixed.text);
+    assert.equal(mixed.json.wouldChange, 1);
+    assert.deepEqual(mixed.json.notFound, ["pt1"]);
+    assert.equal(mixed.json.hint, HINT);
+    const run = await call("bulk_update", { account: "work", threadIds: ["wt1", "pt1"], action: "mark_read" });
+    assert.deepEqual([run.json.changed, run.json.notFound], [1, ["pt1"]]);
+    assert.ok(!work.messages.get("w1")!.labelIds!.includes("UNREAD"));
+
+    const none = await call("bulk_update", { account: "work", threadIds: ["pt1"], action: "mark_read" });
+    assert.equal(none.isError, true);
+    assert.equal(none.text, `None of the 1 thread ID(s) exist in ${WORK}. ${HINT}`);
+    assert.equal(fake.batchModifyCalls.length, 1, "nothing was changed for the missing ones");
+  });
+
+  test("messages: Gmail's refusal of the batch carries the hint, and so does a dry run", async () => {
+    const { call, fake, personal } = await setup();
+    const dry = await call("bulk_update", { account: "work", messageIds: ["p1"], action: "star", dryRun: true });
+    assert.equal(dry.isError, true);
+    assert.equal(dry.text, `None of the first 1 message ID(s) exist in ${WORK}. ${HINT}`);
+    const mixedDry = await call("bulk_update", { account: "work", messageIds: ["w1", "p1"], action: "star", dryRun: true });
+    assert.equal(mixedDry.isError, false, mixedDry.text);
+    assert.deepEqual([mixedDry.json.wouldChange, mixedDry.json.notFound, mixedDry.json.hint], [2, ["p1"], HINT]);
+
+    const run = await call("bulk_update", { account: "work", messageIds: ["w1", "p1"], action: "star" });
+    assert.equal(run.isError, true);
+    assert.match(run.text, /batchModify failed \(404\).*not found\. IDs belong to one account; pass the account that returned them\.$/);
+    assert.ok(!personal.messages.get("p1")!.labelIds!.includes("STARRED"));
+    assert.equal(fake.batchModifyCalls.length, 1);
+  });
+});
+
+describe("descriptions and empty results", () => {
+  test("a search or draft list with nothing in it says so", async () => {
+    const { call } = await setup();
+    const none = await call("search_threads", { query: "from:nobody@nowhere.example" });
+    assert.equal(none.isError, false, none.text);
+    assert.deepEqual(none.json, { threads: [], note: "No threads matched." });
+    const one = await call("search_threads", { account: "work", query: "from:nobody@nowhere.example" });
+    assert.deepEqual(one.json, { account: WORK, threads: [], note: "No threads matched." });
+    assert.equal((await call("search_threads", { account: "work", query: "from:boss" })).json.note, undefined);
+    const drafts = await call("list_drafts", {});
+    assert.equal(drafts.json.note, "No drafts.");
+    assert.equal((await call("list_drafts", { account: "work", query: "subject:nothing" })).json.note, "No drafts matched.");
+    await call("create_draft", { account: "work", to: ["a@example.com"], subject: "W", body: "w" });
+    assert.equal((await call("list_drafts", {})).json.note, undefined);
+  });
+
+  test("the search help covers Gmail's operators, and the account arguments say how results come back", async () => {
+    const { client } = await setup();
+    const { tools } = await client.listTools();
+    const prop = (tool: string, name: string) => ((tools.find((t) => t.name === tool)!.inputSchema.properties as any)[name].description as string);
+    const help = prop("search_threads", "query");
+    for (const op of ["from:", "deliveredto:", "list:", "older_than:", "newer_than:", "subject:", "rfc822msgid:", "AROUND", "label:\"Board Prep\"", "category:", "in:", "in:draft", "is:", "has:", "filename:", "larger:", "{ }", "-is:starred"]) {
+      assert.ok(help.includes(op), `search help mentions ${op}`);
+    }
+    assert.match(prop("search_threads", "account"), /merged into one newest-first list/);
+    assert.match(prop("list_drafts", "account"), /grouped per account/);
+    assert.match(prop("bulk_update", "query"), /same syntax as search_threads/);
+    assert.match(tools.find((t) => t.name === "reply")!.description!, /the user's own addresses are never included/);
+    assert.match(tools.find((t) => t.name === "get_thread")!.description!, /Gmail, Apple Mail and Outlook quote styles/);
+    const { instructions } = { instructions: (client.getInstructions() ?? "") };
+    assert.match(instructions, /ISO 8601 in UTC/);
+    assert.match(instructions, /fromMe: true/);
+    assert.match(instructions, /shorter than pageSize/);
+  });
+});
+
+describe("small defects", () => {
+  test("a thread preview's subject is the first email's, not the oldest shown one's", async () => {
+    const { call, fake, work } = await setup();
+    for (let i = 1; i <= 6; i++) {
+      fake.deliver(work, crlf([`From: p${i}@work.example`, `To: ${WORK}`, "Subject: Re: Project kickoff", "", `reply ${i}`]), { threadId: "kick" });
+    }
+    work.messages.set("kick0", {
+      ...fake.deliver(work, crlf(["From: boss@work.example", `To: ${WORK}`, "Subject: Project kickoff", "", "Let's start"]), { id: "kick0", threadId: "kick" }),
+      internalDate: "0",
+    });
+    // The fake lists a thread's messages in delivery order; put the first email first.
+    const msgs = [...work.messages.entries()].filter(([, m]) => m.threadId === "kick");
+    for (const [id] of msgs) work.messages.delete(id);
+    for (const [id, m] of [msgs.at(-1)!, ...msgs.slice(0, -1)]) work.messages.set(id, m);
+    const res = await call("search_threads", { account: "work", query: "subject:kickoff" });
+    const thread = res.json.threads.find((t: any) => t.id === "kick");
+    assert.equal(thread.subject, "Project kickoff");
+    assert.equal(thread.totalMessages, 7);
+    assert.equal(thread.omittedOlderMessages, 2);
+    assert.ok(thread.messages.every((m: any) => m.subject === undefined));
+  });
+
+  test("send_message refuses an email with nothing in it", async () => {
+    const { call, fake } = await setup();
+    const res = await call("send_message", { account: "work", to: ["x@example.com"], subject: "Just a subject" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /has no content: give it a body \(`body` or `htmlBody`\) or attachments, or pass a draftId/);
+    assert.equal(fake.sentBy(WORK).length, 0);
+    const files = await call("send_message", { account: "work", to: ["x@example.com"], attachments: [{ content: b64("x"), filename: "x.txt" }] });
+    assert.equal(files.isError, false, files.text);
+  });
+
+  test("system labels can't be renamed or deleted, and the refusal is local", async () => {
+    const { call, fake, work } = await setup();
+    const before = fake.requests.length;
+    const renamed = await call("update_label", { account: "work", labelId: "INBOX", displayName: "Inbox2" });
+    assert.equal(renamed.isError, true);
+    assert.match(renamed.text, /^INBOX is a system label that Gmail manages: it can't be renamed, recolored or deleted/);
+    const deleted = await call("delete_label", { account: "work", labelId: "starred" });
+    assert.match(deleted.text, /STARRED is a system label/);
+    assert.ok(work.labels.some((l) => l.id === "STARRED"));
+    assert.ok(!fake.requests.slice(before).some((r) => r.method !== "GET"), "only the label list was read");
+  });
+
+  test("a draft that was sent or deleted is explained", async () => {
+    const { call } = await setup();
+    const draft = await call("create_draft", { account: "work", to: ["a@example.com"], body: "d" });
+    assert.equal((await call("send_message", { account: "work", draftId: draft.json.id })).isError, false);
+    const gone = `Draft ${draft.json.id} no longer exists in ${WORK} (it may have been sent or deleted). If the ID came from another account, pass that account.`;
+    assert.equal((await call("get_draft", { account: "work", draftId: draft.json.id })).text, gone);
+    assert.equal((await call("send_message", { account: "work", draftId: draft.json.id })).text, gone);
+    assert.equal((await call("update_draft", { account: "work", draftId: draft.json.id, subject: "x" })).text, gone);
+    assert.equal((await call("delete_draft", { account: "work", draftId: draft.json.id })).text, gone);
+  });
+
+  test("get_message drops the snippet when the body is there; list_drafts names attachments", async () => {
+    const { call } = await setup();
+    const plain = await call("get_message", { account: "work", messageId: "w1" });
+    assert.equal(plain.json.snippet, undefined);
+    assert.ok(plain.json.plaintextBody);
+    assert.equal((await call("get_message", { account: "work", messageId: "w1", messageFormat: "MINIMAL" })).json.snippet, "snippet of w1");
+
+    await call("create_draft", {
+      account: "work",
+      to: ["a@example.com"],
+      subject: "Files",
+      body: "see",
+      attachments: [{ content: b64("abc"), filename: "a.txt", mimeType: "text/plain" }],
+    });
+    const full = await call("list_drafts", { account: "work", view: "DRAFT_VIEW_FULL" });
+    assert.deepEqual(full.json.drafts[0].attachments, [{ filename: "a.txt", mimeType: "text/plain", size: 3, partId: "1" }]);
+    const meta = await call("list_drafts", { account: "work" });
+    assert.equal(meta.json.drafts[0].attachments, undefined);
+  });
+});
+
+describe("cheaper attachment reads", () => {
+  /** A message whose body Gmail stores out of line (as it does for large ones), plus the given attachments. */
+  const bigMail = (ctx: Ctx, id: string, bodySize: number, files: { name: string; type: string; size: number; id?: string }[]) => {
+    ctx.work.messages.set(id, {
+      id,
+      threadId: id,
+      labelIds: ["INBOX"],
+      snippet: "x",
+      internalDate: "1700000000000",
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Big" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/html", filename: "", headers: [{ name: "Content-Type", value: "text/html; charset=UTF-8" }], body: { attachmentId: "BODY", size: bodySize } },
+          ...files.map((f, i) => ({ partId: String(i + 1), mimeType: f.type, filename: f.name, headers: [], body: { attachmentId: f.id ?? `ATT${i + 1}`, size: f.size } })),
+        ],
+      },
+    });
+    ctx.work.attachments.set(`${id}/BODY`, Buffer.from("<p>" + "x".repeat(bodySize) + "</p>").toString("base64url"));
+  };
+
+  test("a small attachment on a huge email takes two calls and never touches the body", async () => {
+    const ctx = await setup();
+    const csv = Buffer.from("a,b\n1,2\n");
+    bigMail(ctx, "big1", 2 * 1048576, [{ name: "prices.csv", type: "text/csv", size: csv.length }]);
+    ctx.work.attachments.set("big1/ATT1", csv.toString("base64url"));
+    ctx.fake.requests.length = 0;
+    const started = performance.now();
+    const res = (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "big1", filename: "prices.csv" } })) as any;
+    const took = performance.now() - started;
+    assert.equal(res.isError, undefined, res.content[0].text);
+    assert.equal(res.content[1].text, "--- contents of prices.csv (from the email; untrusted) ---\na,b\n1,2\n");
+    assert.deepEqual(JSON.parse(res.content[0].text).size, csv.length);
+    assert.deepEqual(ctx.fake.requests.map((r) => r.path), ["messages/big1", "messages/big1/attachments/ATT1"], "the 2 MB body is never fetched");
+    assert.ok(took < 250, `took ${took.toFixed(0)} ms`);
+  });
+
+  test("files that can't be shown are refused from their listed size and type, without a download", async () => {
+    const ctx = await setup();
+    bigMail(ctx, "big2", 100, [
+      { name: "disk.img", type: "application/octet-stream", size: 20 * 1048576 },
+      { name: "photo.png", type: "image/png", size: 5 * 1048576 },
+      { name: "scan.pdf", type: "application/pdf", size: 9 * 1048576 },
+      { name: "deck.pptx", type: "application/octet-stream", size: 9 * 1048576 },
+    ]);
+    const note = async (filename: string) => {
+      const res = await ctx.call("get_attachment", { account: "work", messageId: "big2", filename });
+      assert.equal(res.isError, false, res.text);
+      return res.json;
+    };
+    const img = await note("disk.img");
+    assert.match(img.note, /^This type of file \(application\/octet-stream\) can't be read as text/);
+    assert.equal(img.size, 20 * 1048576);
+    assert.match((await note("photo.png")).note, /^This image is too large to show here/);
+    assert.match((await note("scan.pdf")).note, /^This file is too large to read here \(9\.0 MB; up to 8 MB can be read\)/);
+    const deck = await note("deck.pptx");
+    assert.match(deck.note, /too large to read here/);
+    assert.equal(deck.mimeType, "application/vnd.openxmlformats-officedocument.presentationml.presentation", "the type comes from the name");
+    assert.ok(!ctx.fake.requests.some((r) => r.path.includes("/attachments/")), "nothing was downloaded");
+
+    // A small file of unknown type is still downloaded and told apart by its first bytes.
+    bigMail(ctx, "big3", 100, [{ name: "photo.dat", type: "application/octet-stream", size: png.length }]);
+    ctx.work.attachments.set("big3/ATT1", png.toString("base64url"));
+    const res = (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "big3", filename: "photo.dat" } })) as any;
+    assert.equal(res.content[1].type, "image");
+    assert.equal(JSON.parse(res.content[0].text).mimeType, "image/png");
+  });
+
+  test("a message's bodies are blanked out before parsing, compact or pretty-printed", () => {
+    const message = {
+      id: "m",
+      snippet: 'say "data": not a key',
+      payload: {
+        headers: [{ name: "Subject", value: 'quoted "data" word' }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/html", body: { size: 5, data: "PHA-eA" } },
+          { partId: "1", filename: "a.pdf", body: { attachmentId: "ATT1", size: 9 } },
+          { partId: "2", mimeType: "text/plain", body: { data: "", size: 0 } },
+        ],
+      },
+    };
+    for (const text of [JSON.stringify(message), JSON.stringify(message, null, 2)]) {
+      const stripped = JSON.parse(Buffer.from(withoutBodyData(Buffer.from(text))).toString("utf8"));
+      assert.equal(stripped.payload.parts[0].body.data, "");
+      assert.equal(stripped.payload.parts[0].body.size, 5);
+      assert.equal(stripped.payload.parts[1].body.attachmentId, "ATT1");
+      assert.equal(stripped.payload.headers[0].value, 'quoted "data" word');
+      assert.equal(stripped.snippet, 'say "data": not a key');
+    }
+    const plain = Buffer.from('{"id":"m","payload":{"headers":[]}}');
+    assert.equal(withoutBodyData(plain), plain, "unchanged when there is nothing to blank");
+  });
+
+  test("a file kept inline in the message is still read", async () => {
+    const ctx = await setup();
+    ctx.work.messages.set("inline1", {
+      id: "inline1",
+      threadId: "inline1",
+      labelIds: ["INBOX"],
+      payload: {
+        partId: "",
+        mimeType: "multipart/mixed",
+        filename: "",
+        headers: [{ name: "Subject", value: "Inline" }, { name: "From", value: "a@example.com" }, { name: "To", value: WORK }],
+        body: { size: 0 },
+        parts: [
+          { partId: "0", mimeType: "text/plain", filename: "", headers: [], body: { data: Buffer.from("see").toString("base64url"), size: 3 } },
+          { partId: "1", mimeType: "text/plain", filename: "note.txt", headers: [], body: { data: Buffer.from("inline note").toString("base64url"), size: 11 } },
+        ],
+      },
+    });
+    ctx.fake.requests.length = 0;
+    const res = (await ctx.client.callTool({ name: "get_attachment", arguments: { account: "work", messageId: "inline1", filename: "note.txt" } })) as any;
+    assert.match(res.content[1].text, /^--- contents of .* ---\ninline note$/);
+    assert.deepEqual(ctx.fake.requests.map((r) => r.path), ["messages/inline1", "messages/inline1"]);
+  });
+
+  test("attachment bytes are decoded in pieces, exactly", () => {
+    const piece = 3 * 1024 * 1024;
+    for (const length of [0, 1, 2, 3, 4, 5, piece - 1, piece, piece + 1, piece + 2, piece + 3, 2 * piece + 7]) {
+      const bytes = Buffer.from(Array.from({ length }, (_, i) => (i * 7919 + (i >> 8)) & 0xff));
+      for (const text of [bytes.toString("base64url"), bytes.toString("base64").replace(/\+/g, "-").replace(/\//g, "_")]) {
+        assert.ok(decodeBase64Url(Buffer.from(text, "latin1")).equals(bytes), `length ${length}${text.endsWith("=") ? " with padding" : ""}`);
+      }
+    }
+  });
+});
+
+describe("smaller results", () => {
+  test("long lists of remaining IDs come back as a count and where they start", async () => {
+    const ctx = await setup();
+    const ids: string[] = [];
+    for (let i = 0; i < 150; i++) {
+      ids.push(ctx.fake.deliver(ctx.work, crlf([`From: s${i}@x.example`, `To: ${WORK}`, `Subject: M${i}`, "", "x"]), { labelIds: ["INBOX", "UNREAD"] }).id);
+    }
+    const first = await ctx.call("bulk_update", { account: "work", messageIds: [...ids, ids[0]], action: "mark_read", maxEmails: 20 });
+    assert.equal(first.isError, false, first.text);
+    assert.equal(first.json.changed, 20);
+    assert.equal(first.json.remainingMessageIds, undefined);
+    assert.equal(first.json.remainingCount, 130);
+    assert.equal(first.json.remainingHint, "Pass the 130 IDs after the first 20 you gave (duplicates removed) as messageIds next time.");
+    assert.match(first.json.more, /To continue, run it again with messageIds set to the 130 IDs after the first 20 you gave \(duplicates removed\)\./);
+    const rest = await ctx.call("bulk_update", { account: "work", messageIds: ids.slice(20), action: "mark_read" });
+    assert.equal(rest.json.changed, 130);
+    assert.equal(rest.json.remainingCount, undefined);
+
+    const threadIds: string[] = [];
+    for (let i = 0; i < 120; i++) {
+      threadIds.push(ctx.fake.deliver(ctx.work, crlf([`From: t${i}@x.example`, `To: ${WORK}`, `Subject: T${i}`, "", "x"]), { labelIds: ["INBOX"] }).threadId);
+    }
+    const threads = await ctx.call("bulk_update", { account: "work", threadIds, action: "star", maxEmails: 10 });
+    assert.equal(threads.json.remainingThreadIds, undefined);
+    assert.equal(threads.json.remainingCount, 110);
+    assert.match(threads.json.remainingHint, /^Pass the 110 IDs after the first 10 you gave/);
+    // Up to 100 the list itself is returned, as before.
+    const few = await ctx.call("bulk_update", { account: "work", threadIds: threadIds.slice(10), action: "star", maxEmails: 10 });
+    assert.equal(few.json.remainingThreadIds.length, 100);
+    assert.equal(few.json.remainingCount, undefined);
+  });
+
+  test("changing a thread reports how many emails changed and the thread's labels, not each email's", async () => {
+    const { call, fake, work } = await setup();
+    fake.deliver(work, crlf(["From: boss@work.example", `To: ${WORK}`, "Subject: Re: Q3 report", "", "ping"]), { threadId: "wt1", labelIds: ["INBOX"] });
+    const res = await call("label_thread", { account: "work", threadId: "wt1", labelIds: ["STARRED"] });
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED"] });
+    const trashed = await call("trash_thread", { account: "work", threadId: "wt1" });
+    assert.deepEqual(trashed.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED", "TRASH"] });
+  });
+});

@@ -77,7 +77,12 @@ const BATCH_SIZE = 50;
 const MAX_RETRIES = 2;
 const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded"]);
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Replaces the wait before a retry (tests pass one that only records the delays). */
+export function setRetryWait(fn: (ms: number) => Promise<void>): void {
+  wait = fn;
+}
 
 function errorInfo(text: string): { message: string; reasons: string[] } {
   try {
@@ -183,7 +188,7 @@ export class GmailClient {
       }
       const retryable = isRateLimited(res.status, text) || (idempotent && res.status >= 500);
       if (retryable && attempt < MAX_RETRIES) {
-        await sleep(retryDelay(res, attempt));
+        await wait(retryDelay(res, attempt));
         attempt++;
         continue;
       }
@@ -227,7 +232,7 @@ export class GmailClient {
     const results = new Array<BatchResult<T>>(items.length);
     let pending = items.map((_, i) => i);
     for (let round = 0; pending.length; round++) {
-      if (round > 0) await sleep(500 * round);
+      if (round > 0) await wait(500 * round);
       const retry: number[] = [];
       for (let start = 0; start < pending.length; start += BATCH_SIZE) {
         const chunk = pending.slice(start, start + BATCH_SIZE);
