@@ -274,6 +274,7 @@ export const MAX_MIME_DEPTH = 64;
 /**
  * Walks a message payload collecting its body text and HTML plus attachments.
  * - Inside multipart/alternative, the first non-empty text/plain and the last HTML version win.
+ * - format=flowed text has its soft line breaks joined (see unflow).
  * - Other multiparts (mixed, related, …) concatenate their body parts in order, so a body that
  *   Apple Mail splits around an inline attachment is kept whole.
  * - Attached emails (message/rfc822) are attachments; their text never becomes this message's body.
@@ -334,8 +335,10 @@ export async function extractContent(
       if (embedded) return {};
       let data = part.body?.data;
       if (!data && part.body?.attachmentId) data = await loadData(part.body.attachmentId);
-      const content = data ? decodeBody(data, header(part, "Content-Type")) : "";
-      return mimeType === "text/plain" ? { text: content } : { html: content };
+      const contentType = header(part, "Content-Type");
+      const content = data ? decodeBody(data, contentType) : "";
+      if (mimeType !== "text/plain") return { html: content };
+      return { text: FLOWED.test(contentType ?? "") ? unflow(content, DEL_SP.test(contentType ?? "")) : content };
     }
     if (mimeType === "text/calendar" && !part.filename) {
       addAttachment(part, "invite.ics");
@@ -350,6 +353,42 @@ export async function extractContent(
     return { text, html, attachments: attachments.filter((a) => !invites.includes(a)) };
   }
   return { text, html, attachments };
+}
+
+const FLOWED = /;\s*format\s*=\s*"?flowed"?\s*(?:;|$)/i;
+const DEL_SP = /;\s*delsp\s*=\s*"?yes"?\s*(?:;|$)/i;
+
+/**
+ * Joins the soft line breaks of format=flowed text (RFC 3676): a line ending in a space continues on the
+ * next line of the same quote depth (with `delSp`, without that space). Quoted lines keep their depth,
+ * as ">" marks; the space added in front of lines that start with ">", "From " or a space is removed;
+ * the signature line "-- " stays a line of its own.
+ */
+export function unflow(text: string, delSp: boolean): string {
+  const out: string[] = [];
+  const marks = (depth: number) => (depth ? `${">".repeat(depth)} ` : "");
+  let paragraph: string | undefined;
+  let paragraphDepth = 0;
+  for (const raw of text.split(/\r?\n/)) {
+    let depth = 0;
+    while (raw.charCodeAt(depth) === 62 /* > */) depth++;
+    let line = raw.charCodeAt(depth) === 32 ? raw.slice(depth + 1) : raw.slice(depth);
+    const flowed = line.endsWith(" ") && line !== "-- ";
+    if (flowed && delSp) line = line.slice(0, -1);
+    // An empty line ends a paragraph even after a soft break (stricter readings would swallow it).
+    if (paragraph !== undefined && depth === paragraphDepth && line) paragraph += line;
+    else {
+      if (paragraph !== undefined) out.push(marks(paragraphDepth) + paragraph);
+      paragraph = line;
+      paragraphDepth = depth;
+    }
+    if (!flowed) {
+      out.push(marks(depth) + paragraph);
+      paragraph = undefined;
+    }
+  }
+  if (paragraph !== undefined) out.push(marks(paragraphDepth) + paragraph);
+  return out.join("\n");
 }
 
 /** The readable body: the plain-text part, or the HTML converted to text when that's missing or blank. */
@@ -396,17 +435,23 @@ export function cleanSnippet(snippet: string | undefined): string | undefined {
   return clean || undefined;
 }
 
+/**
+ * Runs of blank space to collapse: two or more of any space but tab and line feed, except plain spaces
+ * that indent a line (list items, preformatted text, code), which match the first alternative and stay.
+ */
+const BLANK_RUN = /(\n|^) {2,}(?=\S)|[^\S\n\t]{2,}/g;
+
 /** C0 control characters other than tab and line breaks; vertical tab and form feed count as line breaks. */
 const CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
 /**
  * Removes invisible padding and control characters, and collapses the runs of blank space they leave
  * behind (any Unicode space, and CRLF line ends). Tabs are kept: spreadsheet text uses them to separate
- * cells, including empty ones.
+ * cells, including empty ones; so are the spaces that indent a line.
  */
 export function cleanBody(text: string): string {
   return stripInvisible(text.replace(/\r\n?/g, "\n").replace(CONTROLS, (c) => (c === "\x0b" || c === "\x0c" ? "\n" : "")))
-    .replace(/[^\S\n\t]{2,}/g, " ")
+    .replace(BLANK_RUN, (run, lineStart: string | undefined) => (lineStart === undefined ? " " : run))
     .split("\n")
     .map((line) => line.trimEnd()) // not /[^\S\n]+\n/, which is quadratic on long runs of tabs
     .join("\n")

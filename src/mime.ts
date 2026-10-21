@@ -629,6 +629,10 @@ const LINE_TAGS = new Set([
   "div", "tr", "li", "dd", "dt", "table", "caption", "section", "article", "header", "footer", "nav", "aside", "main",
   "address", "center", "form", "fieldset", "legend", "details", "summary", "figcaption", "hr", "menu", "dir",
 ]);
+/** Nested list items are indented two spaces per level, up to this many levels. */
+const MAX_LIST_INDENT = 8;
+/** An ordered list's `start` is kept within ± this (`<ol start=99999999999999999999>` would print 1e20). */
+const MAX_LIST_START = 1_000_000;
 /** Elements whose content is never shown. */
 const HIDDEN_TAGS = ["script", "style", "title", "template", "xmp", "iframe", "noembed", "noframes"];
 const HIDDEN_END = new Map(HIDDEN_TAGS.map((tag) => [tag, new RegExp(`</${tag}[\\s/>]`, "gi")]));
@@ -1063,13 +1067,18 @@ export function htmlToText(html: string): string {
       b.line();
       if (!closing) {
         const list = lists.at(-1);
-        b.marker = list?.ordered ? `${list.next++}.` : "-";
+        // Items of nested lists are indented two spaces per level (up to MAX_LIST_INDENT levels).
+        const indent = "  ".repeat(Math.min(Math.max(lists.length - 1, 0), MAX_LIST_INDENT));
+        b.marker = indent + (list?.ordered ? `${list.next++}.` : "-");
       }
     } else if (tag === "ul" || tag === "ol") {
       if (closing) lists.pop();
       if (lists.length) b.line();
       else b.blank();
-      if (!closing) lists.push({ ordered: tag === "ol", next: Number.parseInt(attrs?.get("start") ?? "", 10) || 1 });
+      if (!closing) {
+        const start = Number.parseInt(attrs?.get("start") ?? "", 10);
+        lists.push({ ordered: tag === "ol", next: Number.isNaN(start) ? 1 : Math.min(Math.max(start, -MAX_LIST_START), MAX_LIST_START) });
+      }
     } else if (PARAGRAPH_TAGS.has(tag)) {
       b.blank();
       if (tag === "pre") {

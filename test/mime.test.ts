@@ -12,6 +12,7 @@ import {
   parseAddressList,
   parseMailboxes,
   recipientsFrom,
+  unflow,
   type ApiMessagePart,
 } from "../src/format.js";
 import { Base64UrlData, buildMime, decodeBase64, decodeEntities, encodeHeaderValue, htmlToText } from "../src/mime.js";
@@ -106,8 +107,8 @@ test("htmlToText lays text out like a browser", () => {
   // Source line breaks and indentation inside text are just spaces; <pre> keeps them.
   assert.equal(htmlToText("<p>Thanks for the\n   update, see you\non Monday.</p>"), "Thanks for the update, see you on Monday.");
   assert.equal(htmlToText("<p>Output:</p><pre>\nname    qty\n  tea     2</pre>Done"), "Output:\n\nname    qty\n  tea     2\n\nDone");
-  // Ordered lists are numbered, nested lists stay together, table cells are tab-separated.
-  assert.equal(htmlToText("<ol><li>One<ul><li>a</li></ul></li><li>Two</li></ol>"), "1. One\n- a\n2. Two");
+  // Ordered lists are numbered, nested lists are indented, table cells are tab-separated.
+  assert.equal(htmlToText("<ol><li>One<ul><li>a</li></ul></li><li>Two</li></ol>"), "1. One\n  - a\n2. Two");
   assert.equal(htmlToText("<table><tr><td>Item</td><td>Price</td></tr><tr><td>Tea</td><td>3</td></tr></table>"), "Item\tPrice\nTea\t3");
   // Hidden content, including unterminated comments and scripts, never shows.
   assert.equal(htmlToText('<title>T</title><script>var s = "</p>";</script>Shown<style>p{}</style><!-- hidden'), "Shown");
@@ -156,6 +157,44 @@ test("tables keep one row per line even when every cell holds a paragraph, as in
   );
   // Cells left open, and empty ones.
   assert.equal(htmlToText("<table><tr><td>a<td><p>b</p><tr><td>c<td></table>after"), "a\tb\nc\nafter");
+});
+
+test("nested lists are indented and list numbers stay sane", () => {
+  assert.equal(
+    htmlToText("<ol><li>Freeze main<ol><li>announce in #eng</li><li>tag release<ul><li>v2.1</li></ul></li></ol></li><li>Run migrations</li></ol>"),
+    "1. Freeze main\n  1. announce in #eng\n  2. tag release\n    - v2.1\n2. Run migrations",
+  );
+  assert.equal(htmlToText('<ol start="0"><li>a</li><li>b</li></ol>'), "0. a\n1. b");
+  assert.equal(htmlToText("<ol start=99999999999999999999><li>a</li></ol><ol start=-7><li>b</li></ol>"), "1000000. a\n\n-7. b");
+  // However deep the nesting, an item is indented at most 16 spaces.
+  assert.equal(htmlToText(`${"<ul><li>x".repeat(50)}`).split("\n").at(-1), `${" ".repeat(16)}- x`);
+});
+
+test("format=flowed text has its soft line breaks joined", () => {
+  assert.equal(
+    unflow("Hi team, \nhere is the status for \nthis week.\n\nNext steps:\n- load tests\n-- \nSebastian", false),
+    "Hi team, here is the status for this week.\n\nNext steps:\n- load tests\n-- \nSebastian",
+  );
+  // DelSp=yes removes the space at each soft break (text without spaces between words, like Japanese).
+  assert.equal(unflow("来週の打ち合わせ \nの件、承知 \nいたしました。", true), "来週の打ち合わせの件、承知いたしました。");
+  // An empty line after a soft break still separates paragraphs.
+  assert.equal(unflow("one \ntwo \n\nthree", false), "one two \n\nthree");
+  // Quote depth is kept, a change of depth ends a paragraph, and space-stuffing is undone.
+  assert.equal(
+    unflow("> Can we meet \n> on Friday?\n>> Earlier \n>> note\n > not a quote\n From here", false),
+    "> Can we meet on Friday?\n>> Earlier note\n> not a quote\nFrom here",
+  );
+});
+
+test("a format=flowed body is read unwrapped", async () => {
+  const text = "Hello, this line was \r\nwrapped by the mail program.\r\n";
+  const part: ApiMessagePart = {
+    partId: "",
+    mimeType: "text/plain",
+    headers: [{ name: "Content-Type", value: 'text/plain; charset="UTF-8"; format=flowed; delsp=no' }],
+    body: { size: text.length, data: Buffer.from(text).toString("base64url") },
+  };
+  assert.equal((await extractContent(part, async () => "")).text, "Hello, this line was wrapped by the mail program.\n");
 });
 
 test("htmlToText decodes entities fully and safely", () => {
@@ -312,6 +351,11 @@ test("invisible padding is removed, but joiners that are part of words are kept"
   // Persian and Hindi need U+200C between letters (after combining marks); Mongolian needs U+180E.
   for (const word of ["می‌خواهم", "क्‌ष", "ᠮᠣᠷᠢ᠎ᠨ", "👨‍👩‍👧"]) assert.equal(cleanBody(`a ${word} b`), `a ${word} b`);
   assert.equal(cleanBody("Blank⠀⠀ Braille​"), "Blank Braille");
+});
+
+test("cleanBody keeps the spaces that indent a line, and collapses other runs", () => {
+  assert.equal(cleanBody("Steps:\n  - one\n    - two\n\u00a0\u00a0\u00a0padded\nwide   gap  \n\tx"), "Steps:\n  - one\n    - two\n padded\nwide gap\n\tx");
+  assert.equal(cleanBody("    \n  \n  code\n"), "code");
 });
 
 test("cleanBody stays fast on long runs of tabs and spaces", () => {
