@@ -87,8 +87,6 @@ export interface RedirectTarget {
  * owns that scheme.
  */
 export function redirectTarget(env: Env, redirectUri: string): RedirectTarget | undefined {
-  const hosts = list(env.ALLOWED_REDIRECT_HOSTS);
-  const allowed = hosts.length ? hosts : DEFAULT_REDIRECT_HOSTS;
   let url: URL;
   try {
     url = new URL(redirectUri);
@@ -98,11 +96,35 @@ export function redirectTarget(env: Env, redirectUri: string): RedirectTarget | 
   const host = url.hostname.toLowerCase();
   const local = LOOPBACK_HOSTS.includes(host);
   const schemeOk = url.protocol === "https:" || (url.protocol === "http:" && local);
-  return schemeOk && allowed.includes(host) ? { host, local } : undefined;
+  return schemeOk && allowedHosts(env).includes(host) ? { host, local } : undefined;
+}
+
+/** The hosts that may receive tokens: ALLOWED_REDIRECT_HOSTS, or Claude's and loopback addresses. */
+export function allowedHosts(env: Env): string[] {
+  const hosts = list(env.ALLOWED_REDIRECT_HOSTS);
+  return hosts.length ? hosts : DEFAULT_REDIRECT_HOSTS;
 }
 
 export function redirectHostAllowed(env: Env, redirectUri: string): boolean {
   return redirectTarget(env, redirectUri) !== undefined;
+}
+
+/**
+ * Whether a client ID may be looked up. An ID that is an https URL names a client ID metadata
+ * document, which the OAuth library fetches from that URL; only documents on the hosts that may
+ * receive tokens are fetched, so an anonymous request can't make the connector fetch any address.
+ * Registered clients have random IDs, which are always looked up (in storage).
+ */
+export function clientIdAllowed(env: Env, clientId: string): boolean {
+  if (!/^https:\/\//i.test(clientId.trim())) return true;
+  let url: URL;
+  try {
+    url = new URL(clientId.trim());
+  } catch {
+    return false;
+  }
+  const host = url.hostname.toLowerCase();
+  return allowedHosts(env).includes(host) && !LOOPBACK_HOSTS.includes(host);
 }
 
 /** Whether `email` may still use the connector: the owner, or an address in ALLOWED_EMAILS. */

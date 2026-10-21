@@ -19,15 +19,20 @@ const STRANGER = "stranger@evil.example";
 
 const crlf = (lines: string[]) => lines.join("\r\n");
 
+/** Each browser (and each client registration) comes from its own address: the connector rate-limits per address. */
+let addresses = 0;
+const nextAddress = () => `100.64.${Math.floor(++addresses / 250) % 256}.${(addresses % 250) + 1}`;
+
 /** A browser: follows nothing automatically, but keeps cookies like one. */
 class Browser {
   cookies = new Map<string, string>();
+  readonly address = nextAddress();
 
   constructor(private mf: Miniflare) {}
 
   async fetch(pathOrUrl: string, init: { method?: string; form?: Record<string, string>; headers?: Record<string, string> } = {}) {
     const url = pathOrUrl.startsWith("http") ? pathOrUrl : ORIGIN + pathOrUrl;
-    const headers: Record<string, string> = { ...init.headers };
+    const headers: Record<string, string> = { "CF-Connecting-IP": this.address, ...init.headers };
     if (this.cookies.size) headers.Cookie = [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; ");
     let body: string | undefined;
     if (init.form) {
@@ -100,6 +105,19 @@ export default {
 
 const COMPAT = { compatibilityDate: "2026-09-01", compatibilityFlags: ["nodejs_compat", "global_fetch_strictly_public"] };
 
+/** Client ID metadata documents served by fake hosts (URL → document body), and every fetch the Worker made for one. */
+const cimdDocs = new Map<string, Record<string, unknown>>();
+const cimdHits: string[] = [];
+/** A document an attacker's host would serve: valid, naming Claude's callback, so only the host check keeps it out. */
+const attackerDoc = (url: string) => ({
+  client_id: url,
+  client_name: "Google Account Security",
+  redirect_uris: [CLAUDE_CALLBACK],
+  token_endpoint_auth_method: "none",
+  grant_types: ["authorization_code", "refresh_token"],
+  response_types: ["code"],
+});
+
 /** Google's revoke endpoint fails while this is set (tests a revoke Google doesn't confirm). */
 let failRevoke = false;
 /**
@@ -120,6 +138,13 @@ async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, strin
           kvNamespaces: ["OAUTH_KV"],
           bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
           outboundService: async (req: MfRequest) => {
+            if (cimdDocs.has(req.url) || req.url.startsWith("https://cimd.attacker.example/")) {
+              cimdHits.push(req.url);
+              // Not cacheable, so every lookup the library makes shows up here.
+              return new MfResponse(JSON.stringify(cimdDocs.get(req.url) ?? attackerDoc(req.url)), {
+                headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+              });
+            }
             if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
             const body = req.method === "GET" ? undefined : await req.text();
             if (refreshFailure && req.url === "https://oauth2.googleapis.com/token" && body?.includes("grant_type=refresh_token")) {
@@ -196,20 +221,27 @@ after(async () => {
   await mf?.dispose();
 });
 
-async function registerClient(redirectUri = CLAUDE_CALLBACK, on = mf) {
+/** Registers a client the way Claude does (a public client with PKCE), with any fields overridden. */
+async function register(body: Record<string, unknown>, on = mf, address = nextAddress()) {
   const res = await on.dispatchFetch(`${ORIGIN}/register`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "CF-Connecting-IP": address },
     body: JSON.stringify({
       client_name: "Claude",
-      redirect_uris: [redirectUri],
+      redirect_uris: [CLAUDE_CALLBACK],
       token_endpoint_auth_method: "none",
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
+      ...body,
     }),
   });
-  assert.equal(res.status, 201, await res.clone().text());
-  return ((await res.json()) as { client_id: string }).client_id;
+  return { status: res.status, headers: res.headers, body: (await res.json()) as any };
+}
+
+async function registerClient(redirectUri = CLAUDE_CALLBACK, on = mf) {
+  const res = await register({ redirect_uris: [redirectUri] }, on);
+  assert.equal(res.status, 201, JSON.stringify(res.body));
+  return res.body.client_id as string;
 }
 
 function authorizeUrl(clientId: string, challenge: string, redirectUri = CLAUDE_CALLBACK) {
@@ -877,6 +909,85 @@ describe("hosted connector (Cloudflare Worker)", () => {
     // The linked accounts stay linked, and a second click finds nothing left to disconnect except the new one.
     const again = await browser.fetch((await browser.fetch("/accounts/disconnect", { form: { csrf } })).location);
     assert.match(again.text, /Disconnected Claude \(1 connection\)/);
+  });
+
+  test("client metadata documents are read only from Claude's hosts, once per request", async () => {
+    cimdHits.length = 0;
+    const attacker = "https://cimd.attacker.example/client.json";
+    const refused = await new Browser(mf).fetch(authorizeUrl(attacker, "x".repeat(43)));
+    assert.equal(refused.status, 403, refused.text);
+    assert.match(refused.text, /only works with Claude, but this request comes from an app at https:\/\/cimd\.attacker\.example/);
+    const form = await tokenRequest({ grant_type: "authorization_code", code: "a:b:c", client_id: attacker, code_verifier: "v" });
+    assert.equal(form.status, 400);
+    assert.equal(form.body.error, "invalid_client");
+    const basic = await mf.dispatchFetch(`${ORIGIN}/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${Buffer.from(`${encodeURIComponent(attacker)}:`).toString("base64")}` },
+      body: new URLSearchParams({ grant_type: "authorization_code", code: "a:b:c", code_verifier: "v" }).toString(),
+    });
+    assert.equal(basic.status, 400);
+    assert.equal(((await basic.json()) as any).error, "invalid_client");
+    assert.deepEqual(cimdHits, [], "the attacker's host was never contacted");
+
+    // A document on claude.ai is used, and fetched once per request rather than once per lookup.
+    const clientId = "https://claude.ai/mcp/client-metadata.json";
+    cimdDocs.set(clientId, { ...attackerDoc(clientId), client_name: "Claude (metadata)" });
+    const verifier = randomBytes(32).toString("base64url");
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+    const browser = new Browser(mf);
+    const consent = await browser.fetch(authorizeUrl(clientId, challenge));
+    assert.equal(consent.status, 200, consent.text);
+    assert.match(consent.text, /Connect your Gmail to Claude \(metadata\)/);
+    assert.deepEqual(cimdHits, [clientId]);
+    const toGoogle = await answerConsent(browser, consent.text);
+    assert.equal(toGoogle.status, 302, toGoogle.text);
+    assert.equal(cimdHits.length, 2);
+    assert.equal((await browser.googleSignIn(toGoogle.location, fake, PERSONAL)).status, 303);
+    const page = await browser.fetch("/accounts");
+    const done = await browser.fetch("/accounts/done", { form: { csrf: field(page.text, "csrf") } });
+    assert.equal(done.status, 302, done.text);
+    const token = await exchangeCode(clientId, new URL(done.location).searchParams.get("code")!, verifier);
+    const accounts = await callToolWith(token.access_token, "list_accounts");
+    assert.equal(accounts.isError, false, accounts.text);
+    assert.deepEqual(accounts.json.accounts.map((a: any) => a.email), [PERSONAL], "earlier tests left only the owner's account linked");
+    assert.equal(cimdHits.length, 4, "one fetch each for the consent page, its answer, Done and the token request");
+  });
+
+});
+
+describe("rate limits (per Worker instance)", () => {
+  let mf3: Miniflare;
+  before(async () => {
+    const fake3 = new FakeGmail();
+    fake3.addMailbox(PERSONAL, "rt-personal");
+    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL });
+  });
+  after(async () => {
+    await mf3?.dispose();
+  });
+
+  test("client registration: 5 a minute per address, 20 per instance", async () => {
+    const one = "198.51.100.1";
+    for (let i = 0; i < 5; i++) assert.equal((await register({}, mf3, one)).status, 201, `registration ${i + 1}`);
+    const sixth = await register({}, mf3, one);
+    assert.equal(sixth.status, 429);
+    assert.equal(sixth.body.error, "too_many_requests");
+    assert.equal(sixth.headers.get("Retry-After"), "60");
+    assert.equal((await register({}, mf3, "198.51.100.2")).status, 201, "another address is fine");
+    // 6 so far; the instance allows 20 in all.
+    for (let i = 0; i < 14; i++) assert.equal((await register({}, mf3, `198.51.100.${10 + i}`)).status, 201, `registration ${7 + i}`);
+    assert.equal((await register({}, mf3, "198.51.100.99")).status, 429, "the instance-wide limit");
+  });
+
+  test("the consent page: 30 a minute per address", async () => {
+    const browser = new Browser(mf3);
+    const url = authorizeUrl("no-such-client", "x".repeat(43));
+    for (let i = 0; i < 30; i++) assert.equal((await browser.fetch(url)).status, 400, `request ${i + 1}`);
+    const limited = await browser.fetch(url);
+    assert.equal(limited.status, 429);
+    assert.match(limited.text, /Too many requests/);
+    assert.equal(limited.headers.get("Retry-After"), "60");
+    assert.equal((await new Browser(mf3).fetch(url)).status, 400, "another address is fine");
   });
 });
 

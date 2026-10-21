@@ -168,8 +168,13 @@ only proves who you are: it never re-adds an account you removed; use **Link** f
 an address off `ALLOWED_EMAILS`, Claude connections made by that address stop working.
 
 Tokens are only ever sent back to Claude (`https://claude.ai`, `https://claude.com`, or a local Claude
-app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. Variables you add in the
-dashboard are kept when the Worker redeploys.
+app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. The same hosts are the only ones
+the connector reads client metadata documents from. Variables you add in the dashboard are kept when
+the Worker redeploys.
+
+Requests anyone can make without signing in (registering a Claude client, opening the consent page)
+are rate-limited per Worker instance (best effort: Cloudflare runs several instances), so someone who
+finds the URL can't burn through the free plan's daily storage writes in one go.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
 batches Gmail calls to stay well inside that: searching five inboxes takes about 15 calls, archiving

@@ -12,7 +12,7 @@
  * are kept in cookies. Otherwise anyone who finds the URL could use up the free plan's 1,000 KV
  * writes a day, after which Claude can't refresh its token until the next day.
  */
-import { AuthorizationError, CimdFetchError, type AuthRequest } from "@cloudflare/workers-oauth-provider";
+import { AuthorizationError, CimdFetchError, type AuthRequest, type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { sameEmail } from "../src/accounts.js";
 import {
   AuthError,
@@ -27,6 +27,7 @@ import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal
 import { checkAccounts } from "./health.js";
 import {
   allowedEmails,
+  clientIdAllowed,
   emailAllowed,
   googleClient,
   GRANT_USER,
@@ -199,6 +200,48 @@ async function startGoogleSignIn(
 
 // ---------- handlers ----------
 
+/** `https://host` (or just the scheme) of a URI for a message; the URI may not parse at all. */
+function safeHost(uri: string): string {
+  try {
+    const url = new URL(uri);
+    return url.host ? `${url.protocol}//${url.host}` : url.protocol;
+  } catch {
+    return "an address that can't be read";
+  }
+}
+
+/**
+ * The library looks the client up inside parseAuthRequest and again whenever lookupClient is
+ * called; for a client ID metadata document every lookup is a fetch. This memoizes lookups for one
+ * request. (The library calls lookupClient on the object it runs on, so an override on an object
+ * that inherits from the helpers also catches its own calls.)
+ */
+function withClientCache(oauth: OAuthHelpers): OAuthHelpers {
+  const cache = new Map<string, ReturnType<OAuthHelpers["lookupClient"]>>();
+  const cached: OAuthHelpers = Object.create(oauth);
+  cached.lookupClient = (clientId: string) => {
+    let result = cache.get(clientId);
+    if (!result) {
+      result = oauth.lookupClient(clientId);
+      cache.set(clientId, result);
+    }
+    return result;
+  };
+  return cached;
+}
+
+/**
+ * Refuses an authorization request whose client_id names a client ID metadata document on a host
+ * that isn't Claude's, before anything is fetched (the library would fetch it from any address).
+ */
+function foreignClient(env: Env, request: Request): Response | undefined {
+  const clientId = new URL(request.url).searchParams.get("client_id") ?? "";
+  if (clientIdAllowed(env, clientId)) return undefined;
+  return messagePage("Can't connect", `This connector only works with Claude, but this request comes from an app at ${safeHost(clientId)}.`, {
+    status: 403,
+  });
+}
+
 /** Turns an invalid authorization request into an error for Claude, or a page if it can't go back safely. */
 function authorizeError(env: Env, error: unknown): Response {
   // Only send errors back to Claude; anything else is shown here, so this can't be an open redirect.
@@ -226,7 +269,9 @@ function notClaude(redirectUri: string): Response {
 const consentCookie = (csrf: string) => `${CONSENT_COOKIE_PREFIX}${csrf.slice(0, 16)}`;
 
 async function authorizeGet(request: Request, env: Env, origin: string): Promise<Response> {
-  const oauth = env.OAUTH_PROVIDER;
+  const foreign = foreignClient(env, request);
+  if (foreign) return foreign;
+  const oauth = withClientCache(env.OAUTH_PROVIDER);
   let authRequest: AuthRequest;
   let clientName: string;
   try {
@@ -264,11 +309,14 @@ async function authorizePost(request: Request, env: Env, origin: string): Promis
   }
   const headers = new Headers();
   headers.append("Set-Cookie", clearCookie(consentCookie(csrf)));
+  const foreign = foreignClient(env, request);
+  if (foreign) return foreign;
+  const oauth = withClientCache(env.OAUTH_PROVIDER);
   try {
-    const authRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+    const authRequest = await oauth.parseAuthRequest(request);
     if (!redirectHostAllowed(env, authRequest.redirectUri)) return notClaude(authRequest.redirectUri);
     if (form.get("decision") !== "approve") return redirect(clientErrorUrl(authRequest), headers);
-    const client = await env.OAUTH_PROVIDER.lookupClient(authRequest.clientId);
+    const client = await oauth.lookupClient(authRequest.clientId);
     return startGoogleSignIn(
       env,
       origin,

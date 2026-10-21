@@ -11,6 +11,7 @@ import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validatio
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError, defaultFetch } from "../src/google.js";
 import { createServer } from "../src/server.js";
+import { guard } from "./guard.js";
 import { connectionAllowed, googleClient, KvAccountSource, type Env, type GrantProps } from "./owner.js";
 import { handleBrowserRequest } from "./routes.js";
 
@@ -144,7 +145,9 @@ function providerFor(origin: string): OAuthProvider<Env> {
 }
 
 export default {
-  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return providerFor(new URL(request.url).origin).fetch(request, env, ctx);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    // Rate limits and the client-metadata host check come first, so they also cover the endpoints
+    // the OAuth library handles itself (/register, /token).
+    return (await guard(request, env)) ?? providerFor(new URL(request.url).origin).fetch(request, env, ctx);
   },
 };
