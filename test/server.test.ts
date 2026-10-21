@@ -598,6 +598,21 @@ describe("labels, trash and spam", () => {
     assert.deepEqual(personal.messages.get("p1")!.labelIds, ["INBOX"]);
   });
 
+  test("system labels are applied without reading the label list; names and user labels read it once", async () => {
+    const { call, fake, work } = await setup();
+    const labelReads = () => fake.requests.filter((r) => r.path === "labels" && r.method === "GET").length;
+    await call("label_message", { account: "work", messageId: "w2", labelIds: ["STARRED", "IMPORTANT"] });
+    await call("update_message_labels", { account: "work", messageId: "w2", addLabelIds: ["CATEGORY_UPDATES"], removeLabelIds: ["INBOX"] });
+    await call("unlabel_thread", { account: "work", threadId: "wt1", labelIds: ["UNREAD"] });
+    assert.equal(labelReads(), 0);
+    assert.deepEqual(work.messages.get("w2")!.labelIds, ["UNREAD", "STARRED", "IMPORTANT", "CATEGORY_UPDATES"]);
+    await call("label_message", { account: "work", messageId: "w2", labelIds: ["Reports", "STARRED"] });
+    assert.equal(labelReads(), 1);
+    await call("label_message", { account: "work", messageId: "w2", labelIds: ["inbox"] });
+    assert.equal(labelReads(), 2, "a name in another case is looked up");
+    assert.ok(work.messages.get("w2")!.labelIds!.includes("INBOX"));
+  });
+
   test("update_message_labels moves a message in one call", async () => {
     const { call, work } = await setup();
     const res = await call("update_message_labels", {

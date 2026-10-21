@@ -1355,10 +1355,17 @@ export class Mailbox {
     });
   }
 
+  /**
+   * The labels needed to resolve `refs`: system label IDs (INBOX, UNREAD, CATEGORY_…) stand for
+   * themselves, so only names and user labels cost a read of the account's label list.
+   */
+  private async labelsFor(refs: string[]): Promise<ApiLabel[]> {
+    if (refs.every(isSystemLabelId)) return refs.map((id): ApiLabel => ({ id, name: id, type: "system" }));
+    return ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
+  }
+
   async modify(kind: "messages" | "threads", id: string, add: string[] | undefined, remove: string[] | undefined) {
-    const labels = add?.length || remove?.length
-      ? (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[])
-      : [];
+    const labels = await this.labelsFor([...(add ?? []), ...(remove ?? [])]);
     const addLabelIds = await this.resolveLabelIds(add, labels);
     const removeLabelIds = await this.resolveLabelIds(remove, labels);
     if (!addLabelIds.length && !removeLabelIds.length) throw new MimeError("Provide at least one label to add or remove.");
@@ -1560,11 +1567,7 @@ export class Mailbox {
     // Check IDs before any call, so a bad one doesn't leave the change half done.
     sel.threadIds?.forEach((id) => checkId(id, "thread"));
     sel.messageIds?.forEach((id) => checkId(id, "message"));
-    // System labels (INBOX, UNREAD, …) need no lookup; only names and user labels do.
-    const refs = [...change.add, ...change.remove];
-    const labels = refs.every(isSystemLabelId)
-      ? refs.map((id): ApiLabel => ({ id, name: id, type: "system" }))
-      : (((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[]);
+    const labels = await this.labelsFor([...change.add, ...change.remove]);
     const add = await this.resolveLabels(change.add, labels);
     const remove = await this.resolveLabels(change.remove, labels);
     const selection = await this.selectMessages(sel, { add, remove }, opts.max);
