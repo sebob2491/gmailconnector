@@ -14,7 +14,7 @@ import {
   recipientsFrom,
   type ApiMessagePart,
 } from "../src/format.js";
-import { Base64UrlData, buildMime, decodeBase64, encodeHeaderValue, htmlToText } from "../src/mime.js";
+import { Base64UrlData, buildMime, decodeBase64, decodeEntities, encodeHeaderValue, htmlToText } from "../src/mime.js";
 import { attachmentDataOf } from "../src/mailbox.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
 
@@ -123,6 +123,41 @@ test("htmlToText decodes entities fully and safely", () => {
   assert.equal(htmlToText("&constructor; &toString; &bogus;"), "&constructor; &toString; &bogus;");
   // Emoji sequences keep their zero-width joiners.
   assert.equal(htmlToText("&#x1F468;&zwj;&#x1F469;&zwj;&#x1F467;"), "👨‍👩‍👧");
+});
+
+/** Character references found the way decodeEntities used to find them (a regex), as a reference. */
+function referenceEntities(text: string): string {
+  const legacy = new Set(["amp", "lt", "gt", "quot", "nbsp", "copy", "reg", "AMP", "LT", "GT", "QUOT", "COPY", "REG"]);
+  const c1 = "€\x81‚ƒ„…†‡ˆ‰Š‹Œ\x8dŽ\x8f\x90‘’“”•–—˜™š›œ\x9džŸ";
+  const code = (n: number) => (n >= 0x80 && n <= 0x9f ? c1[n - 0x80] : n === 0 || n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff) ? "\ufffd" : String.fromCodePoint(n));
+  return text.replace(/&(?:#[xX]([0-9a-fA-F]{1,8})|#([0-9]{1,8})|([A-Za-z][A-Za-z0-9]{0,31}))(;?)/g, (match, hex, dec, name, semi, offset: number) => {
+    if (hex) return code(parseInt(hex, 16));
+    if (dec) return code(parseInt(dec, 10));
+    if (semi) return decodeEntities(match); // a lone known name decodes; anything else is left as is
+    const next = text.charAt(offset + match.length);
+    return legacy.has(name) && !/[A-Za-z0-9=]/.test(next) ? decodeEntities(`&${name};`) : match;
+  });
+}
+
+test("decodeEntities finds references exactly as the regex it replaces did, without allocating per unknown name", () => {
+  let seed = 7;
+  const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
+  const tokens = ["&", "#", "x", "X", ";", "=", " ", "0", "1", "9", "a", "f", "F", "z", "amp", "lt", "gt", "quot", "nbsp", "copy", "reg", "AMP", "eacute", "Eacute", "hearts", "bogus", "constructor", "1F600", "128512", "99999999", "123456789", "a".repeat(33), "é", "&amp;", "&#x41;"];
+  for (let i = 0; i < 3000; i++) {
+    let text = "";
+    const length = Math.floor(random() * 30);
+    for (let j = 0; j < length; j++) text += tokens[Math.floor(random() * tokens.length)];
+    assert.equal(decodeEntities(text), referenceEntities(text), JSON.stringify(text));
+  }
+  for (const text of ["&#x110000;", "&#xD800;", "&#0;", "&#146;", "&ampx", "&amp=1", "&amp", "&lt;b&gt;", "&#x", "&#;", "&;", "&&amp;"]) {
+    assert.equal(decodeEntities(text), referenceEntities(text), text);
+  }
+  // 2 MB of unknown names: the same text back, quickly (the regex version ran out of memory at the Worker's limit).
+  const unknown = "&a".repeat(1024 * 1024);
+  const start = process.cpuUsage();
+  assert.equal(decodeEntities(unknown), unknown);
+  const used = process.cpuUsage(start);
+  assert.ok((used.user + used.system) / 1000 < 200);
 });
 
 test("htmlToText keeps link addresses, including unusual ones", () => {

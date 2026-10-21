@@ -525,15 +525,12 @@ const LEGACY_ENTITIES = new Set(["amp", "lt", "gt", "quot", "nbsp", "copy", "reg
 /** Numeric references to 0x80–0x9F mean Windows-1252 characters (e.g. `&#146;` is ’), as in browsers. */
 const C1_AS_WINDOWS_1252 = "€\x81‚ƒ„…†‡ˆ‰Š‹Œ\x8dŽ\x8f\x90‘’“”•–—˜™š›œ\x9džŸ";
 
-const ENTITY = /&(?:#[xX]([0-9a-fA-F]{1,8})|#([0-9]{1,8})|([A-Za-z][A-Za-z0-9]{0,31}))(;?)/g;
-
 function codePointText(code: number): string {
   if (code >= 0x80 && code <= 0x9f) return C1_AS_WINDOWS_1252[code - 0x80];
   if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return "�";
   return String.fromCodePoint(code);
 }
 
-/** Decodes HTML character references: named (HTML 4 and common HTML5 names) and numeric. */
 /**
  * Bytes as a Latin-1 string, one character per byte. (Typed via Uint8Array: the Worker's and Node's
  * type definitions disagree about Buffer#toString's parameters.)
@@ -542,16 +539,81 @@ export function latin1(bytes: Uint8Array): string {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("latin1");
 }
 
+function isDigit(c: number): boolean {
+  return c >= 48 && c <= 57;
+}
+
+/** The value of hex digit `c`, or -1. */
+function hexValue(c: number): number {
+  if (c >= 48 && c <= 57) return c - 48;
+  if (c >= 65 && c <= 70) return c - 55;
+  if (c >= 97 && c <= 102) return c - 87;
+  return -1;
+}
+
+/** The longest legacy entity name ("nbsp", "quot", "copy"). */
+const LONGEST_LEGACY = 4;
+
+/**
+ * Decodes HTML character references: named (HTML 4 and common HTML5 names, as `&name;`, or a few
+ * without the ";") and numeric (`&#233;`, `&#xE9;`, up to 8 digits, ";" optional). A single scan:
+ * text between references is copied in slices, and unknown names stay part of those slices, so even
+ * megabytes of "&a" cost no allocation per reference.
+ */
 export function decodeEntities(text: string): string {
-  if (!text.includes("&")) return text;
-  return text.replace(ENTITY, (match: string, hex: string | undefined, dec: string | undefined, name: string | undefined, semi: string, offset: number) => {
-    if (hex) return codePointText(parseInt(hex, 16));
-    if (dec) return codePointText(parseInt(dec, 10));
-    if (semi) return NAMED_ENTITIES.get(name!) ?? match;
-    // "&amp" without ";" is still "&" in HTML, unless it looks like part of a URL parameter (e.g. "&lt=5").
-    const next = text.charAt(offset + match.length);
-    return LEGACY_ENTITIES.has(name!) && !/[A-Za-z0-9=]/.test(next) ? NAMED_ENTITIES.get(name!)! : match;
-  });
+  let amp = text.indexOf("&");
+  if (amp < 0) return text;
+  const n = text.length;
+  const parts: string[] = [];
+  let copied = 0; // text before this index is in `parts`
+  while (amp >= 0) {
+    let value: string | undefined;
+    let end = 0;
+    const c = text.charCodeAt(amp + 1);
+    if (c === 35 /* # */) {
+      const x = text.charCodeAt(amp + 2);
+      const hex = x === 120 || x === 88; // x X
+      const start = amp + (hex ? 3 : 2);
+      const max = Math.min(n, start + 8);
+      let i = start;
+      let code = 0;
+      for (; i < max; i++) {
+        const digit = hex ? hexValue(text.charCodeAt(i)) : isDigit(text.charCodeAt(i)) ? text.charCodeAt(i) - 48 : -1;
+        if (digit < 0) break;
+        code = code * (hex ? 16 : 10) + digit;
+      }
+      if (i > start) {
+        value = codePointText(code);
+        end = text.charCodeAt(i) === 59 /* ; */ ? i + 1 : i;
+      }
+    } else if (isLetter(c)) {
+      const start = amp + 1;
+      const max = Math.min(n, start + 32);
+      let i = start + 1;
+      while (i < max && (isLetter(text.charCodeAt(i)) || isDigit(text.charCodeAt(i)))) i++;
+      const next = text.charCodeAt(i);
+      if (next === 59 /* ; */) {
+        value = NAMED_ENTITIES.get(text.slice(start, i));
+        end = i + 1;
+      } else if (i - start <= LONGEST_LEGACY && !isLetter(next) && !isDigit(next) && next !== 61 /* = */) {
+        // "&amp" without ";" is still "&" in HTML, unless it looks like part of a URL parameter (e.g. "&lt=5").
+        const name = text.slice(start, i);
+        if (LEGACY_ENTITIES.has(name)) value = NAMED_ENTITIES.get(name);
+        end = i;
+      }
+    }
+    if (value === undefined) {
+      amp = text.indexOf("&", amp + 1);
+      continue;
+    }
+    if (amp > copied) parts.push(text.slice(copied, amp));
+    parts.push(value);
+    copied = end;
+    amp = text.indexOf("&", end);
+  }
+  if (!parts.length) return text;
+  if (copied < n) parts.push(text.slice(copied));
+  return parts.join("");
 }
 
 export function escapeHtml(text: string): string {
