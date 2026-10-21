@@ -12,6 +12,7 @@ import {
   header,
   parseMailboxes,
   recipientsFrom,
+  stripInvisible,
   viewUrl,
   type ApiMessage,
   type AttachmentInfo,
@@ -126,6 +127,18 @@ export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) =>
   };
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
+}
+
+/**
+ * Recipient arguments as given ("user@example.com") or with a display name ("Ann Lee <ann@example.com>",
+ * which is kept for the header). A value that holds no address at all is passed on as it is, so the
+ * address check names it.
+ */
+function recipients(values: string[] | undefined): Recipient[] | undefined {
+  return values?.flatMap((value): Recipient[] => {
+    const parsed = parseMailboxes(value);
+    return parsed.length ? parsed : [value];
+  });
 }
 
 function toAttachments(inputs: AttachmentInput[] | undefined): OutgoingAttachment[] {
@@ -651,8 +664,10 @@ export class Mailbox {
         const { id: messageId, ...message } = summaries[0];
         return { id, ...(messageId !== id ? { messageId } : {}), totalMessages: 1, ...message, viewUrl: link };
       }
-      // Replies repeat the subject with "Re:"; list it once for the thread.
-      const subject = summaries[0]?.subject;
+      // Replies repeat the subject with "Re:"; list it once for the thread, as its first email had it
+      // (the preview only shows the latest emails).
+      const subject =
+        format === "METADATA_ONLY" || !messages.length ? undefined : stripInvisible(header(messages[0].payload, "Subject") ?? "").trim();
       const base = normalizeSubject(subject);
       return {
         id,
@@ -710,7 +725,11 @@ export class Mailbox {
     const msg: ApiMessage = await this.client.request("GET", `messages/${checkId(messageId, "message")}`, {
       query: { format: apiFormat(format), metadataHeaders: apiFormat(format) === "metadata" ? METADATA_HEADERS : undefined },
     });
-    return this.markFromMe(await this.format(msg, format, opts));
+    const formatted = this.markFromMe(await this.format(msg, format, opts));
+    if (format !== "PLAIN_TEXT" && format !== "FULL_CONTENT") return formatted;
+    // With the body there, the snippet only repeats its start.
+    const { snippet: _s, ...rest } = formatted;
+    return rest;
   }
 
   /**
@@ -855,18 +874,21 @@ export class Mailbox {
   async sendMessage(input: ComposeInput & { draftId?: string; replyThreadId?: string; replyToMessageId?: string }) {
     if (input.draftId) {
       const id = checkId(input.draftId, "draft");
-      const sent = await this.sendMail(() => this.client.request("POST", "drafts/send", { json: { id } }));
+      const sent = await this.sendMail(() => this.client.request("POST", "drafts/send", { json: { id } }).catch((err) => this.draftGone(id, err)));
       return this.sentResult(sent);
     }
-    const to = input.to ?? [];
+    const to = recipients(input.to) ?? [];
     if (!to.length && !input.cc?.length && !input.bcc?.length) {
       throw new MimeError("Provide at least one recipient in to, cc or bcc (or a draftId).");
+    }
+    if (!input.body && !input.htmlBody && !input.attachments?.length) {
+      throw new MimeError("The email has no content: give it a body (`body` or `htmlBody`) or attachments, or pass a draftId to send a draft.");
     }
     const own = await this.bodies(input);
     const msg: OutgoingMessage = {
       to,
-      cc: input.cc,
-      bcc: input.bcc,
+      cc: recipients(input.cc),
+      bcc: recipients(input.bcc),
       subject: input.subject,
       text: own.text,
       html: own.html,
@@ -902,9 +924,9 @@ export class Mailbox {
     const ctx = await this.replyContext(input.messageId, input.replyAll);
     const { text, html } = this.withQuote(await this.bodies(input), ctx.quote);
     const mime = buildMimeChunks({
-      to: input.to?.length ? input.to : ctx.to,
-      cc: input.cc?.length ? input.cc : ctx.cc,
-      bcc: input.bcc,
+      to: input.to?.length ? recipients(input.to) : ctx.to,
+      cc: input.cc?.length ? recipients(input.cc) : ctx.cc,
+      bcc: recipients(input.bcc),
       subject: ctx.subject,
       text,
       html,
@@ -956,9 +978,9 @@ export class Mailbox {
       `<br>${content.html ?? escapeHtml(origText).replace(/\n/g, "<br>")}</div>`;
     const subject = header(p, "Subject") ?? "";
     const mime = buildMimeChunks({
-      to: input.to,
-      cc: input.cc,
-      bcc: input.bcc,
+      to: recipients(input.to),
+      cc: recipients(input.cc),
+      bcc: recipients(input.bcc),
       subject: /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`.trim(),
       text,
       html,
@@ -1046,8 +1068,9 @@ export class Mailbox {
       // A list shows a preview of each draft; get_draft returns the whole thing.
       const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY", { maxBodyChars: LIST_BODY_CHARS });
       if (full) {
-        const { htmlBody: _h, snippet: _s, attachments: _a, labelIds: _l, ...rest } = formatted as FormattedMessage;
-        return rest;
+        const { htmlBody: _h, snippet: _s, attachments, labelIds: _l, ...rest } = formatted as FormattedMessage;
+        const files = (attachments ?? []).map(({ filename, mimeType, size, partId }) => ({ filename, mimeType, size, ...(partId !== undefined ? { partId } : {}) }));
+        return { ...rest, ...(files.length ? { attachments: files } : {}) };
       }
       const { labelIds: _l, ...rest } = formatted as FormattedMessage;
       return rest;
@@ -1059,18 +1082,29 @@ export class Mailbox {
     };
   }
 
+  /** Turns Gmail's 404 for a draft into a message saying what probably happened; other errors pass through. */
+  private draftGone(draftId: string, err: unknown): never {
+    if (err instanceof GmailApiError && err.status === 404) {
+      throw new MimeError(
+        `Draft ${draftId} no longer exists in ${this.email} (it may have been sent or deleted). If the ID came from another account, pass that account.`,
+      );
+    }
+    throw err;
+  }
+
   async getDraft(draftId: string, format: MessageFormat, opts: FormatOptions = {}) {
+    const id = checkId(draftId, "draft");
     // drafts.get has no metadataHeaders parameter; metadata format returns every header.
-    const draft = await this.client.request("GET", `drafts/${checkId(draftId, "draft")}`, { query: { format: apiFormat(format) } });
+    const draft = await this.client.request("GET", `drafts/${id}`, { query: { format: apiFormat(format) } }).catch((err) => this.draftGone(id, err));
     return this.formatDraft(draft, format, opts);
   }
 
   async createDraft(input: ComposeInput & { replyToMessageId?: string }) {
     const own = await this.bodies(input);
     const msg: OutgoingMessage = {
-      to: input.to,
-      cc: input.cc,
-      bcc: input.bcc,
+      to: recipients(input.to),
+      cc: recipients(input.cc),
+      bcc: recipients(input.bcc),
       subject: input.subject,
       text: own.text,
       html: own.html,
@@ -1096,13 +1130,13 @@ export class Mailbox {
    */
   async updateDraft(input: ComposeInput & { draftId: string }) {
     const draftId = checkId(input.draftId, "draft");
-    const existing = await this.client.request("GET", `drafts/${draftId}`, { query: { format: "full" } });
+    const existing = await this.client.request("GET", `drafts/${draftId}`, { query: { format: "full" } }).catch((err) => this.draftGone(draftId, err));
     const msg = existing.message as ApiMessage;
     const p = msg.payload;
     const content = await extractContent(p, this.loader(msg.id));
     // Keep the draft's recipients (with their display names) unless new ones are given.
     const pick = (value: string[] | undefined, headerName: string): Recipient[] =>
-      value?.length ? value : recipientsFrom(header(p, headerName));
+      value?.length ? recipients(value)! : recipientsFrom(header(p, headerName));
     const bodyChanged = Boolean(input.body || input.htmlBody);
     const inReplyTo = header(p, "In-Reply-To");
     // Keep a chosen send-as address; without From, Gmail would send from the primary address.
@@ -1132,7 +1166,8 @@ export class Mailbox {
   }
 
   async deleteDraft(draftId: string) {
-    await this.client.request("DELETE", `drafts/${checkId(draftId, "draft")}`);
+    const id = checkId(draftId, "draft");
+    await this.client.request("DELETE", `drafts/${id}`).catch((err) => this.draftGone(id, err));
     return { deleted: draftId };
   }
 
@@ -1194,15 +1229,23 @@ export class Mailbox {
     return { ...label, ...(created.length ? { createdParentLabels: created } : {}) };
   }
 
+  /** Only user labels can be changed or deleted; Gmail refuses for its own (INBOX, STARRED, CATEGORY_…). */
+  private userLabel(label: ApiLabel): ApiLabel {
+    if (label.type === "system" || isSystemLabelId(label.id)) {
+      throw new MimeError(`${label.name} is a system label that Gmail manages: it can't be renamed, recolored or deleted. Only user labels can be (see list_labels).`);
+    }
+    return label;
+  }
+
   async updateLabel(labelRef: string, input: LabelInput) {
-    const [labelId] = await this.resolveLabelIds([labelRef]);
-    return this.client.request("PATCH", `labels/${labelId}`, { json: this.labelBody(input) });
+    const [label] = await this.resolveLabels([labelRef]);
+    return this.client.request("PATCH", `labels/${this.userLabel(label).id}`, { json: this.labelBody(input) });
   }
 
   async deleteLabel(labelRef: string) {
-    const [labelId] = await this.resolveLabelIds([labelRef]);
-    await this.client.request("DELETE", `labels/${labelId}`);
-    return { deleted: labelId };
+    const [label] = await this.resolveLabels([labelRef]);
+    await this.client.request("DELETE", `labels/${this.userLabel(label).id}`);
+    return { deleted: label.id };
   }
 
   /** Accepts label IDs or display names (case-insensitive) and returns IDs for this account. */

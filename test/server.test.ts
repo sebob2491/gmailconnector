@@ -414,11 +414,28 @@ describe("sending", () => {
     assert.equal(mime.get("Subject"), "Hi Bcc: evil@example.com");
   });
 
-  test("non-plain addresses are rejected", async () => {
-    const { call } = await setup();
-    const res = await call("send_message", { account: "work", to: ["Bob <bob@example.com>"], body: "b" });
-    assert.equal(res.isError, true);
-    assert.match(res.text, /Invalid email address/);
+  test("recipients may carry a display name; anything that isn't an address is rejected", async () => {
+    const { call, fake } = await setup();
+    const res = await call("send_message", {
+      account: "work",
+      to: ["Bob <bob@example.com>", "carol@example.com"],
+      cc: ['"Doe, Jane" <jane@example.com>'],
+      bcc: ["dan@example.com (Dan)"],
+      body: "b",
+    });
+    assert.equal(res.isError, false, res.text);
+    const mime = inspectMime(fake.sentBy(WORK)[0].raw);
+    assert.equal(mime.get("To"), "Bob <bob@example.com>, carol@example.com");
+    assert.equal(mime.get("Cc"), '"Doe, Jane" <jane@example.com>');
+    assert.equal(mime.get("Bcc"), "Dan <dan@example.com>");
+    for (const tool of ["reply", "create_draft", "forward"] as const) {
+      const r = await call(tool, { account: "work", messageId: "w1", to: ["Ann Lee <ann@example.com>"], body: "x", forwardText: "x" });
+      assert.equal(r.isError, false, `${tool}: ${r.text}`);
+    }
+    assert.equal(inspectMime(fake.sentBy(WORK)[1].raw).get("To"), "Ann Lee <ann@example.com>");
+    const bad = await call("send_message", { account: "work", to: ["bob"], body: "b" });
+    assert.equal(bad.isError, true);
+    assert.match(bad.text, /Invalid email address in "to": "bob"/);
   });
 
   test("send_message can send an existing draft", async () => {
@@ -2330,5 +2347,81 @@ describe("descriptions and empty results", () => {
     assert.match(instructions, /ISO 8601 in UTC/);
     assert.match(instructions, /fromMe: true/);
     assert.match(instructions, /shorter than pageSize/);
+  });
+});
+
+describe("small defects", () => {
+  test("a thread preview's subject is the first email's, not the oldest shown one's", async () => {
+    const { call, fake, work } = await setup();
+    for (let i = 1; i <= 6; i++) {
+      fake.deliver(work, crlf([`From: p${i}@work.example`, `To: ${WORK}`, "Subject: Re: Project kickoff", "", `reply ${i}`]), { threadId: "kick" });
+    }
+    work.messages.set("kick0", {
+      ...fake.deliver(work, crlf(["From: boss@work.example", `To: ${WORK}`, "Subject: Project kickoff", "", "Let's start"]), { id: "kick0", threadId: "kick" }),
+      internalDate: "0",
+    });
+    // The fake lists a thread's messages in delivery order; put the first email first.
+    const msgs = [...work.messages.entries()].filter(([, m]) => m.threadId === "kick");
+    for (const [id] of msgs) work.messages.delete(id);
+    for (const [id, m] of [msgs.at(-1)!, ...msgs.slice(0, -1)]) work.messages.set(id, m);
+    const res = await call("search_threads", { account: "work", query: "subject:kickoff" });
+    const thread = res.json.threads.find((t: any) => t.id === "kick");
+    assert.equal(thread.subject, "Project kickoff");
+    assert.equal(thread.totalMessages, 7);
+    assert.equal(thread.omittedOlderMessages, 2);
+    assert.ok(thread.messages.every((m: any) => m.subject === undefined));
+  });
+
+  test("send_message refuses an email with nothing in it", async () => {
+    const { call, fake } = await setup();
+    const res = await call("send_message", { account: "work", to: ["x@example.com"], subject: "Just a subject" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /has no content: give it a body \(`body` or `htmlBody`\) or attachments, or pass a draftId/);
+    assert.equal(fake.sentBy(WORK).length, 0);
+    const files = await call("send_message", { account: "work", to: ["x@example.com"], attachments: [{ content: b64("x"), filename: "x.txt" }] });
+    assert.equal(files.isError, false, files.text);
+  });
+
+  test("system labels can't be renamed or deleted, and the refusal is local", async () => {
+    const { call, fake, work } = await setup();
+    const before = fake.requests.length;
+    const renamed = await call("update_label", { account: "work", labelId: "INBOX", displayName: "Inbox2" });
+    assert.equal(renamed.isError, true);
+    assert.match(renamed.text, /^INBOX is a system label that Gmail manages: it can't be renamed, recolored or deleted/);
+    const deleted = await call("delete_label", { account: "work", labelId: "starred" });
+    assert.match(deleted.text, /STARRED is a system label/);
+    assert.ok(work.labels.some((l) => l.id === "STARRED"));
+    assert.ok(!fake.requests.slice(before).some((r) => r.method !== "GET"), "only the label list was read");
+  });
+
+  test("a draft that was sent or deleted is explained", async () => {
+    const { call } = await setup();
+    const draft = await call("create_draft", { account: "work", to: ["a@example.com"], body: "d" });
+    assert.equal((await call("send_message", { account: "work", draftId: draft.json.id })).isError, false);
+    const gone = `Draft ${draft.json.id} no longer exists in ${WORK} (it may have been sent or deleted). If the ID came from another account, pass that account.`;
+    assert.equal((await call("get_draft", { account: "work", draftId: draft.json.id })).text, gone);
+    assert.equal((await call("send_message", { account: "work", draftId: draft.json.id })).text, gone);
+    assert.equal((await call("update_draft", { account: "work", draftId: draft.json.id, subject: "x" })).text, gone);
+    assert.equal((await call("delete_draft", { account: "work", draftId: draft.json.id })).text, gone);
+  });
+
+  test("get_message drops the snippet when the body is there; list_drafts names attachments", async () => {
+    const { call } = await setup();
+    const plain = await call("get_message", { account: "work", messageId: "w1" });
+    assert.equal(plain.json.snippet, undefined);
+    assert.ok(plain.json.plaintextBody);
+    assert.equal((await call("get_message", { account: "work", messageId: "w1", messageFormat: "MINIMAL" })).json.snippet, "snippet of w1");
+
+    await call("create_draft", {
+      account: "work",
+      to: ["a@example.com"],
+      subject: "Files",
+      body: "see",
+      attachments: [{ content: b64("abc"), filename: "a.txt", mimeType: "text/plain" }],
+    });
+    const full = await call("list_drafts", { account: "work", view: "DRAFT_VIEW_FULL" });
+    assert.deepEqual(full.json.drafts[0].attachments, [{ filename: "a.txt", mimeType: "text/plain", size: 3, partId: "1" }]);
+    const meta = await call("list_drafts", { account: "work" });
+    assert.equal(meta.json.drafts[0].attachments, undefined);
   });
 });

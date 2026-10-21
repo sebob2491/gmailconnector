@@ -347,7 +347,10 @@ const searchAccountArg = z
     'Email address or alias of one linked account, or "all" (default). With several accounts the results are merged into one newest-first list and each thread carries its `account`.',
   );
 const addressList = (what: string) =>
-  z.array(z.string()).optional().describe(`Optional. ${what} Each string MUST be a plain email address (e.g. "user@example.com").`);
+  z
+    .array(z.string())
+    .optional()
+    .describe(`Optional. ${what} Each entry is an email address, with or without a name: "user@example.com" or "Ann Lee <ann@example.com>".`);
 const messageFormatArg = z
   .enum(["MINIMAL", "PLAIN_TEXT", "FULL_CONTENT", "METADATA_ONLY", "RAW"])
   .optional()
@@ -748,7 +751,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Send email",
       description:
-        "Sends an email immediately from the chosen Gmail account (`account` is required when several are linked). Either pass `draftId` to send an existing draft as is, or give recipients, subject and body. To send within an existing conversation, pass `replyThreadId` or `replyToMessageId` (from the same account). Returns the sent message's `id`, `threadId` and `labelIds`.",
+        "Sends an email immediately from the chosen Gmail account (`account` is required when several are linked). Either pass `draftId` to send an existing draft as is, or give recipients, subject and a body (or attachments). To send within an existing conversation, pass `replyThreadId` or `replyToMessageId` (from the same account). Returns the sent message's `id`, `threadId` and `labelIds`.",
       inputSchema: {
         account: sendAccountArg,
         draftId: z.string().optional().describe("Optional. ID of an existing draft to send; other content fields are then ignored."),
