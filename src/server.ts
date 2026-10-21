@@ -761,7 +761,7 @@ export function createServer(deps: ServerDeps): McpServer {
     {
       title: "Send email",
       description:
-        "Sends an email immediately from the chosen Gmail account (`account` is required when several are linked). Either pass `draftId` to send an existing draft as is, or give recipients, subject and a body (or attachments). To send within an existing conversation, pass `replyThreadId` or `replyToMessageId` (from the same account). Returns the sent message's `id`, `threadId` and `labelIds`.",
+        "Sends an email immediately from the chosen Gmail account (`account` is required when several are linked). Either pass `draftId` to send an existing draft as is, or give recipients, subject and body. To send within an existing conversation, pass `replyThreadId` or `replyToMessageId` (from the same account). Returns the sent message's `id`, `threadId` and `labelIds`.",
       inputSchema: strictArgs({
         account: sendAccountArg,
         draftId: z.string().optional().describe("Optional. ID of an existing draft to send; other content fields are then ignored."),
