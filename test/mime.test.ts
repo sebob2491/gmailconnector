@@ -204,6 +204,17 @@ test("htmlToText stays fast on hostile HTML", () => {
   }
 });
 
+test("runs of '<' that start no tag are text, converted in one piece", () => {
+  assert.equal(htmlToText("<p>if a < b and 1<2 << 3 <= 4</p><pre>x <1\n< y</pre>"), "if a < b and 1<2 << 3 <= 4\n\nx <1\n< y");
+  const stray = "<".repeat(4 * 1024 * 1024);
+  const heap = process.memoryUsage().heapUsed;
+  const start = process.cpuUsage();
+  assert.equal(htmlToText(stray).length, stray.length);
+  const used = process.cpuUsage(start);
+  assert.ok((used.user + used.system) / 1000 < 250, "CPU");
+  assert.ok(process.memoryUsage().heapUsed - heap < 48 * 1024 * 1024, "one part per run, not one per '<'");
+});
+
 test("attachment content given as a data: URL is accepted", () => {
   assert.equal(decodeBase64("data:text/plain;base64,aGVsbG8=").toString(), "hello");
 });

@@ -643,6 +643,12 @@ function isLetter(c: number): boolean {
   return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
 
+/** Whether the "<" at `lt` starts markup (a tag, an end tag, a comment, "<!…>" or "<?…>"); otherwise it is text. */
+function startsMarkup(html: string, lt: number): boolean {
+  const c = html.charCodeAt(lt + 1);
+  return c === 33 /* ! */ || c === 47 /* / */ || c === 63 /* ? */ || isLetter(c);
+}
+
 /**
  * Reads a tag's attributes from `i` (just after its name) through the closing ">", like a browser:
  * quotes only matter around attribute values. Returns the index after ">", or -1 if the document ends
@@ -813,7 +819,9 @@ export function htmlToText(html: string): string {
   };
 
   while (pos < n) {
-    const lt = html.indexOf("<", pos);
+    // The next "<" that starts markup; any other "<" is part of the text run, however many there are.
+    let lt = html.indexOf("<", pos);
+    while (lt >= 0 && !startsMarkup(html, lt)) lt = html.indexOf("<", lt + 1);
     const textEnd = lt < 0 ? n : lt;
     if (textEnd > pos) {
       let raw = html.slice(pos, textEnd);
@@ -849,13 +857,6 @@ export function htmlToText(html: string): string {
     }
     const closing = c1 === 47;
     const nameStart = closing ? lt + 2 : lt + 1;
-    if (!isLetter(html.charCodeAt(nameStart))) {
-      // A "<" that doesn't start a tag is just text.
-      if (pre) b.pre("<");
-      else b.text("<");
-      pos = lt + 1;
-      continue;
-    }
     let i = nameStart + 1;
     for (let c = html.charCodeAt(i); i < n && c !== 62 && c !== 47 && !isHtmlSpace(c); c = html.charCodeAt(++i));
     const tag = html.slice(nameStart, i).toLowerCase();
