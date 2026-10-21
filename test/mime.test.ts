@@ -451,7 +451,33 @@ test("long filenames use RFC 2231 continuations and long subjects stay within li
   assert.match(raw, /filename\*0\*=UTF-8''%E8%A6%8B/);
   assert.match(raw, /filename\*1\*=%/);
   const headers = parseHeaders(raw.slice(0, raw.indexOf("\r\n\r\n")));
-  assert.equal(headers.find((h) => h.name === "Subject")!.value, `https://example.com/${"a".repeat(1200)}`);
+  // Subjects are cut to 1,000 characters.
+  assert.equal(headers.find((h) => h.name === "Subject")!.value, `https://example.com/${"a".repeat(980)}`);
+});
+
+test("huge file names, subjects and attached emails from a forwarded email cost little", () => {
+  const timed = (build: () => string) => {
+    const start = process.cpuUsage();
+    const raw = build();
+    const used = process.cpuUsage(start);
+    assert.ok((used.user + used.system) / 1000 < 150, `${(used.user + used.system) / 1000} ms`);
+    for (const line of raw.split("\r\n")) assert.ok(line.length <= 998, `line of ${line.length}`);
+    return raw;
+  };
+  const named = timed(() => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("x"), filename: `${"é".repeat(1024 * 1024)}.pdf` }] }));
+  const pdf = leafBodies(named).find((l) => l.type === "application/octet-stream")!;
+  const filename = /filename="([^"]*)"/.exec(pdf.headers.find((h) => h.name === "Content-Disposition")!.value)![1];
+  assert.equal(filename, `${"é".repeat(251)}.pdf`, "cut to 255 characters, keeping the extension");
+  const subject = timed(() => buildMime({ to: ["a@example.com"], subject: "ab ".repeat(400_000), text: "x" }));
+  assert.equal(parseHeaders(subject.slice(0, subject.indexOf("\r\n\r\n"))).find((h) => h.name === "Subject")!.value.length, 1000);
+  // A MIME type that isn't one is sent as application/octet-stream.
+  const typed = timed(() => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("x"), filename: "a.bin", mimeType: `x/${"y".repeat(5000)}` }] }));
+  assert.match(typed, /Content-Type: application\/octet-stream; name="a\.bin"/);
+  const csv = buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("a,b"), filename: "a.csv", mimeType: 'text/csv; charset="utf-8"' }] });
+  assert.match(csv, /Content-Type: text\/csv; charset="utf-8"; name="a\.csv"/, "parameters are kept");
+  // Attached emails over 2 MB go as base64, without the 7-bit copies.
+  const eml = Buffer.from(("a".repeat(70) + "\n").repeat(40_000));
+  assert.match(timed(() => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: eml, filename: "m.eml", mimeType: "message/rfc822" }] })), /message\/rfc822[^]*Content-Transfer-Encoding: base64/);
 });
 
 test("addresses with control or invisible characters are refused", () => {

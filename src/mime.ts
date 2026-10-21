@@ -322,7 +322,8 @@ function leafPart(headers: string[], content: Buffer | Base64UrlData): MimeChunk
 
 /**
  * An attached email (message/rfc822) as 7-bit text when it is plain ASCII with lines of at most 998
- * characters (RFC 2046 does not allow base64 there); undefined otherwise, to be sent as base64.
+ * characters (RFC 2046 does not allow base64 there); undefined otherwise, to be sent as base64. Only
+ * for emails up to MAX_SEVEN_BIT_MESSAGE: this makes a few copies of it.
  */
 function sevenBitMessage(content: Buffer): string | undefined {
   for (const byte of content) if (byte > 0x7e || byte === 0) return undefined;
@@ -350,16 +351,47 @@ function withParams(header: string, params: string): string {
   return params.includes(CRLF) || header.length + params.length > 76 ? `${header};${CRLF} ${params}` : `${header}; ${params}`;
 }
 
+/** Longest file name sent (longer ones keep their extension); a forwarded file's name may be any length. */
+const MAX_FILENAME = 255;
+/** Longest subject sent, in characters. */
+const MAX_SUBJECT = 1000;
+/** Attached emails up to this size are sent as 7-bit text when they can be; larger ones as base64. */
+const MAX_SEVEN_BIT_MESSAGE = 2 * 1024 * 1024;
+
+/** The first `max` characters of `text` (one fewer rather than split a surrogate pair). */
+function cut(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, (text.charCodeAt(max - 1) & 0xfc00) === 0xd800 ? max - 1 : max);
+}
+
+/** A file name cut to MAX_FILENAME characters, keeping its extension. */
+function limitFilename(name: string): string {
+  if (name.length <= MAX_FILENAME) return name;
+  const ext = /\.[A-Za-z0-9]{1,10}$/.exec(name.slice(-11))?.[0] ?? "";
+  return cut(name, MAX_FILENAME - ext.length) + ext;
+}
+
+/**
+ * A MIME type as given, if it is one (type/subtype, with parameters or not, at most 200 characters);
+ * a forwarded part's may be anything.
+ */
+function mimeTypeOf(value: string | undefined): string {
+  const type = value?.trim() ?? "";
+  return type.length <= 200 && /^[\w.+-]+\/[\w.+-]+(?:\s*;\s*[\w.+-]+=(?:[\w.+-]+|"[^"\\\x00-\x1f\x7f-\uffff]*"))*$/.test(type)
+    ? type
+    : "application/octet-stream";
+}
+
 function attachmentPart(att: OutgoingAttachment, index: number): MimeChunk[] {
-  const filename = att.filename ?? `attachment-${index + 1}`;
-  const mimeType = oneLine(att.mimeType || "application/octet-stream");
+  const filename = limitFilename(att.filename ?? `attachment-${index + 1}`);
+  const mimeType = mimeTypeOf(att.mimeType);
   const headers = [withParams(`Content-Type: ${mimeType}`, filenameParams("name", filename))];
   if (att.inline && att.contentId) {
     headers.push(withParams("Content-Disposition: inline", filenameParams("filename", filename)), `Content-ID: <${att.contentId}>`);
   } else {
     headers.push(withParams("Content-Disposition: attachment", filenameParams("filename", filename)));
   }
-  if (/^message\/rfc822$/i.test(mimeType)) {
+  if (/^message\/rfc822$/i.test(mimeType) && attachmentSize(att.content) <= MAX_SEVEN_BIT_MESSAGE) {
     const message = sevenBitMessage(att.content instanceof Base64UrlData ? att.content.bytes() : att.content);
     if (message !== undefined) return joinLines([...headers, "Content-Transfer-Encoding: 7bit", "", message]);
   }
@@ -465,7 +497,7 @@ export function buildMimeChunks(msg: OutgoingMessage): MimeChunk[] {
     body = multipart("mixed", [body, ...regular.map((a, i) => attachmentPart({ ...a, inline: false }, i))]);
   }
 
-  const subject = oneLine(msg.subject ?? "");
+  const subject = cut(oneLine(cut(msg.subject ?? "", 2 * MAX_SUBJECT)), MAX_SUBJECT);
   const inReplyTo = messageIds(msg.inReplyTo)[0];
   const ids = messageIds(msg.references);
   const references = ids.length > MAX_REFERENCES ? [ids[0], ...ids.slice(1 - MAX_REFERENCES)] : ids;
