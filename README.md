@@ -75,6 +75,8 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   senders per run (`maxSenders` up to 20); the emails you already have stay until you archive or trash
   them with the bulk tools.
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
+  HTML-only emails are converted the way a browser shows them, without what the sender hid (a
+  newsletter's preview text, mobile-only copies of the content).
 - `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`
   and the subject its first email had. Results are compact: one-email threads are shown flat, previews
   are cleaned of the invisible padding and HTML codes that marketing emails contain, and recipients are

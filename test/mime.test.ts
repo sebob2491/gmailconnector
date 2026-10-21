@@ -122,6 +122,23 @@ test("control characters from numeric references or raw bytes are dropped from b
   assert.equal(cleanBody("a\tb\u0000c\u001b[31md\fpage 2\u000bnext"), "a\tbc[31md\npage 2\nnext");
 });
 
+test("htmlToText leaves out elements hidden by their style, such as a newsletter's preview text", () => {
+  const preheader = `<div style="display:none;font-size:1px;color:#fff;max-height:0;overflow:hidden">Jeans from $39.99 this week only${"&zwnj;&nbsp;".repeat(20)}</div>`;
+  assert.equal(htmlToText(`${preheader}<table><tr><td><p>Hi Sam,</p><p>New arrivals are in.</p></td></tr></table>`), "Hi Sam,\n\nNew arrivals are in.");
+  // Nested elements, other spellings, the preheader pattern without display:none, and `hidden`.
+  assert.equal(htmlToText('<div style="DISPLAY: none !important"><div>a</div><p>b</p></div>c'), "c");
+  assert.equal(htmlToText('<span style="font-size:0;max-height:0px;overflow:hidden;mso-hide:all">preview</span>Body'), "Body");
+  assert.equal(htmlToText("<p hidden>secret</p>shown"), "shown");
+  // A hidden element ends with its end tag, an end tag of what it is in, or the next cell, item or row.
+  assert.equal(htmlToText('<div><span style="display:none">x</div>after'), "after");
+  assert.equal(htmlToText('<table><tr><td style="display:none">mobile<td>desktop</table>'), "desktop");
+  assert.equal(htmlToText('<table><tr><td style="display:none"><table><tr><td>inner</td></tr></table></td><td>shown</td></tr></table>'), "shown");
+  assert.equal(htmlToText('<ul><li style="display:none">one<li>two</ul>'), "- two");
+  // A hidden image's alt text isn't used; other "none" styles hide nothing.
+  assert.equal(htmlToText('<a href="https://x.example/"><img style="display:none" alt="Hidden"><img alt="Shop"></a>'), "Shop (https://x.example/)");
+  assert.equal(htmlToText('<p style="text-decoration:none;border:none">kept</p><div style="max-height:0px">kept too</div>'), "kept\n\nkept too");
+});
+
 test("htmlToText decodes entities fully and safely", () => {
   assert.equal(htmlToText("F&uuml;r Sie: Caf&eacute; &Agrave; &rarr; &hearts; &alpha;&Omega; &euro;5 &frac12;"), "Für Sie: Café À → ♥ αΩ €5 ½");
   // Numeric references in the Windows-1252 range, and legacy references without ";".

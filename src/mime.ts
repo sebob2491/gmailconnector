@@ -656,12 +656,26 @@ function startsMarkup(html: string, lt: number): boolean {
   return c === 33 /* ! */ || c === 47 /* / */ || c === 63 /* ? */ || isLetter(c);
 }
 
+/** What scanAttributes notes about any tag, without collecting its attributes: its style and `hidden`. */
+interface TagFlags {
+  style: string | undefined;
+  hidden: boolean;
+}
+
+/** Whether html[start, end) is the attribute name `name` (lower-case ASCII letters), in any case. */
+function isName(html: string, start: number, end: number, name: string): boolean {
+  if (end - start !== name.length) return false;
+  for (let k = 0; k < name.length; k++) if ((html.charCodeAt(start + k) | 0x20) !== name.charCodeAt(k)) return false;
+  return true;
+}
+
 /**
  * Reads a tag's attributes from `i` (just after its name) through the closing ">", like a browser:
  * quotes only matter around attribute values. Returns the index after ">", or -1 if the document ends
- * inside the tag (browsers then drop the rest). Linear in the tag's length.
+ * inside the tag (browsers then drop the rest). Linear in the tag's length. Attributes are collected
+ * into `attrs` when given; `flags` gets the style attribute and whether `hidden` is set.
  */
-function scanAttributes(html: string, i: number, attrs?: Map<string, string>): number {
+function scanAttributes(html: string, i: number, attrs?: Map<string, string>, flags?: TagFlags): number {
   const n = html.length;
   while (i < n) {
     let c = html.charCodeAt(i);
@@ -674,6 +688,8 @@ function scanAttributes(html: string, i: number, attrs?: Map<string, string>): n
     i++; // the first character always belongs to the name, even "=" or a quote
     while (i < n && (c = html.charCodeAt(i)) !== 62 && c !== 61 && c !== 47 && !isHtmlSpace(c)) i++;
     const name = attrs ? html.slice(nameStart, i).toLowerCase() : "";
+    const style = flags !== undefined && flags.style === undefined && isName(html, nameStart, i, "style");
+    if (flags && isName(html, nameStart, i, "hidden")) flags.hidden = true;
     while (i < n && isHtmlSpace(html.charCodeAt(i))) i++;
     if (html.charCodeAt(i) !== 61 /* = */) {
       if (attrs && !attrs.has(name)) attrs.set(name, "");
@@ -686,16 +702,51 @@ function scanAttributes(html: string, i: number, attrs?: Map<string, string>): n
     if (c === 34 || c === 39) {
       const close = html.indexOf(c === 34 ? '"' : "'", i + 1);
       if (close < 0) return -1;
-      value = attrs ? html.slice(i + 1, close) : "";
+      value = attrs || style ? html.slice(i + 1, close) : "";
       i = close + 1;
     } else {
       const start = i;
       while (i < n && (c = html.charCodeAt(i)) !== 62 && !isHtmlSpace(c)) i++;
-      value = attrs ? html.slice(start, i) : "";
+      value = attrs || style ? html.slice(start, i) : "";
     }
     if (attrs && !attrs.has(name)) attrs.set(name, value);
+    if (style) flags!.style = value;
   }
   return -1;
+}
+
+/** Elements without content or an end tag. */
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "param", "source", "track", "wbr"]);
+
+/** Inline styles that hide an element: display:none, or the max-height:0 with overflow:hidden of email preheaders. */
+function hidesElement(style: string): boolean {
+  if (!/none|hidden/i.test(style)) return false;
+  return (
+    /display\s*:\s*none/i.test(style) ||
+    (/max-height\s*:\s*0(?:px|em|rem|pt|%)?\s*(?:!important\s*)?(?:;|$)/i.test(style) && /overflow\s*:\s*hidden/i.test(style))
+  );
+}
+
+/** A start tag that ends an open element of this kind whose end tag was left out (as `<li>` ends an open `<li>`). */
+function endsImplicitly(open: string, tag: string): boolean {
+  switch (open) {
+    case "p":
+      return PARAGRAPH_TAGS.has(tag) || LINE_TAGS.has(tag);
+    case "li":
+      return tag === "li";
+    case "dt":
+    case "dd":
+      return tag === "dt" || tag === "dd";
+    case "td":
+    case "th":
+      return tag === "td" || tag === "th" || tag === "tr";
+    case "tr":
+      return tag === "tr";
+    case "option":
+      return tag === "option" || tag === "optgroup";
+    default:
+      return false;
+  }
 }
 
 /** Collects output text, collapsing white space and blank lines as a browser lays them out. */
@@ -786,7 +837,9 @@ class TextBuilder {
 /**
  * Converts an email's HTML to readable text, the way a browser would show it: white space collapses,
  * block elements and <br> make lines, lists get markers, table cells are separated by tabs, and links
- * keep their address as "label (url)". Runs in linear time on any input, including broken HTML.
+ * keep their address as "label (url)". Elements hidden by their inline style (display:none, or the
+ * max-height:0 and overflow:hidden of a newsletter's preview text) or by `hidden` are left out. Runs
+ * in linear time on any input, including broken HTML.
  */
 export function htmlToText(html: string): string {
   const b = new TextBuilder();
@@ -796,6 +849,12 @@ export function htmlToText(html: string): string {
   let pre = 0;
   let preStart = false;
   let pos = 0;
+  const flags: TagFlags = { style: undefined, hidden: false };
+  /**
+   * An element hidden by its style, and everything in it, until its end: how many of its kind are open,
+   * and the elements opened inside it (by name, and in all).
+   */
+  let hidden: { tag: string; depth: number; inner: Map<string, number>; open: number } | undefined;
 
   const closeLink = () => {
     if (!link) return;
@@ -831,7 +890,7 @@ export function htmlToText(html: string): string {
     let lt = html.indexOf("<", pos);
     while (lt >= 0 && !startsMarkup(html, lt)) lt = html.indexOf("<", lt + 1);
     const textEnd = lt < 0 ? n : lt;
-    if (textEnd > pos) {
+    if (textEnd > pos && !hidden) {
       let raw = html.slice(pos, textEnd);
       if (pre) {
         if (preStart) raw = raw.replace(/^\r?\n/, "");
@@ -870,7 +929,9 @@ export function htmlToText(html: string): string {
     const tag = html.slice(nameStart, i).toLowerCase();
     const wantAttrs = !closing && (tag === "a" || tag === "img" || tag === "ol");
     const attrs = wantAttrs ? new Map<string, string>() : undefined;
-    const end = scanAttributes(html, i, attrs);
+    flags.style = undefined;
+    flags.hidden = false;
+    const end = scanAttributes(html, i, attrs, closing ? undefined : flags);
     if (end < 0) break;
     pos = end;
 
@@ -882,6 +943,37 @@ export function htmlToText(html: string): string {
       const after = scanAttributes(html, m.index + 2 + tag.length);
       if (after < 0) break;
       pos = after;
+      continue;
+    }
+
+    if (hidden) {
+      // Inside a hidden element: only its end matters (its own end tag, an end tag of an element it is
+      // in, or a start tag that implicitly ends it, such as the next <td>).
+      if (closing) {
+        if (tag === hidden.tag) {
+          if (--hidden.depth === 0) hidden = undefined;
+          continue;
+        }
+        const opened = hidden.inner.get(tag);
+        if (opened) {
+          hidden.inner.set(tag, opened - 1);
+          hidden.open--;
+          continue;
+        }
+        hidden = undefined;
+      } else if (hidden.depth === 1 && !hidden.open && endsImplicitly(hidden.tag, tag)) {
+        hidden = undefined;
+      } else {
+        if (tag === hidden.tag) hidden.depth++;
+        else if (!VOID_TAGS.has(tag)) {
+          hidden.inner.set(tag, (hidden.inner.get(tag) ?? 0) + 1);
+          hidden.open++;
+        }
+        continue;
+      }
+    }
+    if (!closing && (flags.hidden || (flags.style !== undefined && hidesElement(flags.style)))) {
+      if (!VOID_TAGS.has(tag)) hidden = { tag, depth: 1, inner: new Map(), open: 0 };
       continue;
     }
 
