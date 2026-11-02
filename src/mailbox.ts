@@ -237,6 +237,29 @@ function checkId(id: string, what: string): string {
   return clean;
 }
 
+/** The most messages, and threads, one change_labels or move_to call takes. */
+export const MAX_CHANGE_MESSAGES = 100;
+export const MAX_CHANGE_THREADS = 50;
+
+/** Checks and de-duplicates the IDs a change_labels or move_to call names, within the per-call limit. */
+function checkTargets(kind: "messages" | "threads", ids: string[]): string[] {
+  const what = kind === "messages" ? "message" : "thread";
+  const unique = [...new Set(ids.map((id) => checkId(id, what)))];
+  const max = kind === "messages" ? MAX_CHANGE_MESSAGES : MAX_CHANGE_THREADS;
+  if (!unique.length) throw new MimeError(`Give at least one ${what} ID.`);
+  if (unique.length > max) throw new MimeError(`At most ${max} ${what} IDs per call (got ${unique.length}); for more, use bulk_update or bulk_trash.`);
+  return unique;
+}
+
+export type MoveDestination = "trash" | "out_of_trash" | "spam" | "not_spam" | "inbox";
+
+/** The label changes behind the moves that aren't Gmail's trash and untrash calls. */
+const MOVES: Record<"spam" | "not_spam" | "inbox", { addLabelIds: string[]; removeLabelIds: string[] }> = {
+  spam: { addLabelIds: ["SPAM"], removeLabelIds: ["INBOX"] },
+  not_spam: { addLabelIds: ["INBOX"], removeLabelIds: ["SPAM"] },
+  inbox: { addLabelIds: ["INBOX"], removeLabelIds: [] },
+};
+
 type Failed = { id: string; error: GmailApiError };
 
 /**
@@ -1664,18 +1687,72 @@ export class Mailbox {
     return ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
   }
 
-  async modify(kind: "messages" | "threads", id: string, add: string[] | undefined, remove: string[] | undefined) {
-    const labels = await this.labelsFor([...(add ?? []), ...(remove ?? [])]);
-    const addLabelIds = await this.resolveLabelIds(add, labels);
-    const removeLabelIds = await this.resolveLabelIds(remove, labels);
-    if (!addLabelIds.length && !removeLabelIds.length) throw new MimeError("Provide at least one label to add or remove.");
-    return this.modifyIds(kind, id, addLabelIds, removeLabelIds);
-  }
-
   async modifyIds(kind: "messages" | "threads", id: string, addLabelIds: string[], removeLabelIds: string[]) {
     const what = kind === "messages" ? "message" : "thread";
     const res = await this.client.request("POST", `${kind}/${checkId(id, what)}/modify`, { json: { addLabelIds, removeLabelIds } });
     return this.modifyResult(kind, res);
+  }
+
+  /**
+   * Adds and removes labels (IDs or names, resolved once) on each of several messages or threads.
+   * TRASH and SPAM are refused: moving to Trash or Spam goes through move_to.
+   */
+  async changeLabels(kind: "messages" | "threads", ids: string[], add: string[] | undefined, remove: string[] | undefined) {
+    const refs = [...(add ?? []), ...(remove ?? [])];
+    const moving = refs.find((ref) => /^(trash|spam)$/i.test(ref.trim()));
+    if (moving) {
+      throw new MimeError(`${moving.trim().toUpperCase()} isn't changed with change_labels: use move_to (destination trash, out_of_trash, spam or not_spam).`);
+    }
+    if (!refs.length) throw new MimeError("Provide at least one label to add or remove.");
+    const targets = checkTargets(kind, ids);
+    const labels = await this.labelsFor(refs);
+    const addLabelIds = await this.resolveLabelIds(add, labels);
+    const removeLabelIds = await this.resolveLabelIds(remove, labels);
+    return this.changeEach(kind, targets, { addLabelIds, removeLabelIds });
+  }
+
+  /**
+   * Moves several messages or threads: to Trash or out of it with Gmail's trash and untrash calls,
+   * and to Spam, out of Spam or to the inbox by changing labels (as Gmail's own buttons do).
+   */
+  async moveTo(kind: "messages" | "threads", ids: string[], destination: MoveDestination) {
+    const targets = checkTargets(kind, ids);
+    if (destination === "trash" || destination === "out_of_trash") return this.changeEach(kind, targets, destination === "trash" ? "trash" : "untrash");
+    const change = MOVES[destination];
+    return this.changeEach(kind, targets, change);
+  }
+
+  /**
+   * Applies one change to each target. A single target is one plain call (its errors are thrown);
+   * several go through Gmail's batch endpoint, one request per 50 messages or 25 threads (a thread
+   * change costs Gmail twice the quota), and each target that fails is reported with its error.
+   */
+  private async changeEach(
+    kind: "messages" | "threads",
+    ids: string[],
+    change: { addLabelIds: string[]; removeLabelIds: string[] } | "trash" | "untrash",
+  ): Promise<{ changed: ReturnType<Mailbox["modifyResult"]>[]; failed: { id: string; error: string }[]; notFound?: boolean }> {
+    if (ids.length === 1) {
+      const [id] = ids;
+      const result =
+        typeof change === "string" ? await this.trash(kind, id, change === "untrash") : await this.modifyIds(kind, id, change.addLabelIds, change.removeLabelIds);
+      return { changed: [result], failed: [] };
+    }
+    const results = await this.client.batchGet(
+      ids.map((id) => (typeof change === "string" ? { path: `${kind}/${id}/${change}`, method: "POST" as const } : { path: `${kind}/${id}/modify`, json: change })),
+      kind === "threads" ? 25 : 50,
+    );
+    const changed: ReturnType<Mailbox["modifyResult"]>[] = [];
+    const failed: { id: string; error: string }[] = [];
+    let notFound = false;
+    results.forEach((r, i) => {
+      if (r.ok) changed.push(this.modifyResult(kind, r.value));
+      else if (r.error.status === 404 || (r.error.status === 400 && /invalid id/i.test(r.error.message))) {
+        notFound = true;
+        failed.push({ id: ids[i], error: "not found in this account" });
+      } else failed.push({ id: ids[i], error: r.error.message });
+    });
+    return { changed, failed, ...(notFound ? { notFound } : {}) };
   }
 
   // ---------- filters ----------

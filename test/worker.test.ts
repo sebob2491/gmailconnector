@@ -581,7 +581,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     });
     assert.equal(init.result.serverInfo.name, "gmail-multi");
     const tools = await mcp("tools/list");
-    assert.equal(tools.result.tools.length, 36);
+    assert.equal(tools.result.tools.length, 25);
 
     const accounts = await callTool("list_accounts");
     assert.deepEqual(accounts.json.accounts.map((a: any) => a.email), [PERSONAL, WORK]);
@@ -799,8 +799,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
   test("connecting again doesn't disconnect an earlier connection", async () => {
     const second = await connectAsOwner(firstClientId);
     assert.notEqual(second, accessToken);
-    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 36, "first connection still works");
-    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 36);
+    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 25, "first connection still works");
+    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 25);
   });
 
   test("searching five linked accounts stays under Cloudflare's 50-call limit", async () => {

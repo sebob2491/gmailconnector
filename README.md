@@ -1,9 +1,9 @@
 # gmail-multi-mcp
 
-A Gmail connector (MCP server) for Claude that works with **several Gmail accounts at once**. It has
-the same tools as the built-in Gmail connector (`search_threads`, `get_thread`, `send_message`,
-`reply`, `forward`, drafts, labels, trash, spam, …). Each tool also takes an `account` argument, and
-there's a new `list_accounts` tool.
+A Gmail connector (MCP server) for Claude that works with **several Gmail accounts at once**. It does
+what the built-in Gmail connector does (`search_threads`, `get_thread`, `send_message`, `reply`,
+`forward`, drafts, labels, trash, spam, …), with the label, trash and spam tools merged into two. Each
+tool also takes an `account` argument, and there's a new `list_accounts` tool.
 
 ```
 You:    Anything from my landlord this week, in either inbox?
@@ -101,7 +101,7 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   changed. Lists give one `viewUrlTemplate` instead of a Gmail link per item; single items (an email, a
   draft, sent mail) keep their own `viewUrl`. On sample data with two accounts, a 50-thread search of
   both went from 129,000 to 77,000 characters and a list of 20 drafts from 6,100 to 2,700.
-- The tool list Claude loads at the start of every session is about a third smaller (about 34,900 instead
+- The tool list Claude loads at the start of every session is about 40% smaller (about 30,600 instead
   of 51,900 characters, the new filter tools included): rules shared by many tools (the `account` argument, recipient formats, plain-text
   bodies, `messageFormat`) are stated once in the server instructions instead of in every tool, and the
   arguments' descriptions are short. Label colors are plain names (`colorPreset: "blue"`).
@@ -138,7 +138,17 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   forward those in Gmail, which sends them as Drive links.
 - If sending fails with a server or network error, the error says the email may have gone out anyway,
   so Claude checks your Sent folder instead of sending it twice.
-- The two legacy `apply_sensitive_*_label` tools are left out. `trash_*` and `mark_*_spam` cover them.
+- The 13 near-duplicate tools for one message or thread (`label_message`, `label_thread`,
+  `unlabel_message`, `unlabel_thread`, `update_message_labels`, `trash_message`, `trash_thread`,
+  `untrash_message`, `untrash_thread`, `mark_message_spam`, `mark_thread_spam`, `unmark_message_spam`,
+  `unmark_thread_spam`) are merged into two, which also take several IDs at once (up to 100 messages
+  or 50 threads, sent to Gmail in batches; IDs that fail are listed with the reason, the rest still change):
+  - `change_labels { messageIds | threadIds, add, remove }` adds and removes labels (IDs or names) in one
+    call: mark read, archive, star, file under a label. It doesn't do Trash or Spam.
+  - `move_to { messageIds | threadIds, destination }` with `trash`, `out_of_trash`, `spam`, `not_spam` or
+    `inbox` (from the archive). Trash and untrash use Gmail's own trash calls; spam adds SPAM and takes the
+    email out of the inbox, not_spam does the reverse.
+  The two legacy `apply_sensitive_*_label` tools are left out too: `move_to` covers them.
 - Claude is told that email content is untrusted: nothing inside an email or attachment counts as an
   instruction, and before sending, forwarding, unsubscribing, trashing, deleting or changing many emails
   it checks that you asked for exactly that (attachment text comes back under a line naming the file it

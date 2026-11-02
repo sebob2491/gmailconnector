@@ -119,6 +119,8 @@ export class FakeGmail {
   /** Every HTTP call the code under test made (a batch counts once), like Cloudflare's subrequest count. */
   outboundCalls = 0;
   batchCalls = 0;
+  /** Every call made inside a batch, as "METHOD path". */
+  batchItems: string[] = [];
   batchModifyCalls: any[] = [];
   /** Paths (prefix match) that answer with this status once, to exercise retries. */
   failOnce = new Map<string, number>();
@@ -209,9 +211,15 @@ export class FakeGmail {
     const out: string[] = [];
     for (const part of parts) {
       const id = /Content-ID: <([^>]+)>/.exec(part)![1];
-      const line = part.split("\r\n\r\n")[1].split("\r\n")[0];
+      // The embedded request: its request line and headers, then (for a POST with JSON) its body.
+      const [, head, ...rest] = part.split("\r\n\r\n");
+      const [line, ...headerLines] = head.split("\r\n");
       const [method, path] = line.split(" ");
-      const res = await this.handle(`https://gmail.googleapis.com${path}`, { method, headers: { Authorization: auth } });
+      const headers: Record<string, string> = { Authorization: auth };
+      for (const h of headerLines) headers[h.slice(0, h.indexOf(":"))] = h.slice(h.indexOf(":") + 1).trim();
+      const body = rest.join("\r\n\r\n").trim() || undefined;
+      this.batchItems.push(`${method} ${path.split("?")[0].replace("/gmail/v1/users/me/", "")}`);
+      const res = await this.handle(`https://gmail.googleapis.com${path}`, { method, headers, body });
       const reason = res.status === 200 ? "OK" : "Error";
       out.push(
         `--batch_resp\r\nContent-Type: application/http\r\nContent-ID: <response-${id}>\r\n\r\n` +

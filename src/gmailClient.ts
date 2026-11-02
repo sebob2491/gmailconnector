@@ -67,6 +67,9 @@ export interface RequestOptions {
 export interface BatchItem {
   path: string;
   query?: Record<string, QueryValue>;
+  /** GET by default; POST with a JSON body for changes such as messages/{id}/modify (only idempotent ones). */
+  method?: "GET" | "POST";
+  json?: unknown;
 }
 
 export type BatchResult<T> = { ok: true; value: T } | { ok: false; error: GmailApiError };
@@ -226,28 +229,29 @@ export class GmailClient {
   /**
    * Runs many GET calls through Gmail's batch endpoint: one HTTP request per 50 calls instead of one
    * each (which keeps the hosted connector under Cloudflare's per-request subrequest limit).
-   * Calls that come back rate-limited or with a server error are retried once.
+   * Calls that come back rate-limited or with a server error are retried once. Items may also be
+   * idempotent POSTs (modify, trash, untrash); `chunkSize` lowers the calls per request for costlier ones.
    */
-  async batchGet<T = any>(items: BatchItem[]): Promise<BatchResult<T>[]> {
+  async batchGet<T = any>(items: BatchItem[], chunkSize = BATCH_SIZE): Promise<BatchResult<T>[]> {
     const results = new Array<BatchResult<T>>(items.length);
     let pending = items.map((_, i) => i);
     for (let round = 0; pending.length; round++) {
       if (round > 0) await wait(500 * round);
       const retry: number[] = [];
-      for (let start = 0; start < pending.length; start += BATCH_SIZE) {
-        const chunk = pending.slice(start, start + BATCH_SIZE);
+      for (let start = 0; start < pending.length; start += chunkSize) {
+        const chunk = pending.slice(start, start + chunkSize);
         const responses = await this.sendBatch(chunk.map((i) => items[i]));
         chunk.forEach((index, k) => {
           const r = responses[k];
-          const path = items[index].path;
+          const { path, json, method = json === undefined ? "GET" : "POST" } = items[index];
           if (r && r.status >= 200 && r.status < 300) {
             results[index] = { ok: true, value: (r.body ? JSON.parse(r.body) : undefined) as T };
           } else if (round < MAX_RETRIES - 1 && (!r || isRateLimited(r.status, r.body) || r.status >= 500)) {
             retry.push(index);
           } else {
             const error = r
-              ? apiError("GET", path, r.status, r.body)
-              : new GmailApiError(502, `Gmail API GET ${path} failed: no response in batch`);
+              ? apiError(method, path, r.status, r.body)
+              : new GmailApiError(502, `Gmail API ${method} ${path} failed: no response in batch`);
             results[index] = { ok: false, error };
           }
         });
@@ -263,7 +267,11 @@ export class GmailClient {
       items
         .map((item, k) => {
           const url = withQuery(new URL(item.path, API_BASE), item.query);
-          return `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <item-${k}>\r\n\r\nGET ${url.pathname}${url.search}\r\n\r\n`;
+          const request =
+            item.json === undefined
+              ? `${item.method ?? "GET"} ${url.pathname}${url.search}\r\n\r\n`
+              : `${item.method ?? "POST"} ${url.pathname}${url.search}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(item.json)}\r\n`;
+          return `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <item-${k}>\r\n\r\n${request}`;
         })
         .join("") + `--${boundary}--`;
     const { res, text } = await this.send("POST", BATCH_URL, body, `multipart/mixed; boundary=${boundary}`, true);

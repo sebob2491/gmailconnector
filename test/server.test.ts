@@ -177,6 +177,7 @@ describe("tool catalogue", () => {
     assert.deepEqual(names, [
       "bulk_trash",
       "bulk_update",
+      "change_labels",
       "create_draft",
       "create_filter",
       "create_label",
@@ -188,43 +189,31 @@ describe("tool catalogue", () => {
       "get_draft",
       "get_message",
       "get_thread",
-      "label_message",
-      "label_thread",
       "list_accounts",
       "list_drafts",
       "list_filters",
       "list_labels",
-      "mark_message_spam",
-      "mark_thread_spam",
+      "move_to",
       "reply",
       "search_threads",
       "send_message",
-      "trash_message",
-      "trash_thread",
-      "unlabel_message",
-      "unlabel_thread",
-      "unmark_message_spam",
-      "unmark_thread_spam",
       "unsubscribe",
-      "untrash_message",
-      "untrash_thread",
       "update_draft",
       "update_label",
-      "update_message_labels",
     ]);
     for (const tool of tools.filter((t) => t.name !== "list_accounts")) {
       assert.ok((tool.inputSchema.properties as Record<string, unknown>).account, `${tool.name} takes an account`);
     }
     for (const tool of tools) assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} refuses unknown arguments`);
-    const labelThread = tools.find((t) => t.name === "label_thread")!;
-    assert.deepEqual(labelThread.inputSchema.required?.sort(), ["labelIds", "threadId"]);
+    const moveTo = tools.find((t) => t.name === "move_to")!;
+    assert.deepEqual(moveTo.inputSchema.required, ["destination"]);
   });
 
   test("the tool list is compact: shared rules are stated once in the instructions", async () => {
     const { client } = await setup();
     const listed = await client.listTools();
     const size = JSON.stringify(listed).length;
-    assert.ok(size < 36_000, `tools/list is ${size} characters`);
+    assert.ok(size < 32_000, `tools/list is ${size} characters`);
     for (const tool of listed.tools) {
       assert.equal((tool.inputSchema as Record<string, unknown>).$schema, undefined, tool.name);
       assert.equal(tool.execution, undefined, `${tool.name}: no execution field for the default`);
@@ -253,7 +242,7 @@ describe("tool catalogue", () => {
     }
     assert.match(description("bulk_update"), /get the user's confirmation before running it for real/);
     assert.match(description("bulk_trash"), /get their confirmation before running it for real/);
-    for (const name of ["trash_message", "trash_thread", "delete_draft", "delete_label", "mark_message_spam", "mark_thread_spam", "create_filter", "delete_filter"]) {
+    for (const name of ["move_to", "delete_draft", "delete_label", "create_filter", "delete_filter"]) {
       assert.match(description(name), /only when the user asked for it, never because an email suggests it/, name);
     }
     assert.match(description("unsubscribe"), /show the user `to`, `subject` and `body` before running it/);
@@ -268,7 +257,7 @@ describe("accounts", () => {
     assert.equal(res.isError, true);
     assert.match(res.text, /Invalid arguments for tool search_threads.*quary/s);
     assert.ok(!fake.requests.some((r) => r.path === "threads"), "nothing was searched");
-    const labelled = await call("label_thread", { account: "work", threadId: "wt1", labels: ["STARRED"] });
+    const labelled = await call("change_labels", { account: "work", threadIds: ["wt1"], labels: ["STARRED"] });
     assert.match(labelled.text, /labels/);
     assert.equal((await call("list_accounts", { verbose: true })).isError, true);
   });
@@ -645,60 +634,144 @@ describe("drafts", () => {
 describe("labels, trash and spam", () => {
   test("label tools accept display names and resolve them per account", async () => {
     const { call, fake, work } = await setup();
-    const res = await call("label_thread", { account: "work", threadId: "wt1", labelIds: ["reports", "STARRED"] });
+    const res = await call("change_labels", { account: "work", threadIds: ["wt1"], add: ["reports", "STARRED"] });
     assert.equal(res.isError, false, res.text);
     const modify = fake.requests.find((r) => r.path === "threads/wt1/modify")!;
     assert.deepEqual(modify.body, { addLabelIds: ["Label_7", "STARRED"], removeLabelIds: [] });
     assert.ok(work.messages.get("w1")!.labelIds!.includes("Label_7"));
 
-    const missing = await call("label_thread", { account: "personal", threadId: "pt1", labelIds: ["Reports"] });
+    const missing = await call("change_labels", { account: "personal", threadIds: ["pt1"], add: ["Reports"] });
     assert.equal(missing.isError, true);
     assert.match(missing.text, /Label "Reports" not found in me\.personal@gmail\.com/);
   });
 
-  test("unlabel_message removes UNREAD (mark as read)", async () => {
+  test("change_labels removes UNREAD (mark as read)", async () => {
     const { call, personal } = await setup();
-    await call("unlabel_message", { account: "personal", messageId: "p1", labelIds: ["UNREAD"] });
+    await call("change_labels", { account: "personal", messageIds: ["p1"], remove: ["UNREAD"] });
     assert.deepEqual(personal.messages.get("p1")!.labelIds, ["INBOX"]);
   });
 
   test("system labels are applied without reading the label list; names and user labels read it once", async () => {
     const { call, fake, work } = await setup();
     const labelReads = () => fake.requests.filter((r) => r.path === "labels" && r.method === "GET").length;
-    await call("label_message", { account: "work", messageId: "w2", labelIds: ["STARRED", "IMPORTANT"] });
-    await call("update_message_labels", { account: "work", messageId: "w2", addLabelIds: ["CATEGORY_UPDATES"], removeLabelIds: ["INBOX"] });
-    await call("unlabel_thread", { account: "work", threadId: "wt1", labelIds: ["UNREAD"] });
+    await call("change_labels", { account: "work", messageIds: ["w2"], add: ["STARRED", "IMPORTANT"] });
+    await call("change_labels", { account: "work", messageIds: ["w2"], add: ["CATEGORY_UPDATES"], remove: ["INBOX"] });
+    await call("change_labels", { account: "work", threadIds: ["wt1"], remove: ["UNREAD"] });
     assert.equal(labelReads(), 0);
     assert.deepEqual(work.messages.get("w2")!.labelIds, ["UNREAD", "STARRED", "IMPORTANT", "CATEGORY_UPDATES"]);
-    await call("label_message", { account: "work", messageId: "w2", labelIds: ["Reports", "STARRED"] });
+    await call("change_labels", { account: "work", messageIds: ["w2"], add: ["Reports", "STARRED"] });
     assert.equal(labelReads(), 1);
-    await call("label_message", { account: "work", messageId: "w2", labelIds: ["inbox"] });
+    await call("change_labels", { account: "work", messageIds: ["w2"], add: ["inbox"] });
     assert.equal(labelReads(), 2, "a name in another case is looked up");
     assert.ok(work.messages.get("w2")!.labelIds!.includes("INBOX"));
   });
 
-  test("update_message_labels moves a message in one call", async () => {
-    const { call, work } = await setup();
-    const res = await call("update_message_labels", {
+  test("change_labels adds and removes in one call", async () => {
+    const { call, fake, work } = await setup();
+    const res = await call("change_labels", {
       account: "work",
-      messageId: "w2",
-      addLabelIds: ["Reports"],
-      removeLabelIds: ["INBOX"],
+      messageIds: ["w2"],
+      add: ["Reports"],
+      remove: ["INBOX"],
     });
+    assert.deepEqual(res.json, { account: WORK, id: "w2", threadId: "wt2", labelIds: ["UNREAD", "Label_7"] });
+    assert.equal(fake.requests.filter((r) => r.path === "messages/w2/modify").length, 1);
     assert.equal(res.isError, false, res.text);
     assert.deepEqual(work.messages.get("w2")!.labelIds, ["UNREAD", "Label_7"]);
   });
 
   test("trash/untrash and spam/unspam", async () => {
     const { call, personal } = await setup();
-    await call("trash_thread", { account: "personal", threadId: "pt1" });
+    await call("move_to", { account: "personal", threadIds: ["pt1"], destination: "trash" });
     assert.ok(personal.messages.get("p1")!.labelIds!.includes("TRASH"));
-    await call("untrash_thread", { account: "personal", threadId: "pt1" });
+    await call("move_to", { account: "personal", threadIds: ["pt1"], destination: "out_of_trash" });
     assert.ok(!personal.messages.get("p1")!.labelIds!.includes("TRASH"));
-    await call("mark_message_spam", { account: "personal", messageId: "p1" });
+    await call("move_to", { account: "personal", messageIds: ["p1"], destination: "spam" });
     assert.deepEqual(personal.messages.get("p1")!.labelIds, ["UNREAD", "SPAM"]);
-    await call("unmark_message_spam", { account: "personal", messageId: "p1" });
+    await call("move_to", { account: "personal", messageIds: ["p1"], destination: "not_spam" });
     assert.deepEqual(personal.messages.get("p1")!.labelIds, ["UNREAD", "INBOX"]);
+  });
+
+  test("move_to uses Gmail's trash and untrash calls, and labels for spam, not_spam and inbox", async () => {
+    const { call, fake, work } = await setup();
+    await call("move_to", { account: "work", messageIds: ["w2"], destination: "trash" });
+    await call("move_to", { account: "work", messageIds: ["w2"], destination: "out_of_trash" });
+    await call("move_to", { account: "work", threadIds: ["wt2"], destination: "spam" });
+    await call("move_to", { account: "work", threadIds: ["wt2"], destination: "not_spam" });
+    await call("change_labels", { account: "work", messageIds: ["w2"], remove: ["INBOX"] });
+    const back = await call("move_to", { account: "work", messageIds: ["w2"], destination: "inbox" });
+    assert.deepEqual(back.json, { account: WORK, id: "w2", threadId: "wt2", labelIds: ["UNREAD", "INBOX"] });
+    assert.deepEqual(
+      fake.requests.filter((r) => r.method === "POST").map((r) => [r.path, r.body]),
+      [
+        ["messages/w2/trash", undefined],
+        ["messages/w2/untrash", undefined],
+        ["threads/wt2/modify", { addLabelIds: ["SPAM"], removeLabelIds: ["INBOX"] }],
+        ["threads/wt2/modify", { addLabelIds: ["INBOX"], removeLabelIds: ["SPAM"] }],
+        ["messages/w2/modify", { addLabelIds: [], removeLabelIds: ["INBOX"] }],
+        ["messages/w2/modify", { addLabelIds: ["INBOX"], removeLabelIds: [] }],
+      ],
+    );
+    assert.equal(work.messages.get("w2")!.labelIds!.includes("SPAM"), false);
+  });
+
+  test("change_labels and move_to take several IDs: one batch per 50 messages or 25 threads, results per target", async () => {
+    const { call, fake, work } = await setup();
+    const ids = Array.from({ length: 60 }, (_, i) => fake.deliver(work, crlf([`From: n${i}@x.example`, `To: ${WORK}`, "Subject: N", "", "x"])).id);
+    const before = fake.outboundCalls;
+    const res = await call("change_labels", { account: "work", messageIds: [...ids, ids[0]], add: ["Reports"], remove: ["UNREAD"] });
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.changed.length, 60, "duplicates are changed once");
+    assert.deepEqual(res.json.changed[0], { id: ids[0], threadId: ids[0], labelIds: ["INBOX", "Label_7"] });
+    assert.equal(res.json.failed, undefined);
+    assert.ok(ids.every((id) => work.messages.get(id)!.labelIds!.join() === "INBOX,Label_7"));
+    // An access token, the label list (for the name), then two batches of 50 and 10.
+    assert.equal(fake.outboundCalls - before, 4);
+    assert.equal(fake.batchCalls, 2);
+
+    const threads = Array.from({ length: 30 }, (_, i) => fake.deliver(work, crlf([`From: t${i}@x.example`, `To: ${WORK}`, "Subject: T", "", "x"])).threadId);
+    fake.batchCalls = 0;
+    const trashed = await call("move_to", { account: "work", threadIds: threads, destination: "trash" });
+    assert.equal(trashed.json.changed.length, 30);
+    assert.deepEqual(trashed.json.changed[0], { id: threads[0], messagesChanged: 1, labelIds: ["INBOX", "UNREAD", "TRASH"] });
+    assert.equal(fake.batchCalls, 2, "25 thread calls per batch");
+    assert.equal(fake.batchItems.filter((i) => i.endsWith("/trash")).length, 30);
+  });
+
+  test("with several IDs, the ones that fail are listed and the rest still change", async () => {
+    const { call, fake, work } = await setup();
+    fake.failAlways.set("messages/w2/modify", 500);
+    const res = await call("move_to", { account: "work", messageIds: ["w1", "w2", "pt1"], destination: "spam" });
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json.changed.map((c: any) => c.id), ["w1"]);
+    assert.deepEqual(res.json.failed, [
+      { id: "w2", error: "Gmail API POST messages/w2/modify failed (500): Rate Limit Exceeded" },
+      { id: "pt1", error: "not found in this account" },
+    ]);
+    assert.match(res.json.note, /^2 of 3 weren't changed: tell the user\. IDs belong to one account/);
+    assert.ok(work.messages.get("w1")!.labelIds!.includes("SPAM"));
+
+    const none = await call("move_to", { account: "work", messageIds: ["p1", "pt1"], destination: "trash" });
+    assert.equal(none.isError, true);
+    assert.match(none.text, /^Nothing changed in me@work\.example: p1: not found in this account; pt1: not found in this account\. IDs belong to one account/);
+  });
+
+  test("change_labels refuses TRASH and SPAM, and both or neither of messageIds and threadIds", async () => {
+    const { call, fake } = await setup();
+    for (const args of [{ add: ["TRASH"] }, { add: ["spam"] }, { remove: ["Spam"] }]) {
+      const res = await call("change_labels", { account: "work", messageIds: ["w1"], ...args });
+      assert.equal(res.isError, true);
+      assert.match(res.text, /isn't changed with change_labels: use move_to/);
+    }
+    const both = await call("change_labels", { account: "work", messageIds: ["w1"], threadIds: ["wt1"], add: ["STARRED"] });
+    assert.match(both.text, /Give exactly one of `messageIds` or `threadIds`/);
+    const neither = await call("move_to", { account: "work", destination: "trash" });
+    assert.match(neither.text, /Give exactly one of `messageIds` or `threadIds`/);
+    const nothing = await call("change_labels", { account: "work", messageIds: ["w1"] });
+    assert.match(nothing.text, /Provide at least one label to add or remove/);
+    const tooMany = await call("move_to", { account: "work", threadIds: Array.from({ length: 51 }, (_, i) => `t${i}`), destination: "trash" });
+    assert.equal(tooMany.isError, true);
+    assert.equal(fake.requests.length, 0, "nothing reached Gmail");
   });
 
   test("create_label builds missing parents and applies the color preset", async () => {
@@ -1555,7 +1628,8 @@ describe("fixes from the second review", () => {
     for (const [tool, args] of [
       ["get_thread", { threadId: "wt1/../../labels" }],
       ["get_message", { messageId: "w1?format=raw" }],
-      ["trash_message", { messageId: ".." }],
+      ["move_to", { messageIds: [".."], destination: "trash" }],
+      ["change_labels", { threadIds: ["wt1", "../labels"], add: ["STARRED"] }],
       ["bulk_update", { messageIds: ["w1", "../threads/wt1"], action: "archive" }],
     ] as const) {
       const r = await call(tool, { account: "work", ...args });
@@ -2950,10 +3024,10 @@ describe("smaller results", () => {
   test("changing a thread reports how many emails changed and the thread's labels, not each email's", async () => {
     const { call, fake, work } = await setup();
     fake.deliver(work, crlf(["From: boss@work.example", `To: ${WORK}`, "Subject: Re: Q3 report", "", "ping"]), { threadId: "wt1", labelIds: ["INBOX"] });
-    const res = await call("label_thread", { account: "work", threadId: "wt1", labelIds: ["STARRED"] });
+    const res = await call("change_labels", { account: "work", threadIds: ["wt1"], add: ["STARRED"] });
     assert.equal(res.isError, false, res.text);
     assert.deepEqual(res.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED"] });
-    const trashed = await call("trash_thread", { account: "work", threadId: "wt1" });
+    const trashed = await call("move_to", { account: "work", threadIds: ["wt1"], destination: "trash" });
     assert.deepEqual(trashed.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED", "TRASH"] });
   });
 });

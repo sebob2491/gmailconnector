@@ -20,6 +20,8 @@ import {
   type SenderGroup,
   type UnsubscribeOptions,
   DRAFT_URL_TEMPLATE,
+  MAX_CHANGE_MESSAGES,
+  MAX_CHANGE_THREADS,
   VIEW_URL_TEMPLATE,
   WRONG_ACCOUNT_HINT,
 } from "./mailbox.js";
@@ -31,6 +33,7 @@ const INSTRUCTIONS = `This server connects several Gmail accounts at once.
 - Call list_accounts to see which accounts are linked (email + optional alias like "work").
 - \`account\` takes a linked account's email or alias. Tools that work on one account may omit it when only one is linked or a default is set. search_threads, list_drafts, list_labels and list_filters cover every linked account when \`account\` is omitted (or "all"): search_threads merges the results into one list, newest first, and each thread's \`account\` says which inbox it's in; the others group results by account.
 - Message, thread, draft, label and filter IDs belong to one account. When you act on an ID, pass the same \`account\` that returned it.
+- change_labels (labels, read/unread, archive, star) and move_to (Trash, Spam, inbox) act on message or thread IDs; bulk_update and bulk_trash on many emails chosen by a search.
 - send_message, reply and forward require \`account\` whenever more than one account is linked. If the user has not said which address to send from, ask them.
 - Recipient lists (to, cc, bcc) take addresses, plain or with a name: "Ann Lee <ann@example.com>". \`body\` is plain text: don't format it with Markdown; use \`htmlBody\` for rich text (\`body\` is then the plain-text alternative). Attachments are base64 \`content\` with a \`filename\`, 25 MB in all.
 - messageFormat (get_message, get_thread, get_draft): PLAIN_TEXT (default) gives the plain-text body (HTML converted to text; get_message and get_thread cut links over 200 characters to their website) and attachment info; MINIMAL gives headers and snippet, no body; FULL_CONTENT adds the HTML body and keeps full links; METADATA_ONLY gives senders, recipients, date and flags; RAW gives the MIME source, with Gmail's \`labelIds\`. Bodies longer than maxBodyChars (default 20000; 0: no limit) are shortened, with a note.
@@ -959,58 +962,74 @@ export function createServer(deps: ServerDeps): McpServer {
       }),
   );
 
-  const labelTool = (
-    name: string,
-    kind: "messages" | "threads",
-    mode: "add" | "remove",
-    description: string,
-  ) => {
-    const idKey = kind === "messages" ? "messageId" : "threadId";
-    server.registerTool(
-      name,
-      {
-        description,
-        inputSchema: strictArgs({
-          account: accountArg,
-          [idKey]: z.string(),
-          labelIds: labelIdsArg,
-        } as z.ZodRawShape),
-        annotations: write,
-      },
-      async (args: Record<string, any>) =>
-        run(async () => {
-          const mb = await router.one(args.account);
-          const id = args[idKey] as string;
-          const result =
-            mode === "add" ? await mb.modify(kind, id, args.labelIds, undefined) : await mb.modify(kind, id, undefined, args.labelIds);
-          return { account: mb.email, ...result };
-        }),
-    );
+  /** The messageIds or threadIds of a change_labels or move_to call (exactly one of them). */
+  const targetArgs = {
+    messageIds: z.array(z.string()).min(1).max(MAX_CHANGE_MESSAGES).optional().describe(`Up to ${MAX_CHANGE_MESSAGES} messages.`),
+    threadIds: z.array(z.string()).min(1).max(MAX_CHANGE_THREADS).optional().describe(`Up to ${MAX_CHANGE_THREADS} threads (every email in each).`),
+  };
+  const targetsOf = (args: { messageIds?: string[]; threadIds?: string[] }) => {
+    if (Boolean(args.messageIds) === Boolean(args.threadIds)) throw new AccountError("Give exactly one of `messageIds` or `threadIds`.");
+    return args.messageIds ? { kind: "messages" as const, ids: args.messageIds } : { kind: "threads" as const, ids: args.threadIds! };
+  };
+  /**
+   * One target: its result as Gmail's single calls give it. Several: `changed` and the IDs that
+   * `failed`, with why; when none changed, an error.
+   */
+  const changeResult = (account: string, r: Awaited<ReturnType<Mailbox["moveTo"]>>) => {
+    if (r.changed.length === 1 && !r.failed.length) return { account, ...r.changed[0] };
+    if (!r.changed.length) {
+      throw new AccountError(
+        `Nothing changed in ${account}: ${r.failed.map((f) => `${f.id}: ${f.error}`).join("; ")}.${r.notFound ? ` ${WRONG_ACCOUNT_HINT}` : ""}`,
+      );
+    }
+    return {
+      account,
+      changed: r.changed,
+      ...(r.failed.length ? { failed: r.failed, note: `${r.failed.length} of ${r.changed.length + r.failed.length} weren't changed: tell the user.${r.notFound ? ` ${WRONG_ACCOUNT_HINT}` : ""}` } : {}),
+    };
   };
 
-  labelTool("label_message", "messages", "add", "Adds labels to one message. To trash or mark as spam use trash_message / mark_message_spam.");
-  labelTool("unlabel_message", "messages", "remove", "Removes labels from one message (e.g. remove UNREAD to mark as read, INBOX to archive).");
-  labelTool("label_thread", "threads", "add", "Adds labels to every message in a thread. To trash or mark as spam use trash_thread / mark_thread_spam.");
-  labelTool("unlabel_thread", "threads", "remove", "Removes labels from every message in a thread (e.g. remove UNREAD to mark as read, INBOX to archive).");
-
   server.registerTool(
-    "update_message_labels",
+    "change_labels",
     {
-      title: "Add and remove message labels",
+      title: "Change labels",
       description:
-        "Adds and removes labels on one message in a single call, e.g. to move it between labels.",
+        "Adds and/or removes labels on messages or whole threads of one account, e.g. remove UNREAD to mark as read, INBOX to archive; add STARRED to star. Give `messageIds` or `threadIds`. For Trash and Spam use move_to; for emails chosen by a search, bulk_update.",
       inputSchema: strictArgs({
         account: accountArg,
-        messageId: z.string(),
-        addLabelIds: labelIdsArg.optional(),
-        removeLabelIds: labelIdsArg.optional(),
+        ...targetArgs,
+        add: labelIdsArg.optional(),
+        remove: labelIdsArg.optional(),
       }),
       annotations: write,
     },
     async (args) =>
       run(async () => {
+        const { kind, ids } = targetsOf(args);
         const mb = await router.one(args.account);
-        return { account: mb.email, ...(await mb.modify("messages", args.messageId, args.addLabelIds, args.removeLabelIds)) };
+        return changeResult(mb.email, await mb.changeLabels(kind, ids, args.add, args.remove));
+      }),
+  );
+
+  server.registerTool(
+    "move_to",
+    {
+      title: "Move to Trash, Spam or inbox",
+      description:
+        "Moves messages or whole threads of one account: `trash` (kept 30 days), `out_of_trash` (restore), `spam` (report as spam, out of the inbox), `not_spam` (back to the inbox) or `inbox` (from the archive). Give `messageIds` or `threadIds`; prefer threadIds for conversations." +
+        ON_REQUEST_ONLY,
+      inputSchema: strictArgs({
+        account: accountArg,
+        ...targetArgs,
+        destination: z.enum(["trash", "out_of_trash", "spam", "not_spam", "inbox"]),
+      }),
+      annotations: destructive,
+    },
+    async (args) =>
+      run(async () => {
+        const { kind, ids } = targetsOf(args);
+        const mb = await router.one(args.account);
+        return changeResult(mb.email, await mb.moveTo(kind, ids, args.destination));
       }),
   );
 
@@ -1579,53 +1598,6 @@ export function createServer(deps: ServerDeps): McpServer {
         const mb = await router.one(args.account);
         return { account: mb.email, ...(await withSettingsScope(mb, () => mb.deleteFilter(args.filterId))) };
       }),
-  );
-
-  // ---------- trash & spam ----------
-
-  const simpleTool = (
-    name: string,
-    kind: "messages" | "threads",
-    description: string,
-    annotations: typeof write | typeof destructive,
-    action: (mb: Mailbox, id: string) => Promise<unknown>,
-  ) => {
-    const idKey = kind === "messages" ? "messageId" : "threadId";
-    server.registerTool(
-      name,
-      {
-        description,
-        inputSchema: strictArgs({
-          account: accountArg,
-          [idKey]: z.string(),
-        } as z.ZodRawShape),
-        annotations,
-      },
-      async (args: Record<string, any>) =>
-        run(async () => {
-          const mb = await router.one(args.account);
-          return { account: mb.email, ...((await action(mb, args[idKey])) as object) };
-        }),
-    );
-  };
-
-  simpleTool("trash_message", "messages", "Moves one message to Trash (prefer trash_thread for a conversation)." + ON_REQUEST_ONLY, destructive, (mb, id) =>
-    mb.trash("messages", id),
-  );
-  simpleTool("trash_thread", "threads", "Moves an entire thread to Trash." + ON_REQUEST_ONLY, destructive, (mb, id) => mb.trash("threads", id));
-  simpleTool("untrash_message", "messages", "Restores one message from Trash.", write, (mb, id) => mb.trash("messages", id, true));
-  simpleTool("untrash_thread", "threads", "Restores an entire thread from Trash.", write, (mb, id) => mb.trash("threads", id, true));
-  simpleTool("mark_message_spam", "messages", "Marks one message as spam (moves it out of the inbox)." + ON_REQUEST_ONLY, destructive, (mb, id) =>
-    mb.modifyIds("messages", id, ["SPAM"], ["INBOX"]),
-  );
-  simpleTool("mark_thread_spam", "threads", "Marks an entire thread as spam." + ON_REQUEST_ONLY, destructive, (mb, id) =>
-    mb.modifyIds("threads", id, ["SPAM"], ["INBOX"]),
-  );
-  simpleTool("unmark_message_spam", "messages", "Moves one message out of Spam back to the inbox.", write, (mb, id) =>
-    mb.modifyIds("messages", id, ["INBOX"], ["SPAM"]),
-  );
-  simpleTool("unmark_thread_spam", "threads", "Moves an entire thread out of Spam back to the inbox.", write, (mb, id) =>
-    mb.modifyIds("threads", id, ["INBOX"], ["SPAM"]),
   );
 
   return server;
