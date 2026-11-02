@@ -538,9 +538,26 @@ test("form fields between lines, over several lines, and on turned pages", async
   // A field whose rect lies between two lines (crossing neither baseline) is a line of its own between them.
   {
     const b = new PdfBuilder();
-    const field = b.widget([150, 676, 400, 696], "BT /Helv 10 Tf 2 5 Td (In between) Tj ET");
-    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (The line above) Tj 0 -28 Td (The line below) Tj ET"))} /Annots [${refs(field)}] >>`);
+    const field = b.widget([150, 674, 400, 690], "BT /Helv 10 Tf 2 5 Td (In between) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (The line above) Tj 0 -40 Td (The line below) Tj ET"))} /Annots [${refs(field)}] >>`);
     assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "The line above\nIn between\nThe line below");
+  }
+  // Boxes that sit on the label's line (their rect starts just above its baseline, as LibreOffice draws them): the values
+  // are 6.5 points above the labels' baselines, which still lie within the font size of the rects.
+  {
+    const b = new PdfBuilder();
+    const name = b.widget([110, 702.5, 300, 716.3], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET");
+    const date = b.widget([110, 682.5, 300, 696.3], "BT /Helv 10 Tf 2 4 Td (2024-01-05) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (Name:) Tj 0 -20 Td (Date:) Tj ET"))} /Annots [${refs(name, date)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Name: Sebastian\nDate: 2024-01-05");
+  }
+  // A multi-line text field: its first line joins the label's, the others follow that line, before the next label, wherever
+  // they are; here a tall box whose label sits on its bottom line.
+  {
+    const b = new PdfBuilder();
+    const field = b.widget([140, 602.5, 400, 660], "BT /Helv 10 Tf 12 TL 2 47 Td (First line of the comment) Tj T* (the second line) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 680 Td (Notes) Tj 0 -80 Td (Comments:) Tj 0 -30 Td (Signature:) Tj ET"))} /Annots [${refs(field)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Notes\n\nComments: First line of the comment\nthe second line\n\nSignature:");
   }
   // A multi-line text field: its first line joins the label's, the others follow, before the next label.
   {

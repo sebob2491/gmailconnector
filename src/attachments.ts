@@ -2606,11 +2606,15 @@ const EXACT = 1;
 const MOVED = 2;
 const BREAK = 4;
 
-/** A line of positioned runs: its baseline (across the text direction), largest font size, and runs (indexes). */
+/**
+ * A line of positioned runs: its baseline (across the text direction), largest font size, and runs
+ * (indexes); and the further lines of the multi-line fields whose first line joined it.
+ */
 interface PositionedLine {
   across: number;
   size: number;
   runs: number[];
+  attached?: number[][];
 }
 
 /** The axis a direction runs along: 0 right, 1 up, 2 left, 3 down; -1 for anything else (skewed text). */
@@ -2819,6 +2823,17 @@ class PdfTextWriter {
     return separator;
   }
 
+  /** Writes the recorded pieces `runs` as a line at `across`, left to right. */
+  private emitLine(runs: number[], across: number, texts: string[], along: Float64Array, lastAlong: Float64Array, alongEnd: Float64Array, sizes: Float64Array, fx: number, fy: number) {
+    sortRuns(runs, along, false);
+    for (let k = 0; k < runs.length; k++) {
+      const i = runs[k];
+      const flags = this.runData[i * RUN_FIELDS + 7];
+      this.breakLine = k === 0 || (flags & BREAK) !== 0;
+      this.emit(texts[i], along[i], lastAlong[i], alongEnd[i], across, fx, fy, sizes[i], (flags & EXACT) !== 0, (flags & MOVED) !== 0);
+    }
+  }
+
   /** Starts a new line (between separately read content, e.g. annotations after the page). */
   newline() {
     if (this.length && this.lastChar !== "\n") this.add("\n");
@@ -2837,12 +2852,14 @@ class PdfTextWriter {
 
   /**
    * Writes the recorded pieces again, placed by position: the page's own pieces grouped into lines by
-   * baseline (top first), each annotation's lines joining the page's line at their height (within
-   * 0.4 of the font size; a one-line field also joins the only line whose baseline crosses its
-   * rect) or else making lines of their own, and every line's runs left to right; then the usual
-   * spacing rules apply. The reading direction is the axis most text runs along, so pages turned
-   * with /Rotate (whose text runs up or down the page) read the same way; runs in other directions
-   * follow in drawing order (a limitation: a field drawn upright on such a page comes after its text).
+   * baseline (top first), and every line's pieces left to right; then the usual spacing rules apply.
+   * An annotation's first line joins the page's line at its height (within 0.4 of the font size), or
+   * else the only page line whose baseline crosses its rect or lies just below it (where a label sits
+   * on the line a box is drawn on); its further lines (a multi-line field) follow that line. An
+   * annotation that joins no line keeps its lines at their own heights. The reading direction is the
+   * axis most text runs along, so pages turned with /Rotate (whose text runs up or down the page)
+   * read the same way; runs in other directions follow in drawing order (a limitation: a field
+   * drawn upright on such a page comes after its text).
    * Sorting makes this O(n log n) in the number of pieces (at most MAX_POSITIONED_RUNS).
    */
   private positioned() {
@@ -2883,37 +2900,39 @@ class PdfTextWriter {
     const lines = groupLines(own, across, sizes);
     // Annotation runs come one annotation after another: each annotation's lines are matched in turn.
     const unmatched: number[] = [];
-    const joins: [PositionedLine, number[]][] = [];
+    const joins: [PositionedLine, PositionedLine[]][] = [];
     for (let start = 0; start < fields.length; ) {
       const annotation = data[fields[start] * RUN_FIELDS + 8];
       let end = start + 1;
       while (end < fields.length && data[fields[end] * RUN_FIELDS + 8] === annotation) end++;
       const fieldLines = groupLines(fields.slice(start, end), across, sizes);
       start = end;
-      // The rect's extent across the reading direction.
-      const r = annotation * 4;
-      const a1 = this.rects[r + 1] * fx - this.rects[r] * fy;
-      const a2 = this.rects[r + 3] * fx - this.rects[r + 2] * fy;
-      for (const fieldLine of fieldLines) {
-        // The nearest of the page's lines: the first at or below this one, or the one above it.
-        const below = lineAtOrBelow(lines, fieldLine.across);
-        let target: PositionedLine | undefined;
-        for (const k of [below - 1, below]) {
-          const line = lines[k];
-          if (!line || Math.abs(line.across - fieldLine.across) > 0.4 * Math.max(line.size, fieldLine.size)) continue;
-          if (!target || Math.abs(line.across - fieldLine.across) < Math.abs(target.across - fieldLine.across)) target = line;
-        }
-        if (!target && fieldLines.length === 1) {
-          const first = lineAtOrBelow(lines, Math.max(a1, a2));
-          if (first < lines.length && lines[first].across >= Math.min(a1, a2) && !(lines[first + 1]?.across >= Math.min(a1, a2))) target = lines[first];
-        }
-        if (target) joins.push([target, fieldLine.runs]);
-        else unmatched.push(...fieldLine.runs);
+      const first = fieldLines[0];
+      // The nearest of the page's lines to the field's first line, within the tolerance: the first at or below it, or the one above.
+      const below = lineAtOrBelow(lines, first.across);
+      let target: PositionedLine | undefined;
+      for (const k of [below - 1, below]) {
+        const line = lines[k];
+        if (!line || Math.abs(line.across - first.across) > 0.4 * Math.max(line.size, first.size)) continue;
+        if (!target || Math.abs(line.across - first.across) < Math.abs(target.across - first.across)) target = line;
       }
+      if (!target) {
+        // Else the only page line whose baseline crosses the rect, or lies a little below it (a label on the line a box sits on).
+        const r = annotation * 4;
+        const a1 = this.rects[r + 1] * fx - this.rects[r] * fy;
+        const a2 = this.rects[r + 3] * fx - this.rects[r + 2] * fy;
+        const low = Math.min(a1, a2) - 0.6 * first.size;
+        const k = lineAtOrBelow(lines, Math.max(a1, a2));
+        if (k < lines.length && lines[k].across >= low && !(lines[k + 1]?.across >= low)) target = lines[k];
+      }
+      if (target) joins.push([target, fieldLines]);
+      else for (const line of fieldLines) unmatched.push(...line.runs);
     }
-    for (const [line, runs] of joins) {
-      for (const i of runs) across[i] = line.across;
-      line.runs.push(...runs);
+    // A field's first line joins its line; its other lines follow that line, side by side with those of other fields there.
+    for (const [line, fieldLines] of joins) {
+      for (const i of fieldLines[0].runs) across[i] = line.across;
+      line.runs.push(...fieldLines[0].runs);
+      for (let j = 1; j < fieldLines.length; j++) ((line.attached ??= [])[j - 1] ??= []).push(...fieldLines[j].runs);
     }
     const all = lines.concat(groupLines(unmatched, across, sizes)).sort((a, b) => b.across - a.across);
     this.parts = [];
@@ -2921,14 +2940,9 @@ class PdfTextWriter {
     this.hasLast = false;
     this.spacing = undefined;
     for (const line of all) {
-      const runs = line.runs;
-      sortRuns(runs, along, false);
-      for (let k = 0; k < runs.length; k++) {
-        const i = runs[k];
-        const flags = data[i * RUN_FIELDS + 7];
-        this.breakLine = k === 0 || (flags & BREAK) !== 0;
-        this.emit(texts[i], along[i], lastAlong[i], alongEnd[i], line.across, fx, fy, sizes[i], (flags & EXACT) !== 0, (flags & MOVED) !== 0);
-      }
+      this.emitLine(line.runs, line.across, texts, along, lastAlong, alongEnd, sizes, fx, fy);
+      // Attached lines are written just below their line (for the spacing rules: half a line apart each).
+      line.attached?.forEach((runs, j) => this.emitLine(runs, line.across - (j + 1) * 0.5 * line.size, texts, along, lastAlong, alongEnd, sizes, fx, fy));
     }
     for (const i of others) {
       const o = i * RUN_FIELDS;
