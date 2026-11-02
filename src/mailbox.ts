@@ -6,15 +6,21 @@ import {
   METADATA_HEADERS,
   apiFormat,
   bareAddress,
+  bodyNotes,
   bodyText,
+  compactMessage,
   extractContent,
   formatMessage,
   formatThread,
   header,
+  isoTime,
+  labelFlags,
   limitLength,
   parseMailboxes,
+  preview,
   recipientsFrom,
   stripInvisible,
+  userLabelIds,
   viewUrl,
   type ApiMessage,
   type ApiMessagePart,
@@ -109,6 +115,69 @@ export interface LabelInput {
   colorPreset?: string;
   labelListVisibility?: string;
   messageListVisibility?: string;
+}
+
+// ---------- filters ----------
+
+/** What a filter matches (users.settings.filters criteria). */
+export interface FilterCriteria {
+  from?: string;
+  to?: string;
+  subject?: string;
+  query?: string;
+  negatedQuery?: string;
+  hasAttachment?: boolean;
+  excludeChats?: boolean;
+  /** Bytes, compared as sizeComparison says. */
+  size?: number;
+  sizeComparison?: "larger" | "smaller";
+}
+
+/** A filter's actions as the tools take and show them; each stands for a label change Gmail makes. */
+export interface FilterActions {
+  /** User labels to add, by name or ID; they must exist. */
+  addLabels?: string[];
+  archive?: boolean;
+  markRead?: boolean;
+  star?: boolean;
+  markImportant?: boolean;
+  neverImportant?: boolean;
+  trash?: boolean;
+  neverSpam?: boolean;
+  category?: "primary" | "social" | "promotions" | "updates" | "forums";
+}
+
+interface ApiFilter {
+  id: string;
+  criteria?: FilterCriteria & { sizeComparison?: string };
+  action?: { addLabelIds?: string[]; removeLabelIds?: string[]; forward?: string };
+}
+
+/** The label change behind each yes/no action, as Gmail's filter settings make it. */
+const FILTER_FLAGS: { action: keyof FilterActions; add?: string; remove?: string }[] = [
+  { action: "archive", remove: "INBOX" },
+  { action: "markRead", remove: "UNREAD" },
+  { action: "star", add: "STARRED" },
+  { action: "markImportant", add: "IMPORTANT" },
+  { action: "neverImportant", remove: "IMPORTANT" },
+  { action: "trash", add: "TRASH" },
+  { action: "neverSpam", remove: "SPAM" },
+];
+
+/** At most this many existing emails are counted when previewing a filter. */
+export const FILTER_PREVIEW_MAX = 500;
+
+/** A Gmail search for what a filter matches, as Gmail's own "search" button for a filter builds it. */
+export function filterQuery(c: FilterCriteria): string {
+  const terms: string[] = [];
+  if (c.from?.trim()) terms.push(`from:(${c.from.trim()})`);
+  if (c.to?.trim()) terms.push(`to:(${c.to.trim()})`);
+  if (c.subject?.trim()) terms.push(`subject:(${c.subject.trim()})`);
+  if (c.query?.trim()) terms.push(`(${c.query.trim()})`);
+  if (c.negatedQuery?.trim()) terms.push(`-{${c.negatedQuery.trim()}}`);
+  if (c.hasAttachment) terms.push("has:attachment");
+  if (c.size && c.sizeComparison) terms.push(`${c.sizeComparison}:${c.size}`);
+  return terms.join(" ");
 }
 
 interface ApiLabel {
@@ -217,7 +286,16 @@ function replySubject(subject: string | undefined): string {
   return /^re:/i.test(s) ? s : `Re: ${s}`.trim();
 }
 
-const THREAD_PREVIEW_MESSAGES = 5;
+/** How many of a thread's most recent emails a search result lists. */
+const THREAD_PREVIEW_MESSAGES = 3;
+/** get_thread shortens the oldest bodies first once its bodies add up to more than this many characters. */
+export const DEFAULT_THREAD_BUDGET = 60_000;
+/** A body shortened to fit get_thread's budget keeps this many characters. */
+const BUDGET_PREVIEW_CHARS = 200;
+
+/** Links to a thread or message (`{id}`) and to a draft (`{messageId}`) in Gmail, for `{account}`. */
+export const VIEW_URL_TEMPLATE = "https://mail.google.com/mail/?authuser={account}#all/{id}";
+export const DRAFT_URL_TEMPLATE = "https://mail.google.com/mail/?authuser={account}#drafts?compose={messageId}";
 /** How many matching emails a bulk dry run lists. */
 const BULK_PREVIEW = 10;
 /** Draft bodies in list_drafts are previews; get_draft has the full text. */
@@ -717,6 +795,15 @@ const SEND_AS_TTL_MS = 60 * 60 * 1000;
  */
 export const sendAsCache = new Map<string, { entries: SendAsEntry[]; expiresAt: number }>();
 
+const LABEL_NAMES_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Each account's user label names by ID, kept for 10 minutes per isolate, so results can show label
+ * names instead of IDs without reading the label list on every call. Keyed like sendAsCache; a label
+ * change through this connector clears the account's entry. Exported for tests.
+ */
+export const labelNameCache = new Map<string, { names: Map<string, string>; expiresAt: number }>();
+
 /** A short one-way fingerprint of a secret (two FNV-1a style rounds), for use in a cache key. */
 function fingerprint(secret: string): string {
   let h1 = 0x811c9dc5;
@@ -733,6 +820,8 @@ function fingerprint(secret: string): string {
 export class Mailbox {
   /** A send-as lookup in progress, so one tool call never asks twice. */
   private sendAsLookup?: Promise<SendAsEntry[]>;
+  /** A label list read in progress (for label names), likewise. */
+  private labelNamesLookup?: Promise<Map<string, string>>;
 
   constructor(
     readonly client: GmailClient,
@@ -805,15 +894,51 @@ export class Mailbox {
     return own || (entries.find((e) => e.isDefault)?.signature?.trim() ?? "");
   }
 
-  /** Adds `fromMe: true` (right after `sender`) to an email the user sent from any of their addresses. */
-  private markFromMe<T extends { sender?: string }>(msg: T): T & { fromMe?: true } {
-    if (!msg.sender || !this.isMine(bareAddress(msg.sender))) return msg;
+  /** Adds `fromMe: true` (right after `from`) to an email the user sent from any of their addresses. */
+  private markFromMe(msg: Record<string, unknown>): Record<string, unknown> {
+    if (typeof msg.from !== "string" || !this.isMine(bareAddress(msg.from))) return msg;
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(msg)) {
       out[key] = value;
-      if (key === "sender") out.fromMe = true;
+      if (key === "from") out.fromMe = true;
     }
-    return out as T & { fromMe: true };
+    return out;
+  }
+
+  // ---------- label names ----------
+
+  private get labelCacheKey(): string {
+    return this.sendAsKey;
+  }
+
+  /** Forgets this account's label names (after a label is created, renamed or deleted). */
+  private forgetLabelNames(): void {
+    labelNameCache.delete(this.labelCacheKey);
+  }
+
+  private rememberLabels(labels: ApiLabel[]): Map<string, string> {
+    const names = new Map(labels.filter((l) => l.type !== "system").map((l) => [l.id, l.name]));
+    labelNameCache.set(this.labelCacheKey, { names, expiresAt: Date.now() + LABEL_NAMES_TTL_MS });
+    return names;
+  }
+
+  /**
+   * Names for the user labels among `labelLists` (system labels need none): from the cache when it
+   * has them all, otherwise from one read of the label list per call. If that fails, the IDs are shown.
+   */
+  async labelNames(labelLists: readonly (readonly string[] | undefined)[]): Promise<ReadonlyMap<string, string>> {
+    const wanted = new Set(labelLists.flatMap((l) => userLabelIds(l)));
+    if (!wanted.size) return new Map();
+    const hit = labelNameCache.get(this.labelCacheKey);
+    if (hit && hit.expiresAt > Date.now() && [...wanted].every((id) => hit.names.has(id))) return hit.names;
+    this.labelNamesLookup ??= this.client
+      .request("GET", "labels")
+      .then((res) => this.rememberLabels((res?.labels ?? []) as ApiLabel[]))
+      .catch(() => hit?.names ?? new Map<string, string>())
+      .finally(() => {
+        this.labelNamesLookup = undefined;
+      });
+    return this.labelNamesLookup;
   }
 
   private loader(messageId: string) {
@@ -827,16 +952,23 @@ export class Mailbox {
   }
 
   /**
-   * Trims a message for search results: no per-message threadId or link (the thread has them), and
-   * no recipient list when the email went only to this account.
+   * Trims a message for search results: compact (see compactMessage), with a preview-length snippet,
+   * no threadId (the thread has it), and no recipient list when the email went only to this account.
+   * `flags` are the message's own flags to show (a thread's other flags are given for the thread).
    */
-  private searchSummary(m: FormattedMessage) {
-    const { threadId: _t, viewUrl: _v, ...rest } = m;
+  private searchSummary(m: FormattedMessage, flags: "all" | "own", names: ReadonlyMap<string, string>) {
     const self = this.email.toLowerCase();
-    if (rest.toRecipients?.length === 1 && bareAddress(rest.toRecipients[0]) === self && !rest.ccRecipients) {
-      delete rest.toRecipients;
+    const toSelfOnly = m.toRecipients?.length === 1 && bareAddress(m.toRecipients[0]) === self && !m.ccRecipients?.length;
+    const out = compactMessage(
+      { ...m, threadId: m.id, snippet: m.snippet === undefined ? undefined : preview(m.snippet), ...(toSelfOnly ? { toRecipients: [] } : {}) },
+      { names, flags: flags === "all" },
+    );
+    if (flags === "own") {
+      const own = labelFlags([m.labelIds]);
+      const at = Object.keys(out).indexOf("snippet");
+      return this.markFromMe(insertAt(out, at < 0 ? Object.keys(out).length : at, { ...(own.unread ? { unread: true } : {}), ...(own.starred ? { starred: true } : {}) }));
     }
-    return rest;
+    return this.markFromMe(out);
   }
 
   // ---------- threads & messages ----------
@@ -871,29 +1003,34 @@ export class Mailbox {
       ids.map((id) => ({ path: `threads/${id}`, query: { format: "metadata", metadataHeaders: METADATA_HEADERS } })),
     );
     const { found, failed } = settle(ids, fetched);
-    const threads = await mapLimit(found, 8, async ({ id, value: thread }) => {
+    const shown = found.map(({ id, value: thread }) => {
       let messages = (thread.messages ?? []) as ApiMessage[];
       if (!includeDrafts) messages = messages.filter((m) => !m.labelIds?.includes("DRAFT"));
+      return { id, messages };
+    });
+    // User label names, read once for the page (and only when a user label appears).
+    const names = await this.labelNames(shown.flatMap((t) => t.messages.map((m) => m.labelIds)));
+    const threads = await mapLimit(shown, 8, async ({ id, messages }): Promise<Record<string, any>> => {
       const recent = messages.slice(-THREAD_PREVIEW_MESSAGES);
-      const summaries = (await Promise.all(recent.map((m) => this.format(m, format)))).map((m) => this.markFromMe(this.searchSummary(m)));
-      const link = viewUrl(this.email, `all/${id}`);
+      const formatted = await Promise.all(recent.map((m) => this.format(m, format)));
       // Most threads hold one email: show it flat instead of a thread wrapping a one-item list.
-      if (summaries.length === 1) {
-        const { id: messageId, ...message } = summaries[0];
-        return { id, ...(messageId !== id ? { messageId } : {}), totalMessages: 1, ...message, viewUrl: link };
+      if (formatted.length === 1) {
+        const { id: messageId, ...message } = this.searchSummary(formatted[0], "all", names);
+        return { id, ...(messageId !== id ? { messageId } : {}), ...message };
       }
       // Replies repeat the subject with "Re:"; list it once for the thread, as its first email had it
-      // (the preview only shows the latest emails).
+      // (the preview only shows the latest emails). The flags are the whole thread's.
       const subject =
         format === "METADATA_ONLY" || !messages.length ? undefined : stripInvisible(header(messages[0].payload, "Subject") ?? "").trim();
       const base = normalizeSubject(subject);
       return {
         id,
         ...(subject !== undefined ? { subject } : {}),
-        totalMessages: messages.length,
-        ...(messages.length > recent.length ? { omittedOlderMessages: messages.length - recent.length } : {}),
-        viewUrl: link,
-        messages: summaries.map(({ subject: s, ...m }) => (s !== undefined && normalizeSubject(s) !== base ? { subject: s, ...m } : m)),
+        total: messages.length,
+        ...labelFlags(messages.map((m) => m.labelIds), names),
+        messages: formatted
+          .map((m) => this.searchSummary(m, "own", names))
+          .map(({ subject: s, ...m }) => (s !== undefined && normalizeSubject(s as string) !== base ? { subject: s, ...m } : m)),
       };
     });
     return {
@@ -904,30 +1041,52 @@ export class Mailbox {
     };
   }
 
-  async getThread(threadId: string, format: MessageFormat, opts: FormatOptions = {}) {
+  /**
+   * A thread in the compact shape (see compactMessage): the subject once (and on a message only when
+   * it changes), the thread's flags once (each message shows only its own unread/starred), and notes
+   * on shortened bodies once. With bodies, messages don't repeat their snippet, and once the bodies add
+   * up to more than `maxTotalChars` (default DEFAULT_THREAD_BUDGET; 0 for no limit), the oldest are
+   * cut to their start, listed under `shortened`.
+   */
+  async getThread(threadId: string, format: MessageFormat, opts: FormatOptions & { maxTotalChars?: number } = {}) {
     if (format === "RAW") throw new MimeError("RAW format is not supported for threads; use get_message instead.");
     const thread = await this.client.request("GET", `threads/${checkId(threadId, "thread")}`, {
       query: { format: apiFormat(format), metadataHeaders: format === "MINIMAL" || format === "METADATA_ONLY" ? METADATA_HEADERS : undefined },
     });
     const messages = ((thread.messages ?? []) as ApiMessage[]).filter((m) => !m.labelIds?.includes("DRAFT"));
     // A reply's quoted copy of an earlier message is hidden (see formatThread): that message is in the result.
-    const formatted = (await formatThread(messages, format, this.email, (id) => this.loader(id), opts)).map((m) => this.markFromMe(m));
-    const base = {
-      id: thread.id as string,
-      viewUrl: viewUrl(this.email, `all/${thread.id}`),
-    };
-    if (format !== "PLAIN_TEXT" && format !== "FULL_CONTENT") return { ...base, messages: formatted };
-    // With bodies, each message's snippet only repeats its body, and its threadId is the thread's id.
-    // The subject is given once for the thread, and on a message only when it changes.
-    const subject = formatted[0]?.subject;
+    const formatted = await formatThread(messages, format, this.email, (id) => this.loader(id), opts);
+    const withBodies = format === "PLAIN_TEXT" || format === "FULL_CONTENT";
+    const shortened = withBodies ? fitBudget(formatted, opts.maxTotalChars ?? DEFAULT_THREAD_BUDGET) : [];
+    const names = await this.labelNames(messages.map((m) => m.labelIds));
+    const subject = formatted.find((m) => m.subject !== undefined)?.subject;
     const topic = normalizeSubject(subject);
     return {
-      id: base.id,
+      id: thread.id as string,
       ...(subject !== undefined ? { subject } : {}),
-      viewUrl: base.viewUrl,
-      messages: formatted.map(({ snippet: _s, threadId: _t, subject: s, ...m }) =>
-        s !== undefined && normalizeSubject(s) !== topic ? { subject: s, ...m } : m,
-      ),
+      ...(messages.length > 1 ? { total: messages.length } : {}),
+      ...labelFlags(messages.map((m) => m.labelIds), names),
+      messages: formatted.map((m) => {
+        const own = labelFlags([m.labelIds]);
+        const { subject: s, ...rest } = compactMessage(
+          { ...m, threadId: m.id, ...(withBodies ? { snippet: undefined } : {}), labelIds: [...(own.unread ? ["UNREAD"] : []), ...(own.starred ? ["STARRED"] : [])] },
+          { names },
+        );
+        // Only a message's own unread/starred remain: drop the "archived" its reduced labels imply.
+        delete rest.archived;
+        return this.markFromMe(s !== undefined && normalizeSubject(s as string) !== topic ? { subject: s, ...rest } : rest);
+      }),
+      ...bodyNotes(formatted),
+      ...(shortened.length
+        ? {
+            shortened: {
+              messageIds: shortened,
+              note:
+                `This thread is long, so the bodies of its oldest emails were cut to their first ${BUDGET_PREVIEW_CHARS} characters or left out. ` +
+                `get_message shows one in full; maxTotalChars: 0 returns every body.`,
+            },
+          }
+        : {}),
     };
   }
 
@@ -941,11 +1100,12 @@ export class Mailbox {
     const msg: ApiMessage = await this.client.request("GET", `messages/${checkId(messageId, "message")}`, {
       query: { format: apiFormat(format), metadataHeaders: apiFormat(format) === "metadata" ? METADATA_HEADERS : undefined },
     });
-    const formatted = this.markFromMe(await this.format(msg, format, opts));
-    if (format !== "PLAIN_TEXT" && format !== "FULL_CONTENT") return formatted;
+    const formatted = await this.format(msg, format, opts);
     // With the body there, the snippet only repeats its start.
-    const { snippet: _s, ...rest } = formatted;
-    return rest;
+    const withBody = format === "PLAIN_TEXT" || format === "FULL_CONTENT";
+    const names = format === "RAW" ? new Map<string, string>() : await this.labelNames([msg.labelIds]);
+    const compact = compactMessage({ ...formatted, ...(withBody ? { snippet: undefined } : {}) }, { names, keepLabelIds: format === "RAW" });
+    return { ...this.markFromMe(compact), ...bodyNotes([formatted]), viewUrl: formatted.viewUrl };
   }
 
   /**
@@ -1265,9 +1425,15 @@ export class Mailbox {
     };
   }
 
-  private async formatDraft(draft: { id: string; message: ApiMessage }, format: MessageFormat, opts: FormatOptions = {}) {
-    const { id: messageId, viewUrl: _v, ...rest } = await this.format(draft.message, format, opts);
-    return { id: draft.id, messageId, ...rest, viewUrl: this.draftUrl(messageId) };
+  /**
+   * A draft in the compact shape (see compactMessage), without flags (a draft's labels say nothing
+   * new) and without `from` when it is the account's own address. Notes on a shortened body follow.
+   */
+  private async formatDraft(draft: { id: string; message: ApiMessage }, format: MessageFormat, opts: FormatOptions = {}): Promise<Record<string, unknown>> {
+    const formatted = await this.format(draft.message, format, opts);
+    const { id: messageId, ...rest } = compactMessage(formatted, { flags: false, keepLabelIds: format === "RAW" });
+    if (typeof rest.from === "string" && sameMailbox(bareAddress(rest.from), this.email)) delete rest.from;
+    return { id: draft.id, messageId, ...rest, ...bodyNotes([formatted]) };
   }
 
   async listDrafts(opts: { query?: string; pageSize?: number; pageToken?: string; view?: DraftView }) {
@@ -1283,14 +1449,16 @@ export class Mailbox {
     const { found, failed } = settle(ids.map((d) => d.id), fetched);
     const drafts = await mapLimit(found, 8, async ({ value: draft }) => {
       // A list shows a preview of each draft; get_draft returns the whole thing.
-      const formatted = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY", { maxBodyChars: LIST_BODY_CHARS });
-      if (full) {
-        const { htmlBody: _h, snippet: _s, attachments, labelIds: _l, ...rest } = formatted as FormattedMessage;
-        const files = (attachments ?? []).map(({ filename, mimeType, size, partId }) => ({ filename, mimeType, size, ...(partId !== undefined ? { partId } : {}) }));
-        return { ...rest, ...(files.length ? { attachments: files } : {}) };
-      }
-      const { labelIds: _l, ...rest } = formatted as FormattedMessage;
-      return rest;
+      const { htmlBody: _h, snippet: _s, attachments, ...rest } = await this.formatDraft(draft, full ? "PLAIN_TEXT" : "METADATA_ONLY", {
+        maxBodyChars: LIST_BODY_CHARS,
+      });
+      const files = ((attachments ?? []) as AttachmentInfo[]).map(({ filename, mimeType, size, partId }) => ({
+        filename,
+        mimeType,
+        size,
+        ...(partId !== undefined ? { partId } : {}),
+      }));
+      return { ...rest, ...(files.length ? { attachments: files } : {}) };
     });
     return {
       drafts,
@@ -1313,7 +1481,7 @@ export class Mailbox {
     const id = checkId(draftId, "draft");
     // drafts.get has no metadataHeaders parameter; metadata format returns every header.
     const draft = await this.client.request("GET", `drafts/${id}`, { query: { format: apiFormat(format) } }).catch((err) => this.draftGone(id, err));
-    return this.formatDraft(draft, format, opts);
+    return { ...(await this.formatDraft(draft, format, opts)), viewUrl: this.draftUrl(draft.message.id) };
   }
 
   async createDraft(input: ComposeInput & { replyToMessageId?: string }) {
@@ -1392,6 +1560,7 @@ export class Mailbox {
 
   async listLabels() {
     const res = await this.client.request("GET", "labels");
+    this.rememberLabels((res.labels ?? []) as ApiLabel[]);
     const labels = ((res.labels ?? []) as ApiLabel[])
       .map((l) => ({
         id: l.id,
@@ -1419,6 +1588,7 @@ export class Mailbox {
   }
 
   async createLabel(input: LabelInput & { displayName: string; autoCreateParentLabels?: boolean }) {
+    this.forgetLabelNames();
     let name = input.displayName.split("/").map((s) => s.trim()).filter(Boolean).join("/");
     if (!name) throw new MimeError("displayName must not be empty.");
     const created: string[] = [];
@@ -1456,12 +1626,14 @@ export class Mailbox {
 
   async updateLabel(labelRef: string, input: LabelInput) {
     const [label] = await this.resolveLabels([labelRef]);
+    this.forgetLabelNames();
     return this.client.request("PATCH", `labels/${this.userLabel(label).id}`, { json: this.labelBody(input) });
   }
 
   async deleteLabel(labelRef: string) {
     const [label] = await this.resolveLabels([labelRef]);
     await this.client.request("DELETE", `labels/${this.userLabel(label).id}`);
+    this.forgetLabelNames();
     return { deleted: label.id };
   }
 
@@ -1504,6 +1676,135 @@ export class Mailbox {
     const what = kind === "messages" ? "message" : "thread";
     const res = await this.client.request("POST", `${kind}/${checkId(id, what)}/modify`, { json: { addLabelIds, removeLabelIds } });
     return this.modifyResult(kind, res);
+  }
+
+  // ---------- filters ----------
+
+  /** A filter as results show it: criteria as Gmail has them, actions as named actions (see FilterActions). */
+  private describeFilter(f: ApiFilter, names: ReadonlyMap<string, string>) {
+    const criteria = Object.fromEntries(Object.entries(f.criteria ?? {}).filter(([, v]) => v !== undefined && v !== "" && v !== false));
+    let add = [...(f.action?.addLabelIds ?? [])];
+    let remove = [...(f.action?.removeLabelIds ?? [])];
+    const actions: Record<string, unknown> = {};
+    for (const { action, add: a, remove: r } of FILTER_FLAGS) {
+      if (a && add.includes(a)) {
+        actions[action] = true;
+        add = add.filter((id) => id !== a);
+      }
+      if (r && remove.includes(r)) {
+        actions[action] = true;
+        remove = remove.filter((id) => id !== r);
+      }
+    }
+    const category = add.find((id) => id.startsWith("CATEGORY_"));
+    if (category) {
+      actions.category = category === "CATEGORY_PERSONAL" ? "primary" : category.slice("CATEGORY_".length).toLowerCase();
+      add = add.filter((id) => id !== category);
+    }
+    if (add.length) actions.addLabels = add.map((id) => names.get(id) ?? id);
+    if (remove.length) actions.removeLabels = remove.map((id) => names.get(id) ?? id);
+    if (f.action?.forward) actions.forward = f.action.forward;
+    return { id: f.id, criteria, actions };
+  }
+
+  /** The account's filters (users.settings.filters.list, which gmail.modify allows), with label names. */
+  async listFilters() {
+    const res = await this.client.request("GET", "settings/filters");
+    const filters = (res?.filter ?? []) as ApiFilter[];
+    const names = await this.labelNames(filters.map((f) => [...(f.action?.addLabelIds ?? []), ...(f.action?.removeLabelIds ?? [])]));
+    return { filters: filters.map((f) => this.describeFilter(f, names)) };
+  }
+
+  /**
+   * Creates a filter, or with `preview` only counts the existing emails it matches (up to
+   * FILTER_PREVIEW_MAX, with the newest few as examples). Labels to add must exist already.
+   */
+  async createFilter(criteria: FilterCriteria, actions: FilterActions, opts: { preview?: boolean } = {}) {
+    const clean = Object.fromEntries(
+      Object.entries(criteria).map(([k, v]) => [k, typeof v === "string" ? v.trim() : v]).filter(([, v]) => v !== undefined && v !== "" && v !== false),
+    ) as FilterCriteria;
+    const { sizeComparison: _c, excludeChats: _e, ...matching } = clean;
+    if (!Object.keys(matching).length) {
+      throw new MimeError("Give at least one criterion: from, to, subject, query, negatedQuery, hasAttachment or size.");
+    }
+    if ((clean.size === undefined) !== (clean.sizeComparison === undefined)) {
+      throw new MimeError("size and sizeComparison go together: e.g. size 10485760 with sizeComparison \"larger\" for emails over 10 MB.");
+    }
+    if (actions.markImportant && actions.neverImportant) throw new MimeError("markImportant and neverImportant can't both be set.");
+    const addLabelIds: string[] = [];
+    const removeLabelIds: string[] = [];
+    for (const { action, add, remove } of FILTER_FLAGS) {
+      if (!actions[action]) continue;
+      if (add) addLabelIds.push(add);
+      if (remove) removeLabelIds.push(remove);
+    }
+    if (actions.category) addLabelIds.push(actions.category === "primary" ? "CATEGORY_PERSONAL" : `CATEGORY_${actions.category.toUpperCase()}`);
+    if (actions.addLabels?.length) {
+      const labels = ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
+      this.rememberLabels(labels);
+      const missing: string[] = [];
+      for (const ref of actions.addLabels) {
+        const label = labels.find((l) => l.id === ref) ?? labels.find((l) => l.name.toLowerCase() === ref.trim().toLowerCase());
+        if (label) addLabelIds.push(label.id);
+        else missing.push(ref);
+      }
+      if (missing.length) {
+        const own = labels.filter((l) => l.type !== "system").map((l) => l.name).sort((a, b) => a.localeCompare(b));
+        throw new MimeError(
+          `${missing.map((m) => `"${m}"`).join(", ")} ${missing.length === 1 ? "isn't a label" : "aren't labels"} in ${this.email}. ` +
+            `Its labels: ${own.length ? own.join(", ") : "none yet"}. A filter can only add a label that exists: create it with create_label first (after asking the user).`,
+        );
+      }
+    }
+    if (!addLabelIds.length && !removeLabelIds.length) {
+      throw new MimeError("Give at least one action: addLabels, archive, markRead, star, markImportant, neverImportant, trash, neverSpam or category.");
+    }
+    const body = { criteria: clean, action: { ...(addLabelIds.length ? { addLabelIds } : {}), ...(removeLabelIds.length ? { removeLabelIds } : {}) } };
+    const query = filterQuery(clean);
+    const names = await this.labelNames([addLabelIds]);
+    const filter = this.describeFilter({ id: "", ...body }, names);
+    if (opts.preview) {
+      const list = await this.client.request("GET", "messages", { query: { q: query, maxResults: FILTER_PREVIEW_MAX } });
+      const ids = ((list.messages ?? []) as { id: string }[]).map((m) => m.id);
+      const fetched = await this.client.batchGet<ApiMessage>(
+        ids.slice(0, 5).map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: ["From", "Subject"] } })),
+      );
+      const examples = fetched.flatMap((r) =>
+        r.ok
+          ? [{ from: header(r.value.payload, "From") ?? "", subject: stripInvisible(header(r.value.payload, "Subject") ?? "").trim(), ...(isoTime(r.value.internalDate) ? { date: isoTime(r.value.internalDate) } : {}) }]
+          : [],
+      );
+      return {
+        preview: true,
+        criteria: filter.criteria,
+        actions: filter.actions,
+        query,
+        existingMatches: list.nextPageToken ? `more than ${FILTER_PREVIEW_MAX}` : ids.length,
+        ...(examples.length ? { examples } : {}),
+        note: "Nothing was created. The filter will apply to new mail only; bulk_update or bulk_trash with `query` can apply the same change to the existing emails.",
+      };
+    }
+    const created = (await this.client.request("POST", "settings/filters", { json: body })) as ApiFilter;
+    return {
+      created: { ...filter, id: created.id },
+      query,
+      note: "The filter applies to new mail. Existing emails are unchanged: bulk_update or bulk_trash with `query` can change them.",
+    };
+  }
+
+  /** Deletes a filter, returning what it did. */
+  async deleteFilter(filterId: string) {
+    const id = checkId(filterId, "filter");
+    const gone = (err: unknown): never => {
+      if (err instanceof GmailApiError && err.status === 404) {
+        throw new MimeError(`Filter ${filterId} doesn't exist in ${this.email} (see list_filters; IDs belong to one account).`);
+      }
+      throw err;
+    };
+    const filter = (await this.client.request("GET", `settings/filters/${id}`).catch(gone)) as ApiFilter;
+    await this.client.request("DELETE", `settings/filters/${id}`).catch(gone);
+    const names = await this.labelNames([[...(filter.action?.addLabelIds ?? []), ...(filter.action?.removeLabelIds ?? [])]]);
+    return { deleted: this.describeFilter(filter, names) };
   }
 
   // ---------- attachments ----------
@@ -1783,4 +2084,35 @@ function findPart(msg: ApiMessage, partId: string | undefined) {
     stack.push(...(part.parts ?? []));
   }
   return undefined;
+}
+
+/** `obj` with `extra`'s entries inserted before its `index`-th key. */
+function insertAt(obj: Record<string, unknown>, index: number, extra: Record<string, unknown>): Record<string, unknown> {
+  const entries = Object.entries(obj);
+  return Object.fromEntries([...entries.slice(0, index), ...Object.entries(extra), ...entries.slice(index)]);
+}
+
+/**
+ * Keeps a thread's bodies within `budget` characters (0: no limit): the oldest bodies are cut to their
+ * first BUDGET_PREVIEW_CHARS characters (their HTML left out), and if that isn't enough, left out,
+ * until the rest fits; the latest email always keeps its body. Returns the IDs of the messages cut.
+ */
+function fitBudget(messages: FormattedMessage[], budget: number): string[] {
+  if (!budget) return [];
+  const size = (m: FormattedMessage) => (m.plaintextBody?.length ?? 0) + (m.htmlBody?.length ?? 0);
+  let total = messages.reduce((n, m) => n + size(m), 0);
+  const cut = new Set<string>();
+  for (const pass of ["preview", "drop"] as const) {
+    for (const m of messages.slice(0, -1)) {
+      if (total <= budget) break;
+      const before = size(m);
+      const text = m.plaintextBody ?? "";
+      if (pass === "preview" && text.length <= BUDGET_PREVIEW_CHARS && m.htmlBody === undefined) continue;
+      m.plaintextBody = pass === "preview" ? preview(text, BUDGET_PREVIEW_CHARS) : "";
+      delete m.htmlBody;
+      total -= before - size(m);
+      cut.add(m.id);
+    }
+  }
+  return messages.filter((m) => cut.has(m.id)).map((m) => m.id);
 }

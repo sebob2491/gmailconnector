@@ -517,7 +517,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.equal(toGoogle.status, 302, toGoogle.text);
     const google = new URL(toGoogle.location);
     assert.equal(google.searchParams.get("redirect_uri"), `${ORIGIN}/google/callback`);
-    assert.equal(google.searchParams.get("scope"), "https://www.googleapis.com/auth/gmail.modify");
+    assert.equal(google.searchParams.get("scope"), "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.settings.basic");
     assert.equal(google.searchParams.get("access_type"), "offline");
     assert.equal(google.searchParams.get("code_challenge_method"), "S256");
 
@@ -581,7 +581,7 @@ describe("hosted connector (Cloudflare Worker)", () => {
     });
     assert.equal(init.result.serverInfo.name, "gmail-multi");
     const tools = await mcp("tools/list");
-    assert.equal(tools.result.tools.length, 33);
+    assert.equal(tools.result.tools.length, 36);
 
     const accounts = await callTool("list_accounts");
     assert.deepEqual(accounts.json.accounts.map((a: any) => a.email), [PERSONAL, WORK]);
@@ -799,8 +799,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
   test("connecting again doesn't disconnect an earlier connection", async () => {
     const second = await connectAsOwner(firstClientId);
     assert.notEqual(second, accessToken);
-    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 33, "first connection still works");
-    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 33);
+    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 36, "first connection still works");
+    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 36);
   });
 
   test("searching five linked accounts stays under Cloudflare's 50-call limit", async () => {

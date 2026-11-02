@@ -17,10 +17,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 | Situation | Behaviour |
 |---|---|
-| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account. `search_threads` merges the results from all accounts into one list in true newest-first order, across accounts and across pages, and each thread says which account it's in; `list_drafts` and `list_labels` group results by account. The returned `nextPageToken` continues every account at once: a page holds the newest threads of all accounts together (so it can be shorter than pageSize × accounts), and the next page carries on from there with nothing skipped or repeated. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
+| `search_threads`, `list_drafts`, `list_labels`, `list_filters` with no `account` | Runs on **every** linked account. `search_threads` merges the results from all accounts into one list in true newest-first order, across accounts and across pages, and each thread says which account it's in; `list_drafts`, `list_labels` and `list_filters` group results by account. The returned `nextPageToken` continues every account at once: a page holds the newest threads of all accounts together (so it can be shorter than pageSize × accounts), and the next page carries on from there with nothing skipped or repeated. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
 | Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
-| IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
+| IDs (message, thread, draft, label, filter) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
 | `account` values | The account's email address, or a nickname you pick (`work`, `personal`, …): on the hosted connector's accounts page, or with `accounts alias` in the local version. |
 | Label arguments | Take label IDs **or** display names (e.g. `"Receipts"`), resolved per account. |
 
@@ -74,15 +74,42 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   accounts; and the plan notes when an unsubscribe address isn't on the sender's own domain. Up to 10
   senders per run (`maxSenders` up to 20); the emails you already have stay until you archive or trash
   them with the bulk tools.
+- New `list_filters`, `create_filter` and `delete_filter` tools: "file everything from my bank under
+  Finance and skip the inbox". A filter matches on sender, recipient, subject, a Gmail search (or one
+  that must not match), attachments or size, and can add existing labels, archive, mark read, star, mark
+  or never mark important, trash, never send to spam, or set the inbox category. `create_filter` with
+  `preview: true` counts the existing emails that match (up to 500, with examples) without creating
+  anything, and Claude is told to show you that and ask before creating or deleting a filter. Filters
+  only act on new mail, so the result gives the equivalent search for `bulk_update` or `bulk_trash` to
+  handle the emails you already have. There is no forwarding action (Gmail needs a verified forwarding
+  address, and an email could try to talk Claude into forwarding your mail); set that up in Gmail.
+  Filters need the `gmail.settings.basic` scope. **After updating, add the scope
+  `https://www.googleapis.com/auth/gmail.settings.basic` on your Google Cloud project's Data access page
+  and re-link your accounts** (on the accounts page when hosted, or with `accounts add` locally) to use
+  filters. Until an account is re-linked, everything else keeps working and the filter tools say how to
+  re-link it (listing filters works either way).
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
   HTML-only emails are converted the way a browser shows them, without what the sender hid (a
   newsletter's preview text, mobile-only copies of the content), and tables come out one row per line
   with tabs between cells, also when Outlook puts a paragraph in every cell.
-- `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`
-  and the subject its first email had. Results are compact: one-email threads are shown flat, previews
-  are cleaned of the invisible padding and HTML codes that marketing emails contain, and recipients are
-  listed only when an email wasn't addressed to just you. A 50-email search comes back about half the
-  size of the raw Gmail data. The search help Claude sees covers Gmail's full operator syntax.
+- Results are compact JSON, so more mail fits in Claude's context. Emails show `from`, `to`, `cc`, `date`
+  and `body`; addresses read `Ann Lee <ann@example.com>`. Instead of Gmail's label IDs, an email (or a
+  thread) has flags that appear only when true: `unread`, `starred`, `important`, `inInbox` or
+  `archived`, `sent`, `trash`, `spam`, `category` ("promotions", …) and `labels` with your own labels'
+  names (read from the label list once per call, only when one appears, and kept for 10 minutes).
+  `messageFormat: "RAW"` keeps Gmail's `labelIds`, and the label tools still return the label IDs they
+  changed. Lists give one `viewUrlTemplate` instead of a Gmail link per item; single items (an email, a
+  draft, sent mail) keep their own `viewUrl`. On sample data with two accounts, a 50-thread search of
+  both went from 129,000 to 77,000 characters and a list of 20 drafts from 6,100 to 2,700.
+- The tool list Claude loads at the start of every session is about a third smaller (about 34,900 instead
+  of 51,900 characters, the new filter tools included): rules shared by many tools (the `account` argument, recipient formats, plain-text
+  bodies, `messageFormat`) are stated once in the server instructions instead of in every tool, and the
+  arguments' descriptions are short. Label colors are plain names (`colorPreset: "blue"`).
+- `search_threads` shows each thread's **3 most recent** emails (not the oldest), the thread's `total`
+  and flags, and the subject its first email had. One-email threads are shown flat, previews are cleaned
+  of the invisible padding and HTML codes that marketing emails contain and cut to 140 characters, and
+  recipients are listed only when an email wasn't addressed to just you. The search help Claude sees
+  covers Gmail's full operator syntax.
 - `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
   so, and how much was left out when the body was read whole). Only the start of a long body is read
   and converted, so a 2 MB newsletter takes a few milliseconds. Pass `maxBodyChars: 0` for the full
@@ -97,8 +124,13 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   the result anyway. A real 13-email conversation went from about 41,000 to 4,700 characters. Only text
   that copies an earlier message of the thread is hidden: forwarded emails, quotes of emails from
   elsewhere and replies that answer between quoted lines are left alone, and `get_message` still shows
-  any one email in full. With bodies, the subject is given once for the thread (and on a message only when
-  it changes), and messages don't repeat their preview snippet or the thread ID.
+  any one email in full. The subject and flags are given once for the thread (a message has its own
+  subject only when it changes, and its own `unread`/`starred`), messages don't repeat their preview
+  snippet or the thread ID, and notes on shortened bodies or links come once, naming the messages.
+- `get_thread` keeps long threads within a budget: once the bodies add up to more than 60,000
+  characters (`maxTotalChars`), the oldest are cut to their first 200 characters (or left out) and listed
+  under `shortened`, so Claude can open any of them with `get_message`. The latest email always keeps its
+  body; `maxTotalChars: 0` returns everything.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
 - `forward` re-attaches the original message's attachments, up to Gmail's 25 MB limit (2 MB on the
@@ -149,7 +181,8 @@ beside it, with Copy buttons, and what you should see when it worked. In short:
 3. **Google Auth Platform → Branding:** app name and your email (the first time, **Get started**, with
    audience **External**); under **App domain**, the home page, privacy policy link and authorized
    domain from the setup page. The connector serves its own privacy policy at `/privacy`.
-4. **Data access:** add the scope `https://www.googleapis.com/auth/gmail.modify`.
+4. **Data access:** add the scopes `https://www.googleapis.com/auth/gmail.modify` and
+   `https://www.googleapis.com/auth/gmail.settings.basic` (the second one lets Claude create Gmail filters).
 5. **Audience:** **Publish app**, so the status reads **In production**. In *Testing*, Google signs
    every account out after 7 days, and anyone not listed as a test user sees "Access blocked".
 6. **Clients → Create client:** type **Web application**, with the setup page's redirect URI
@@ -354,7 +387,8 @@ Every Gmail account you link uses this one client.
 2. Go to **APIs & Services → Library**, search for **Gmail API**, and click **Enable**.
 3. Go to **APIs & Services → OAuth consent screen** (called **Google Auth Platform** in newer consoles):
    - User type **External**. Fill in an app name and your email.
-   - Under **Data access / Scopes**, add `https://www.googleapis.com/auth/gmail.modify`.
+   - Under **Data access / Scopes**, add `https://www.googleapis.com/auth/gmail.modify` and
+     `https://www.googleapis.com/auth/gmail.settings.basic` (for Gmail filters).
    - Under **Audience**, click **Publish app** so the status reads **In production**.
      If you leave it in **Testing**, Google expires your tokens every 7 days and you'd have to
      re-link each account weekly. (In Testing you'd also have to add every Gmail address under
@@ -441,8 +475,9 @@ hashes.
   your mail, so treat it like a password. Set `GMAIL_MCP_CONFIG_DIR` to use another folder.
 - `~/.config/gmail-multi-mcp/credentials.json` holds your OAuth client.
 
-The only scope requested is `gmail.modify`: read, compose, send, label and trash. It can't
-permanently delete mail or change account settings. Revoke access at any time with
+The scopes requested are `gmail.modify` (read, compose, send, label and trash) and
+`gmail.settings.basic` (filters; optional: an account linked without it works, except for creating
+and deleting filters). Neither can permanently delete mail. Revoke access at any time with
 `accounts remove`, or at <https://myaccount.google.com/permissions>.
 
 ## Development
