@@ -13,6 +13,7 @@ import {
   formatMessage,
   formatThread,
   header,
+  isoTime,
   labelFlags,
   limitLength,
   parseMailboxes,
@@ -114,6 +115,69 @@ export interface LabelInput {
   colorPreset?: string;
   labelListVisibility?: string;
   messageListVisibility?: string;
+}
+
+// ---------- filters ----------
+
+/** What a filter matches (users.settings.filters criteria). */
+export interface FilterCriteria {
+  from?: string;
+  to?: string;
+  subject?: string;
+  query?: string;
+  negatedQuery?: string;
+  hasAttachment?: boolean;
+  excludeChats?: boolean;
+  /** Bytes, compared as sizeComparison says. */
+  size?: number;
+  sizeComparison?: "larger" | "smaller";
+}
+
+/** A filter's actions as the tools take and show them; each stands for a label change Gmail makes. */
+export interface FilterActions {
+  /** User labels to add, by name or ID; they must exist. */
+  addLabels?: string[];
+  archive?: boolean;
+  markRead?: boolean;
+  star?: boolean;
+  markImportant?: boolean;
+  neverImportant?: boolean;
+  trash?: boolean;
+  neverSpam?: boolean;
+  category?: "primary" | "social" | "promotions" | "updates" | "forums";
+}
+
+interface ApiFilter {
+  id: string;
+  criteria?: FilterCriteria & { sizeComparison?: string };
+  action?: { addLabelIds?: string[]; removeLabelIds?: string[]; forward?: string };
+}
+
+/** The label change behind each yes/no action, as Gmail's filter settings make it. */
+const FILTER_FLAGS: { action: keyof FilterActions; add?: string; remove?: string }[] = [
+  { action: "archive", remove: "INBOX" },
+  { action: "markRead", remove: "UNREAD" },
+  { action: "star", add: "STARRED" },
+  { action: "markImportant", add: "IMPORTANT" },
+  { action: "neverImportant", remove: "IMPORTANT" },
+  { action: "trash", add: "TRASH" },
+  { action: "neverSpam", remove: "SPAM" },
+];
+
+/** At most this many existing emails are counted when previewing a filter. */
+export const FILTER_PREVIEW_MAX = 500;
+
+/** A Gmail search for what a filter matches, as Gmail's own "search" button for a filter builds it. */
+export function filterQuery(c: FilterCriteria): string {
+  const terms: string[] = [];
+  if (c.from?.trim()) terms.push(`from:(${c.from.trim()})`);
+  if (c.to?.trim()) terms.push(`to:(${c.to.trim()})`);
+  if (c.subject?.trim()) terms.push(`subject:(${c.subject.trim()})`);
+  if (c.query?.trim()) terms.push(`(${c.query.trim()})`);
+  if (c.negatedQuery?.trim()) terms.push(`-{${c.negatedQuery.trim()}}`);
+  if (c.hasAttachment) terms.push("has:attachment");
+  if (c.size && c.sizeComparison) terms.push(`${c.sizeComparison}:${c.size}`);
+  return terms.join(" ");
 }
 
 interface ApiLabel {
@@ -1612,6 +1676,135 @@ export class Mailbox {
     const what = kind === "messages" ? "message" : "thread";
     const res = await this.client.request("POST", `${kind}/${checkId(id, what)}/modify`, { json: { addLabelIds, removeLabelIds } });
     return this.modifyResult(kind, res);
+  }
+
+  // ---------- filters ----------
+
+  /** A filter as results show it: criteria as Gmail has them, actions as named actions (see FilterActions). */
+  private describeFilter(f: ApiFilter, names: ReadonlyMap<string, string>) {
+    const criteria = Object.fromEntries(Object.entries(f.criteria ?? {}).filter(([, v]) => v !== undefined && v !== "" && v !== false));
+    let add = [...(f.action?.addLabelIds ?? [])];
+    let remove = [...(f.action?.removeLabelIds ?? [])];
+    const actions: Record<string, unknown> = {};
+    for (const { action, add: a, remove: r } of FILTER_FLAGS) {
+      if (a && add.includes(a)) {
+        actions[action] = true;
+        add = add.filter((id) => id !== a);
+      }
+      if (r && remove.includes(r)) {
+        actions[action] = true;
+        remove = remove.filter((id) => id !== r);
+      }
+    }
+    const category = add.find((id) => id.startsWith("CATEGORY_"));
+    if (category) {
+      actions.category = category === "CATEGORY_PERSONAL" ? "primary" : category.slice("CATEGORY_".length).toLowerCase();
+      add = add.filter((id) => id !== category);
+    }
+    if (add.length) actions.addLabels = add.map((id) => names.get(id) ?? id);
+    if (remove.length) actions.removeLabels = remove.map((id) => names.get(id) ?? id);
+    if (f.action?.forward) actions.forward = f.action.forward;
+    return { id: f.id, criteria, actions };
+  }
+
+  /** The account's filters (users.settings.filters.list, which gmail.modify allows), with label names. */
+  async listFilters() {
+    const res = await this.client.request("GET", "settings/filters");
+    const filters = (res?.filter ?? []) as ApiFilter[];
+    const names = await this.labelNames(filters.map((f) => [...(f.action?.addLabelIds ?? []), ...(f.action?.removeLabelIds ?? [])]));
+    return { filters: filters.map((f) => this.describeFilter(f, names)) };
+  }
+
+  /**
+   * Creates a filter, or with `preview` only counts the existing emails it matches (up to
+   * FILTER_PREVIEW_MAX, with the newest few as examples). Labels to add must exist already.
+   */
+  async createFilter(criteria: FilterCriteria, actions: FilterActions, opts: { preview?: boolean } = {}) {
+    const clean = Object.fromEntries(
+      Object.entries(criteria).map(([k, v]) => [k, typeof v === "string" ? v.trim() : v]).filter(([, v]) => v !== undefined && v !== "" && v !== false),
+    ) as FilterCriteria;
+    const { sizeComparison: _c, excludeChats: _e, ...matching } = clean;
+    if (!Object.keys(matching).length) {
+      throw new MimeError("Give at least one criterion: from, to, subject, query, negatedQuery, hasAttachment or size.");
+    }
+    if ((clean.size === undefined) !== (clean.sizeComparison === undefined)) {
+      throw new MimeError("size and sizeComparison go together: e.g. size 10485760 with sizeComparison \"larger\" for emails over 10 MB.");
+    }
+    if (actions.markImportant && actions.neverImportant) throw new MimeError("markImportant and neverImportant can't both be set.");
+    const addLabelIds: string[] = [];
+    const removeLabelIds: string[] = [];
+    for (const { action, add, remove } of FILTER_FLAGS) {
+      if (!actions[action]) continue;
+      if (add) addLabelIds.push(add);
+      if (remove) removeLabelIds.push(remove);
+    }
+    if (actions.category) addLabelIds.push(actions.category === "primary" ? "CATEGORY_PERSONAL" : `CATEGORY_${actions.category.toUpperCase()}`);
+    if (actions.addLabels?.length) {
+      const labels = ((await this.client.request("GET", "labels")).labels ?? []) as ApiLabel[];
+      this.rememberLabels(labels);
+      const missing: string[] = [];
+      for (const ref of actions.addLabels) {
+        const label = labels.find((l) => l.id === ref) ?? labels.find((l) => l.name.toLowerCase() === ref.trim().toLowerCase());
+        if (label) addLabelIds.push(label.id);
+        else missing.push(ref);
+      }
+      if (missing.length) {
+        const own = labels.filter((l) => l.type !== "system").map((l) => l.name).sort((a, b) => a.localeCompare(b));
+        throw new MimeError(
+          `${missing.map((m) => `"${m}"`).join(", ")} ${missing.length === 1 ? "isn't a label" : "aren't labels"} in ${this.email}. ` +
+            `Its labels: ${own.length ? own.join(", ") : "none yet"}. A filter can only add a label that exists: create it with create_label first (after asking the user).`,
+        );
+      }
+    }
+    if (!addLabelIds.length && !removeLabelIds.length) {
+      throw new MimeError("Give at least one action: addLabels, archive, markRead, star, markImportant, neverImportant, trash, neverSpam or category.");
+    }
+    const body = { criteria: clean, action: { ...(addLabelIds.length ? { addLabelIds } : {}), ...(removeLabelIds.length ? { removeLabelIds } : {}) } };
+    const query = filterQuery(clean);
+    const names = await this.labelNames([addLabelIds]);
+    const filter = this.describeFilter({ id: "", ...body }, names);
+    if (opts.preview) {
+      const list = await this.client.request("GET", "messages", { query: { q: query, maxResults: FILTER_PREVIEW_MAX } });
+      const ids = ((list.messages ?? []) as { id: string }[]).map((m) => m.id);
+      const fetched = await this.client.batchGet<ApiMessage>(
+        ids.slice(0, 5).map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: ["From", "Subject"] } })),
+      );
+      const examples = fetched.flatMap((r) =>
+        r.ok
+          ? [{ from: header(r.value.payload, "From") ?? "", subject: stripInvisible(header(r.value.payload, "Subject") ?? "").trim(), ...(isoTime(r.value.internalDate) ? { date: isoTime(r.value.internalDate) } : {}) }]
+          : [],
+      );
+      return {
+        preview: true,
+        criteria: filter.criteria,
+        actions: filter.actions,
+        query,
+        existingMatches: list.nextPageToken ? `more than ${FILTER_PREVIEW_MAX}` : ids.length,
+        ...(examples.length ? { examples } : {}),
+        note: "Nothing was created. The filter will apply to new mail only; bulk_update or bulk_trash with `query` can apply the same change to the existing emails.",
+      };
+    }
+    const created = (await this.client.request("POST", "settings/filters", { json: body })) as ApiFilter;
+    return {
+      created: { ...filter, id: created.id },
+      query,
+      note: "The filter applies to new mail. Existing emails are unchanged: bulk_update or bulk_trash with `query` can change them.",
+    };
+  }
+
+  /** Deletes a filter, returning what it did. */
+  async deleteFilter(filterId: string) {
+    const id = checkId(filterId, "filter");
+    const gone = (err: unknown): never => {
+      if (err instanceof GmailApiError && err.status === 404) {
+        throw new MimeError(`Filter ${filterId} doesn't exist in ${this.email} (see list_filters; IDs belong to one account).`);
+      }
+      throw err;
+    };
+    const filter = (await this.client.request("GET", `settings/filters/${id}`).catch(gone)) as ApiFilter;
+    await this.client.request("DELETE", `settings/filters/${id}`).catch(gone);
+    const names = await this.labelNames([[...(filter.action?.addLabelIds ?? []), ...(filter.action?.removeLabelIds ?? [])]]);
+    return { deleted: this.describeFilter(filter, names) };
   }
 
   // ---------- attachments ----------

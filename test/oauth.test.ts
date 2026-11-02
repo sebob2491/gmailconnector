@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { runInteractiveAuth, GMAIL_SCOPES } from "../src/oauth.js";
+import { runInteractiveAuth, GMAIL_MODIFY_SCOPE, GMAIL_SCOPES, GMAIL_SETTINGS_SCOPE } from "../src/oauth.js";
 
 const client = { clientId: "cid.apps.googleusercontent.com", clientSecret: "shh" };
 
@@ -62,4 +62,15 @@ test("refuses tokens that don't include Gmail access", async () => {
   const rejected = assert.rejects(flow.result, /Gmail access was not granted/);
   await fetch(`${params.get("redirect_uri")}/?state=${params.get("state")}&code=c`);
   await rejected;
+});
+
+test("asks for the filter settings scope too, but links a grant without it", async () => {
+  assert.deepEqual(GMAIL_SCOPES, [GMAIL_MODIFY_SCOPE, GMAIL_SETTINGS_SCOPE]);
+  assert.equal(GMAIL_SETTINGS_SCOPE, "https://www.googleapis.com/auth/gmail.settings.basic");
+  // The user can untick a permission on Google's consent screen; only Gmail access itself is required.
+  const flow = await startFlow({ access_token: "at", refresh_token: "rt", expires_in: 3600, scope: GMAIL_MODIFY_SCOPE });
+  const params = flow.authUrl.searchParams;
+  assert.equal(params.get("scope"), `${GMAIL_MODIFY_SCOPE} ${GMAIL_SETTINGS_SCOPE}`);
+  await fetch(`${params.get("redirect_uri")}/?state=${params.get("state")}&code=c`);
+  assert.deepEqual((await flow.result).scopes, [GMAIL_MODIFY_SCOPE]);
 });

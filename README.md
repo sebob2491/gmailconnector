@@ -17,10 +17,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 | Situation | Behaviour |
 |---|---|
-| `search_threads`, `list_drafts`, `list_labels` with no `account` | Runs on **every** linked account. `search_threads` merges the results from all accounts into one list in true newest-first order, across accounts and across pages, and each thread says which account it's in; `list_drafts` and `list_labels` group results by account. The returned `nextPageToken` continues every account at once: a page holds the newest threads of all accounts together (so it can be shorter than pageSize × accounts), and the next page carries on from there with nothing skipped or repeated. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
+| `search_threads`, `list_drafts`, `list_labels`, `list_filters` with no `account` | Runs on **every** linked account. `search_threads` merges the results from all accounts into one list in true newest-first order, across accounts and across pages, and each thread says which account it's in; `list_drafts`, `list_labels` and `list_filters` group results by account. The returned `nextPageToken` continues every account at once: a page holds the newest threads of all accounts together (so it can be shorter than pageSize × accounts), and the next page carries on from there with nothing skipped or repeated. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
 | Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
-| IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
+| IDs (message, thread, draft, label, filter) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
 | `account` values | The account's email address. The local version also accepts an alias you pick (`work`, `personal`, …). |
 | Label arguments | Take label IDs **or** display names (e.g. `"Receipts"`), resolved per account. |
 
@@ -74,6 +74,20 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   accounts; and the plan notes when an unsubscribe address isn't on the sender's own domain. Up to 10
   senders per run (`maxSenders` up to 20); the emails you already have stay until you archive or trash
   them with the bulk tools.
+- New `list_filters`, `create_filter` and `delete_filter` tools: "file everything from my bank under
+  Finance and skip the inbox". A filter matches on sender, recipient, subject, a Gmail search (or one
+  that must not match), attachments or size, and can add existing labels, archive, mark read, star, mark
+  or never mark important, trash, never send to spam, or set the inbox category. `create_filter` with
+  `preview: true` counts the existing emails that match (up to 500, with examples) without creating
+  anything, and Claude is told to show you that and ask before creating or deleting a filter. Filters
+  only act on new mail, so the result gives the equivalent search for `bulk_update` or `bulk_trash` to
+  handle the emails you already have. There is no forwarding action (Gmail needs a verified forwarding
+  address, and an email could try to talk Claude into forwarding your mail); set that up in Gmail.
+  Filters need the `gmail.settings.basic` scope. **After updating, add the scope
+  `https://www.googleapis.com/auth/gmail.settings.basic` on your Google Cloud project's Data access page
+  and re-link your accounts** (on the accounts page when hosted, or with `accounts add` locally) to use
+  filters. Until an account is re-linked, everything else keeps working and the filter tools say how to
+  re-link it (listing filters works either way).
 - `messageFormat` defaults to `PLAIN_TEXT` instead of `FULL_CONTENT`, which keeps HTML out of Claude's context.
   HTML-only emails are converted the way a browser shows them, without what the sender hid (a
   newsletter's preview text, mobile-only copies of the content), and tables come out one row per line
@@ -87,8 +101,8 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   changed. Lists give one `viewUrlTemplate` instead of a Gmail link per item; single items (an email, a
   draft, sent mail) keep their own `viewUrl`. On sample data with two accounts, a 50-thread search of
   both went from 129,000 to 77,000 characters and a list of 20 drafts from 6,100 to 2,700.
-- The tool list Claude loads at the start of every session is about 37% smaller (about 32,700 instead of
-  51,900 characters): rules shared by many tools (the `account` argument, recipient formats, plain-text
+- The tool list Claude loads at the start of every session is about a third smaller (about 34,900 instead
+  of 51,900 characters, the new filter tools included): rules shared by many tools (the `account` argument, recipient formats, plain-text
   bodies, `messageFormat`) are stated once in the server instructions instead of in every tool, and the
   arguments' descriptions are short. Label colors are plain names (`colorPreset: "blue"`).
 - `search_threads` shows each thread's **3 most recent** emails (not the oldest), the thread's `total`
@@ -332,8 +346,9 @@ hashes.
   your mail, so treat it like a password. Set `GMAIL_MCP_CONFIG_DIR` to use another folder.
 - `~/.config/gmail-multi-mcp/credentials.json` holds your OAuth client.
 
-The only scope requested is `gmail.modify`: read, compose, send, label and trash. It can't
-permanently delete mail or change account settings. Revoke access at any time with
+The scopes requested are `gmail.modify` (read, compose, send, label and trash) and
+`gmail.settings.basic` (filters; optional: an account linked without it works, except for creating
+and deleting filters). Neither can permanently delete mail. Revoke access at any time with
 `accounts remove`, or at <https://myaccount.google.com/permissions>.
 
 ## Development

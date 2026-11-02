@@ -20,6 +20,10 @@ export interface FakeMailbox {
   attachments: Map<string, string>; // `${messageId}/${attachmentId}` -> base64url data
   sent: { metadata: any; raw: string; message: ApiMessage }[];
   pageSize?: number;
+  /** The account's filters (users.settings.filters). */
+  filters: { id: string; criteria: Record<string, unknown>; action: { addLabelIds?: string[]; removeLabelIds?: string[]; forward?: string } }[];
+  /** False when the grant lacks gmail.settings.basic: creating or deleting filters then fails with 403, as at Google. */
+  settingsScope?: boolean;
   /** The account's send-as settings; when unset, just the primary address. */
   sendAs?: { sendAsEmail: string; displayName?: string; signature?: string; isPrimary?: boolean; isDefault?: boolean }[];
 }
@@ -138,6 +142,7 @@ export class FakeGmail {
       drafts: new Map(),
       attachments: new Map(),
       sent: [],
+      filters: [],
     };
     this.mailboxes.push(mb);
     return mb;
@@ -429,6 +434,32 @@ export class FakeGmail {
       }
     }
 
+    // filters (listing and reading them only need gmail.modify; changes need gmail.settings.basic)
+    if (seg[0] === "settings" && seg[1] === "filters") {
+      const insufficient = () =>
+        json(403, {
+          error: { code: 403, message: "Request had insufficient authentication scopes.", errors: [{ reason: "insufficientPermissions" }], status: "PERMISSION_DENIED" },
+        });
+      if (seg.length === 2 && method === "GET") return json(200, mb.filters.length ? { filter: mb.filters } : {});
+      if (seg.length === 2 && method === "POST") {
+        if (mb.settingsScope === false) return insufficient();
+        if (mb.filters.some((f) => JSON.stringify(f.criteria) === JSON.stringify(body.criteria) && JSON.stringify(f.action) === JSON.stringify(body.action))) {
+          return json(400, { error: { code: 400, message: "Filter already exists" } });
+        }
+        const filter = { id: nextId("ANe1Bm"), criteria: body.criteria, action: body.action };
+        mb.filters.push(filter);
+        return json(200, filter);
+      }
+      const filter = mb.filters.find((f) => f.id === seg[2]);
+      if (method === "DELETE" && mb.settingsScope === false) return insufficient();
+      if (!filter) return notFound();
+      if (method === "GET") return json(200, filter);
+      if (method === "DELETE") {
+        mb.filters = mb.filters.filter((f) => f !== filter);
+        return json(204, undefined);
+      }
+    }
+
     if (path === "profile") return json(200, { emailAddress: mb.email });
     if (path === "settings/sendAs" && method === "GET") {
       return json(200, { sendAs: mb.sendAs ?? [{ sendAsEmail: mb.email, isPrimary: true, isDefault: true }] });
@@ -451,7 +482,7 @@ export class FakeGmail {
       const colon = body.indexOf(":");
       if (colon < 0) return true;
       const key = body.slice(0, colon).toLowerCase();
-      const value = body.slice(colon + 1).replace(/^"(.*)"$/, "$1");
+      const value = body.slice(colon + 1).replace(/^"(.*)"$/, "$1").replace(/^\((.*)\)$/, "$1");
       let hit: boolean;
       if (key === "category") hit = labels.includes(`CATEGORY_${value.toLowerCase() === "primary" ? "PERSONAL" : value.toUpperCase()}`);
       else if (key === "from") hit = (msg.payload?.headers?.find((h) => h.name === "From")?.value ?? "").toLowerCase().includes(value.toLowerCase());
@@ -464,7 +495,7 @@ export class FakeGmail {
       return hit !== negate;
     };
     // Tokens: "(", ")", "OR", and terms (a quoted value may contain spaces and parentheses).
-    const tokens = q.match(/[()]|-?[^\s()"]*"[^"]*"|[^\s()]+/g) ?? [];
+    const tokens = q.match(/-?[^\s()":]+:\([^()]*\)|[()]|-?[^\s()"]*"[^"]*"|[^\s()]+/g) ?? [];
     let pos = 0;
     const all = (): boolean => {
       let result = true;

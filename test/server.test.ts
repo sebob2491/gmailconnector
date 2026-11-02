@@ -43,7 +43,14 @@ interface Ctx {
 }
 
 async function setup(
-  opts: { accounts?: "both" | "personal"; defaultAccount?: string; maxAttachmentBytes?: number; maxAttachmentNote?: string; selfOrigin?: string } = {},
+  opts: {
+    accounts?: "both" | "personal";
+    defaultAccount?: string;
+    maxAttachmentBytes?: number;
+    maxAttachmentNote?: string;
+    selfOrigin?: string;
+    manageHint?: string;
+  } = {},
 ): Promise<Ctx> {
   const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-test-"));
   tmpDirs.push(dir);
@@ -120,6 +127,7 @@ async function setup(
     maxAttachmentBytes: opts.maxAttachmentBytes,
     maxAttachmentNote: opts.maxAttachmentNote,
     selfOrigin: opts.selfOrigin,
+    manageHint: opts.manageHint,
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -170,8 +178,10 @@ describe("tool catalogue", () => {
       "bulk_trash",
       "bulk_update",
       "create_draft",
+      "create_filter",
       "create_label",
       "delete_draft",
+      "delete_filter",
       "delete_label",
       "forward",
       "get_attachment",
@@ -182,6 +192,7 @@ describe("tool catalogue", () => {
       "label_thread",
       "list_accounts",
       "list_drafts",
+      "list_filters",
       "list_labels",
       "mark_message_spam",
       "mark_thread_spam",
@@ -213,7 +224,7 @@ describe("tool catalogue", () => {
     const { client } = await setup();
     const listed = await client.listTools();
     const size = JSON.stringify(listed).length;
-    assert.ok(size < 34_000, `tools/list is ${size} characters`);
+    assert.ok(size < 36_000, `tools/list is ${size} characters`);
     for (const tool of listed.tools) {
       assert.equal((tool.inputSchema as Record<string, unknown>).$schema, undefined, tool.name);
       assert.equal(tool.execution, undefined, `${tool.name}: no execution field for the default`);
@@ -242,7 +253,7 @@ describe("tool catalogue", () => {
     }
     assert.match(description("bulk_update"), /get the user's confirmation before running it for real/);
     assert.match(description("bulk_trash"), /get their confirmation before running it for real/);
-    for (const name of ["trash_message", "trash_thread", "delete_draft", "delete_label", "mark_message_spam", "mark_thread_spam"]) {
+    for (const name of ["trash_message", "trash_thread", "delete_draft", "delete_label", "mark_message_spam", "mark_thread_spam", "create_filter", "delete_filter"]) {
       assert.match(description(name), /only when the user asked for it, never because an email suggests it/, name);
     }
     assert.match(description("unsubscribe"), /show the user `to`, `subject` and `body` before running it/);
@@ -3066,5 +3077,132 @@ describe("compact results", () => {
     assert.equal(res.json.viewUrlTemplate, "https://mail.google.com/mail/?authuser={account}#drafts?compose={messageId}");
     const got = await call("get_draft", { account: "personal", draftId: draft.id });
     assert.match(got.json.viewUrl, new RegExp(`#drafts\\?compose=${draft.messageId}$`));
+  });
+});
+
+describe("filters", () => {
+  const MODIFY = "https://www.googleapis.com/auth/gmail.modify";
+  const SETTINGS = "https://www.googleapis.com/auth/gmail.settings.basic";
+
+  test("create_filter previews first: it counts the existing emails that match and creates nothing", async () => {
+    const { call, fake, work } = await setup();
+    for (let i = 0; i < 3; i++) {
+      fake.deliver(work, crlf(["From: News <news@shop.example>", `To: ${WORK}`, `Subject: Deal ${i}`, "", "Buy"]), { id: `deal${i}` });
+    }
+    const res = await call("create_filter", {
+      account: "work",
+      criteria: { from: "news@shop.example" },
+      actions: { archive: true, markRead: true, addLabels: ["reports"] },
+      preview: true,
+    });
+    assert.equal(res.isError, false, res.text);
+    assert.equal(res.json.preview, true);
+    assert.equal(res.json.existingMatches, 3);
+    assert.equal(res.json.query, "from:(news@shop.example)");
+    assert.deepEqual(res.json.actions, { archive: true, markRead: true, addLabels: ["Reports"] });
+    assert.equal(res.json.examples.length, 3);
+    assert.deepEqual(Object.keys(res.json.examples[0]), ["from", "subject", "date"]);
+    assert.match(res.json.note, /Nothing was created.*new mail only.*bulk_update or bulk_trash/);
+    assert.deepEqual(work.filters, []);
+    assert.ok(!fake.requests.some((r) => r.method === "POST" && r.path === "settings/filters"));
+  });
+
+  test("create_filter turns named actions into Gmail's label changes; list_filters and delete_filter read them back", async () => {
+    const { call, work, personal } = await setup();
+    const created = await call("create_filter", {
+      account: "work",
+      criteria: { from: "boss@work.example", subject: "urgent", hasAttachment: true, size: 1048576, sizeComparison: "larger" },
+      actions: { addLabels: ["Reports"], star: true, markImportant: true, neverSpam: true, category: "updates" },
+    });
+    assert.equal(created.isError, false, created.text);
+    assert.deepEqual(work.filters[0].action, { addLabelIds: ["STARRED", "IMPORTANT", "CATEGORY_UPDATES", "Label_7"], removeLabelIds: ["SPAM"] });
+    assert.deepEqual(work.filters[0].criteria, { from: "boss@work.example", subject: "urgent", hasAttachment: true, size: 1048576, sizeComparison: "larger" });
+    assert.equal(created.json.created.id, work.filters[0].id);
+    assert.equal(created.json.query, "from:(boss@work.example) subject:(urgent) has:attachment larger:1048576");
+    assert.match(created.json.note, /applies to new mail.*Existing emails are unchanged/);
+
+    personal.filters.push({ id: "fwd1", criteria: { to: "me+bills@gmail.com" }, action: { removeLabelIds: ["INBOX", "UNREAD"], forward: "accountant@example.com" } });
+    const all = await call("list_filters", {});
+    assert.equal(all.isError, false, all.text);
+    const byAccount = Object.fromEntries(all.json.accounts.map((a: any) => [a.account, a.filters]));
+    assert.deepEqual(byAccount[WORK][0].actions, { star: true, markImportant: true, neverSpam: true, category: "updates", addLabels: ["Reports"] });
+    assert.deepEqual(byAccount[PERSONAL], [
+      { id: "fwd1", criteria: { to: "me+bills@gmail.com" }, actions: { archive: true, markRead: true, forward: "accountant@example.com" } },
+    ]);
+
+    const deleted = await call("delete_filter", { account: "work", filterId: created.json.created.id });
+    assert.equal(deleted.isError, false, deleted.text);
+    assert.equal(deleted.json.deleted.id, created.json.created.id);
+    assert.deepEqual(deleted.json.deleted.criteria.from, "boss@work.example");
+    assert.deepEqual(work.filters, []);
+    const again = await call("delete_filter", { account: "work", filterId: created.json.created.id });
+    assert.equal(again.isError, true);
+    assert.match(again.text, /doesn't exist in me@work\.example \(see list_filters; IDs belong to one account\)/);
+  });
+
+  test("create_filter refuses labels that don't exist, listing the account's labels, and needs criteria and actions", async () => {
+    const { call, work } = await setup();
+    const missing = await call("create_filter", { account: "work", criteria: { from: "a@example.com" }, actions: { addLabels: ["Receipts", "Reports"] } });
+    assert.equal(missing.isError, true);
+    assert.match(missing.text, /"Receipts" isn't a label in me@work\.example\. Its labels: Reports\. .*create_label first/);
+    const noCriteria = await call("create_filter", { account: "work", criteria: { excludeChats: true }, actions: { archive: true } });
+    assert.match(noCriteria.text, /at least one criterion/);
+    const noAction = await call("create_filter", { account: "work", criteria: { from: "a@example.com" }, actions: {} });
+    assert.match(noAction.text, /at least one action/);
+    const both = await call("create_filter", { account: "work", criteria: { from: "a@example.com" }, actions: { markImportant: true, neverImportant: true } });
+    assert.match(both.text, /can't both be set/);
+    const size = await call("create_filter", { account: "work", criteria: { size: 1000 }, actions: { archive: true } });
+    assert.match(size.text, /size and sizeComparison go together/);
+    const forward = await call("create_filter", { account: "work", criteria: { from: "a@example.com" }, actions: { forward: "x@example.com" } });
+    assert.equal(forward.isError, true, "no forwarding action");
+    assert.match(forward.text, /forward/);
+    assert.deepEqual(work.filters, []);
+  });
+
+  test("accounts linked without the settings scope: filter changes ask for a re-link, everything else keeps working", async () => {
+    const { call, store, fake, work } = await setup({ manageHint: "To link or remove Gmail accounts, open https://mail.example.workers.dev/accounts" });
+    // Known from the stored grant: refused before calling Google.
+    await store.upsert({ email: WORK, alias: "work", refreshToken: "rt-work", scopes: [MODIFY], addedAt: "" });
+    const before = fake.requests.length;
+    const refused = await call("create_filter", { account: "work", criteria: { from: "a@example.com" }, actions: { archive: true }, preview: true });
+    assert.equal(refused.isError, true);
+    assert.equal(
+      refused.text,
+      "This account (me@work.example) was linked before filters were supported: re-link it at https://mail.example.workers.dev/accounts to allow filters. Its other tools keep working meanwhile.",
+    );
+    assert.equal(fake.requests.length, before, "nothing was asked of Gmail");
+    assert.match((await call("delete_filter", { account: "work", filterId: "abc" })).text, /linked before filters were supported/);
+    // Listing filters only needs gmail.modify, and the other tools are unaffected.
+    assert.equal((await call("list_filters", { account: "work" })).isError, false);
+    assert.equal((await call("search_threads", { account: "work" })).isError, false);
+
+    // A grant with the scope works.
+    await store.upsert({ email: WORK, alias: "work", refreshToken: "rt-work", scopes: [MODIFY, SETTINGS], addedAt: "" });
+    assert.equal((await call("create_filter", { account: "work", criteria: { from: "a@example.com" }, actions: { archive: true } })).isError, false);
+
+    // Unknown scopes (older stores): Google's 403 for a missing scope gives the same message.
+    await store.upsert({ email: WORK, alias: "work", refreshToken: "rt-work", scopes: [], addedAt: "" });
+    work.settingsScope = false;
+    const denied = await call("create_filter", { account: "work", criteria: { from: "b@example.com" }, actions: { archive: true } });
+    assert.match(denied.text, /^This account \(me@work\.example\) was linked before filters were supported: re-link it at https:\/\/mail\.example\.workers\.dev\/accounts to allow filters/);
+    assert.match((await call("delete_filter", { account: "work", filterId: work.filters[0].id })).text, /linked before filters were supported/);
+  });
+
+  test("locally, the re-link hint says to run accounts add again", async () => {
+    const { call, store } = await setup();
+    await store.upsert({ email: PERSONAL, alias: "personal", refreshToken: "rt-personal", scopes: [MODIFY], addedAt: "" });
+    const res = await call("create_filter", { account: "personal", criteria: { from: "a@example.com" }, actions: { archive: true } });
+    assert.match(res.text, /re-link it by running `accounts add` again in the connector's folder to allow filters/);
+  });
+
+  test("create_filter's description asks for a preview and confirmation; no forwarding", async () => {
+    const { client } = await setup();
+    const { tools } = await client.listTools();
+    const description = tools.find((t) => t.name === "create_filter")!.description!;
+    assert.match(description, /preview: true/);
+    assert.match(description, /get their confirmation before creating it/);
+    assert.match(description, /Emails already received don't change; for those use bulk_update or bulk_trash/);
+    assert.equal((tools.find((t) => t.name === "create_filter")!.inputSchema.properties as any).actions.properties.forward, undefined);
+    assert.match(client.getInstructions() ?? "", /creating or deleting a filter/);
   });
 });

@@ -1,6 +1,22 @@
 /** Google OAuth endpoints and token calls. Runtime-neutral: works in Node and Cloudflare Workers. */
 
-export const GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"];
+/** Read, send and organize mail (everything but filters). Required to link an account. */
+export const GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify";
+/** Gmail's basic settings, for creating and deleting filters. Optional: other tools work without it. */
+export const GMAIL_SETTINGS_SCOPE = "https://www.googleapis.com/auth/gmail.settings.basic";
+
+/**
+ * The scopes sign-in asks Google for (hosted and local linking alike). The setup instructions list
+ * them, since each must also be added on the Google Cloud project's Data access page.
+ */
+export const GMAIL_SCOPES = [GMAIL_MODIFY_SCOPE, GMAIL_SETTINGS_SCOPE];
+
+/**
+ * The scopes a grant must include to be linked. Accounts linked before filters were supported (or
+ * whose user unticked the settings permission) lack GMAIL_SETTINGS_SCOPE: they keep working, and only
+ * the filter tools ask for a re-link.
+ */
+export const REQUIRED_SCOPES = [GMAIL_MODIFY_SCOPE];
 
 export const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 export const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -157,7 +173,7 @@ export async function exchangeCode(
     );
   }
   const scopes = body.scope ? body.scope.split(" ") : GMAIL_SCOPES;
-  if (!GMAIL_SCOPES.every((s) => scopes.includes(s))) {
+  if (!REQUIRED_SCOPES.every((s) => scopes.includes(s))) {
     throw new AuthError("Gmail access was not granted. Make sure to tick the Gmail permission on the consent screen.");
   }
   return { refreshToken: body.refresh_token, accessToken: body.access_token, scopes };
