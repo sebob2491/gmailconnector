@@ -683,6 +683,36 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(res.text, /only works with Claude/);
   });
 
+  test("sign-in codes go only to Claude's callback, not to any page on claude.ai", async () => {
+    // claude.com is the announced future address of the same callback.
+    const future = "https://claude.com/api/mcp/auth_callback";
+    const client = await registerClient(future);
+    const consent = await new Browser(mf).fetch(authorizeUrl(client, "x".repeat(43), future));
+    assert.equal(consent.status, 200, consent.text);
+    assert.match(consent.text, /Access will be sent to <b>claude\.com<\/b>/);
+
+    const elsewhere = [
+      "https://claude.ai/",
+      "https://claude.ai/new",
+      "https://claude.ai/api/mcp/auth_callback/x",
+      "https://claude.ai/api/mcp/auth_callback?next=https://evil.example",
+      "https://claude.ai/api/mcp/auth_callback#x",
+      "https://claude.ai:8443/api/mcp/auth_callback",
+      "https://claude.com/api/other",
+      "https://user@claude.ai/api/mcp/auth_callback",
+    ];
+    const reg = await register({ redirect_uris: elsewhere });
+    assert.equal(reg.status, 201, JSON.stringify(reg.body));
+    for (const redirect of elsewhere) {
+      const res = await new Browser(mf).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect));
+      assert.equal(res.status, 403, `${redirect}: ${res.status}`);
+      assert.match(res.text, /only works with Claude/, redirect);
+      // Request errors aren't sent there either.
+      const error = await new Browser(mf).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect).replace("response_type=code", "response_type=token"));
+      assert.notEqual(error.status, 302, redirect);
+    }
+  });
+
   test("a claude.ai address with another scheme can't receive tokens", async () => {
     // `evilapp://claude.ai/…` has the host claude.ai, but the code would go to whichever app owns
     // the evilapp: scheme; plain http could be read on the way.
@@ -1078,6 +1108,43 @@ describe("rate limits (per Worker instance)", () => {
     assert.match(limited.text, /Too many requests/);
     assert.equal(limited.headers.get("Retry-After"), "60");
     assert.equal((await new Browser(mf3).fetch(url)).status, 400, "another address is fine");
+  });
+});
+
+describe("a connector with its settings changed", () => {
+  let mf4: Miniflare;
+  before(async () => {
+    const fake4 = new FakeGmail();
+    fake4.addMailbox(PERSONAL, "rt-personal");
+    mf4 = await startWorker(fake4, {
+      ALLOWED_EMAILS: PERSONAL,
+      ALLOWED_REDIRECT_URIS: "https://claude.ai/api/*, https://app.example/cb ,http://localhost/oauth/*, https://bad.example*, not a url",
+    });
+  });
+  after(async () => {
+    await mf4?.dispose();
+  });
+
+  test("ALLOWED_REDIRECT_URIS replaces the list of places sign-in codes may go", async () => {
+    const cases: [string, number][] = [
+      ["https://claude.ai/api/mcp/auth_callback", 200],
+      ["https://claude.ai/api/anything", 200],
+      ["https://claude.ai/new", 403],
+      ["https://claude.com/api/mcp/auth_callback", 403],
+      ["https://app.example/cb", 200],
+      ["https://app.example/cb2", 403],
+      ["http://app.example/cb", 403],
+      ["http://localhost:5555/oauth/cb", 200],
+      ["http://localhost:5555/other", 403],
+      ["https://bad.example.evil/cb", 403],
+    ];
+    const reg = await register({ redirect_uris: cases.map(([uri]) => uri) }, mf4);
+    assert.equal(reg.status, 201, JSON.stringify(reg.body));
+    for (const [redirect, expected] of cases) {
+      const res = await new Browser(mf4).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect));
+      assert.equal(res.status, expected, `${redirect}: ${res.status}\n${res.text.slice(0, 300)}`);
+      if (expected === 403) assert.match(res.text, /only works with Claude/, redirect);
+    }
   });
 });
 

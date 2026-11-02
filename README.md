@@ -190,10 +190,15 @@ still sign in). Linked accounts can't sign in, so someone with access to one of 
 only proves who you are: it never re-adds an account you removed; use **Link** for that. If you take
 an address off `ALLOWED_EMAILS`, Claude connections made by that address stop working.
 
-Tokens are only ever sent back to Claude (`https://claude.ai`, `https://claude.com`, or a local Claude
-app at `localhost`); override the hosts with `ALLOWED_REDIRECT_HOSTS`. The same hosts are the only ones
-the connector reads client metadata documents from. Variables you add in the dashboard are kept when
-the Worker redeploys.
+Sign-in codes are only ever sent to Claude's own callback for custom connectors,
+`https://claude.ai/api/mcp/auth_callback` (and `https://claude.com/api/mcp/auth_callback`, its
+announced future address), or to a local Claude app at `localhost`/`127.0.0.1` (any port); any other
+page, even on claude.ai, is refused. To change the list, add a variable `ALLOWED_REDIRECT_URIS`:
+comma-separated exact URIs, or prefixes ending in `*` (e.g. `https://claude.ai/api/*`); addresses must
+still be https, or http to a loopback address. (The older `ALLOWED_REDIRECT_HOSTS`, any path on the
+listed hosts, still works when `ALLOWED_REDIRECT_URIS` isn't set.) Client metadata documents are only
+read from the same hosts (by default claude.ai and claude.com). Changing the list doesn't affect
+existing connections. Variables you add in the dashboard are kept when the Worker redeploys.
 
 Requests anyone can make without signing in (registering a Claude client, opening the consent page)
 are rate-limited per Worker instance (best effort: Cloudflare runs several instances), so someone who
