@@ -4,3 +4,4 @@ credentials.json
 accounts.json
 dist-worker/
 .wrangler/
+worker/version.generated.ts

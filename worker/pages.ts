@@ -1,5 +1,6 @@
 /** Server-rendered HTML for the connector's setup, consent and account pages. */
 import type { AccountHealth } from "./health.js";
+import type { UpdateAvailable } from "./version.js";
 
 export const escapeHtml = (value: string): string =>
   value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
@@ -51,6 +52,9 @@ ol.steps li{margin:14px 0}
 .status{font-weight:600}
 .status.ok{color:var(--ok)}
 .status.todo{color:var(--warn)}
+.notice.update .how{display:block;margin-top:6px}
+.notice a{color:inherit}
+.version{text-align:center;font-size:.8rem}
 `;
 
 const LOGO = `<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 6l9 7 9-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>`;
@@ -104,6 +108,21 @@ ${opts.action ? `<div class="actions"><a class="button primary" href="${escapeHt
   return htmlResponse(layout(title, body), { status: opts.status ?? 400, headers: opts.headers });
 }
 
+const link = (href: string, label: string) => `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`;
+
+/**
+ * "An update is available", with how to get it. `repo` is this copy's GitHub repository when the
+ * build knew it (only shown to the signed-in owner).
+ */
+function updateNotice(update: UpdateAvailable, repo?: string): string {
+  const actions = repo ? link(`https://github.com/${repo}/actions/workflows/update-from-upstream.yml`, "Update from upstream") : "<b>Update from upstream</b>";
+  const copy = repo ? link(`https://github.com/${repo}`, "your copy on GitHub") : "your copy on GitHub";
+  return `<div class="notice warn update"><b>An update is available.</b> ${escapeHtml(update.upstream)} has changes newer than the version running here (${link(update.compareUrl, "what changed")}, or ${link(update.commitsUrl, "its latest changes")}).
+<span class="how">To update, open ${copy}: if it's a fork, press <b>Sync fork → Update branch</b>; otherwise open <b>Actions → ${actions} → Run workflow</b>. Cloudflare redeploys by itself a minute or two later.</span></div>`;
+}
+
+const versionFooter = (version: string) => `<p class="muted version">Version ${escapeHtml(version)}</p>`;
+
 function copyRow(value: string): string {
   return `<div class="copy"><code>${escapeHtml(value)}</code><button type="button" data-copy="${escapeHtml(value)}">Copy</button></div>`;
 }
@@ -122,12 +141,14 @@ export function statusPage(opts: {
   claimed: boolean;
   /** This response's script nonce (the page has copy buttons). */
   nonce: string;
+  version: string;
+  update?: UpdateAvailable;
 }): string {
   const mcpUrl = `${opts.origin}/mcp`;
   const callback = `${opts.origin}/google/callback`;
   const check = (done: boolean, doneText = "Done", todoText = "To do") =>
     `<span class="status ${done ? "ok" : "todo"}">${done ? `✓ ${doneText}` : `○ ${todoText}`}</span>`;
-  const body = `<div class="card"><h1>Your Gmail connector is running</h1>
+  const body = `${opts.update ? updateNotice(opts.update) : ""}<div class="card"><h1>Your Gmail connector is running</h1>
 <p class="muted">Finish these steps to use it in Claude. This page updates as you go.</p>
 <ol class="steps">
 <li><h2>Connect Google ${check(opts.googleConfigured)}</h2>
@@ -147,7 +168,7 @@ export function statusPage(opts: {
 <p class="muted">Then press <b>Connect</b> and sign in with Google, using an address from <code>ALLOWED_EMAILS</code>. The first one to sign in becomes this connector's owner.</p></li>
 <li><h2>Link more Gmail accounts</h2>
 <p>While connecting, tap <b>Link another Gmail account</b> for each extra inbox. You can also manage them any time at:</p>${copyRow(`${opts.origin}/accounts`)}</li>
-</ol></div>`;
+</ol></div>${versionFooter(opts.version)}`;
   return layout("Gmail connector setup", body, { nonce: opts.nonce });
 }
 
@@ -206,6 +227,10 @@ export function accountsPage(opts: {
   csrf: string;
   connecting?: { clientName: string; redirectHost: string };
   notice?: { kind: "ok" | "bad" | "warn"; text: string; link?: { href: string; label: string } };
+  version: string;
+  update?: UpdateAvailable;
+  /** This copy's GitHub repository, when the build knew it. */
+  repo?: string;
 }): string {
   const csrf = `<input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">`;
   const rows = opts.accounts
@@ -256,7 +281,8 @@ ${
     ? ""
     : `<div class="card"><h2>Claude's access</h2>
 <p class="muted">Disconnecting signs Claude out of this connector everywhere it's connected (every Claude account and app). Your linked Gmail accounts stay linked; connect again from Claude's connector settings to use them.</p>
-<form method="post" action="/accounts/disconnect" class="actions">${csrf}<button>Disconnect Claude</button></form></div>`
-}`;
+<form method="post" action="/accounts/disconnect" class="actions">${csrf}<button>Disconnect Claude</button></form></div>
+${opts.update ? updateNotice(opts.update, opts.repo) : ""}`
+}${versionFooter(opts.version)}`;
   return layout("Gmail accounts", body);
 }

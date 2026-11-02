@@ -41,6 +41,7 @@ import {
   type Env,
   type GrantProps,
 } from "./owner.js";
+import { build, checkForUpdate, versionJson, versionLabel } from "./version.js";
 import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
 const SESSION_COOKIE = "__Host-gmail-connector";
@@ -482,7 +483,11 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
   if (!session) return startGoogleSignIn(env, origin, request, { purpose: "signin" });
   const rec = await loadOwner(env.OAUTH_KV);
   // One token refresh per account, in parallel, so the page shows which ones need re-linking.
-  const health = await checkAccounts(googleClient(env), rec.accounts);
+  // Not while connecting Claude: that page is about choosing accounts.
+  const [health, update] = await Promise.all([
+    checkAccounts(googleClient(env), rec.accounts),
+    session.data.request ? undefined : checkForUpdate(env),
+  ]);
   return htmlResponse(
     accountsPage({
       accounts: rec.accounts.map((a, i) => ({ email: a.email, alias: a.alias, health: health[i] })),
@@ -492,6 +497,9 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
       connecting: session.data.request
         ? { clientName: session.data.clientName ?? "Claude", redirectHost: hostnameOf(session.data.request.redirectUri) }
         : undefined,
+      version: versionLabel(),
+      update,
+      repo: build.repo || undefined,
     }),
   );
 }
@@ -618,10 +626,16 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
           allowedEmailsSet: allowedEmails(env).length > 0,
           claimed: await isClaimed(env),
           nonce,
+          version: versionLabel(),
+          update: await checkForUpdate(env),
         }),
         { nonce },
       );
     }
+    case "GET /version":
+      return new Response(JSON.stringify(versionJson(env)), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+      });
     case "GET /privacy":
       return htmlResponse(privacyPage(origin));
     case "GET /authorize":

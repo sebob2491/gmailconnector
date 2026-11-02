@@ -26,6 +26,8 @@ export interface Env {
    * prefixes ending in `*` (defaults to Claude's callback and loopback addresses).
    */
   ALLOWED_REDIRECT_URIS?: string;
+  /** "owner/repo" of the repository to look for updates in (defaults to this project's). */
+  UPSTREAM_REPO?: string;
   /** Older setting: hosts Claude may redirect back to, any path. Used only without ALLOWED_REDIRECT_URIS. */
   ALLOWED_REDIRECT_HOSTS?: string;
 }

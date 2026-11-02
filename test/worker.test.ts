@@ -126,6 +126,28 @@ let failRevoke = false;
  */
 let refreshFailure: "unreachable" | 503 | undefined;
 
+/** The commit the Worker under test was built from (read from GET /version). */
+let runningCommit = "";
+/** Every request the Worker made to GitHub. */
+const githubHits: string[] = [];
+const NEWER = "f".repeat(40);
+const feed = (sha: string, date: string) =>
+  `<?xml version="1.0"?><feed><entry><id>tag:github.com,2008:Grit::Commit/${sha}</id><updated>${date}</updated></entry></feed>`;
+/**
+ * GitHub, per upstream repository: "tester/newer" has a newer commit; "tester/same" is at the commit
+ * running; "tester/limited" rate-limits the API but serves the commit feed (with a newer commit);
+ * anything else fails.
+ */
+function fakeGitHub(url: string): MfResponse {
+  githubHits.push(url);
+  const json = (body: unknown) => new MfResponse(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
+  if (url === "https://api.github.com/repos/tester/newer/commits/main") return json({ sha: NEWER, commit: { committer: { date: "2099-01-01T00:00:00Z" } } });
+  if (url === "https://api.github.com/repos/tester/same/commits/main") return json({ sha: runningCommit, commit: { committer: { date: "2099-01-01T00:00:00Z" } } });
+  if (url === "https://api.github.com/repos/tester/limited/commits/main") return new MfResponse("rate limited", { status: 403 });
+  if (url === "https://github.com/tester/limited/commits/main.atom") return new MfResponse(feed(NEWER, "2099-01-02T00:00:00Z"));
+  return new MfResponse("unavailable", { status: 500 });
+}
+
 async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, string>): Promise<Miniflare> {
   const instance = new Miniflare(
     convertV4MiniflareOptions({
@@ -138,6 +160,10 @@ async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, strin
           kvNamespaces: ["OAUTH_KV"],
           bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
           outboundService: async (req: MfRequest) => {
+            if (req.url.startsWith("https://api.github.com/") || req.url.startsWith("https://github.com/")) {
+              assert.match(req.headers.get("User-Agent") ?? "", /\S/, "GitHub's API requires a User-Agent");
+              return fakeGitHub(req.url);
+            }
             if (cimdDocs.has(req.url) || req.url.startsWith("https://cimd.attacker.example/")) {
               cimdHits.push(req.url);
               // Not cacheable, so every lookup the library makes shows up here.
@@ -214,7 +240,8 @@ before(async () => {
     { id: "w1", threadId: "wt1" },
   );
 
-  mf = await startWorker(fake, { ALLOWED_EMAILS: PERSONAL });
+  mf = await startWorker(fake, { ALLOWED_EMAILS: PERSONAL, UPSTREAM_REPO: "tester/newer" });
+  runningCommit = ((await (await mf.dispatchFetch(`${ORIGIN}/version`)).json()) as any).commit;
 });
 
 after(async () => {
@@ -397,6 +424,32 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(privacy.text, /gmail\.modify/);
   });
 
+  test("GET /version says which commit is running, and nothing secret", async () => {
+    const res = await mf.dispatchFetch(`${ORIGIN}/version`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("Content-Type") ?? "", /application\/json/);
+    const body = (await res.json()) as any;
+    assert.deepEqual(Object.keys(body).sort(), ["builtAt", "commit", "commitDate", "upstream", "version"]);
+    assert.equal(body.version, JSON.parse(readFileSync("package.json", "utf8")).version);
+    assert.match(body.commit, /^([0-9a-f]{40}|unknown)$/);
+    assert.ok(!Number.isNaN(Date.parse(body.builtAt)));
+    assert.equal(body.upstream, "tester/newer");
+  });
+
+  test("the setup page says when the original repository has a newer version", async () => {
+    const page = await new Browser(mf).fetch("/");
+    assert.match(page.text, /Version \d+\.\d+\.\d+ \(/);
+    if (runningCommit === "unknown") return; // built without git: nothing to compare
+    assert.match(page.text, new RegExp(`Version [^<]*${runningCommit.slice(0, 7)}`));
+    assert.match(page.text, /An update is available/);
+    assert.ok(page.text.includes(`href="https://github.com/tester/newer/compare/${runningCommit}...main"`));
+    assert.match(page.text, /Sync fork/);
+    assert.match(page.text, /Update from upstream/);
+    // GitHub is asked at most once an hour per instance (the first setup page view above asked).
+    await new Browser(mf).fetch("/");
+    assert.deepEqual(githubHits.filter((u) => u.includes("tester/newer")), ["https://api.github.com/repos/tester/newer/commits/main"]);
+  });
+
   test("the MCP endpoint demands OAuth and advertises discovery metadata", async () => {
     const res = await mf.dispatchFetch(`${ORIGIN}/mcp`, { method: "POST", body: "{}" });
     assert.equal(res.status, 401);
@@ -564,6 +617,20 @@ describe("hosted connector (Cloudflare Worker)", () => {
     await save(PERSONAL, "");
     assert.equal((await callTool("list_accounts")).json.accounts[0].alias, undefined);
     await save(WORK, "");
+  });
+
+  test("the accounts page shows the version, and the update notice when not connecting Claude", async () => {
+    const { browser } = await ownerBrowser();
+    const page = await browser.fetch("/accounts");
+    assert.match(page.text, /class="muted version">Version /);
+    if (runningCommit !== "unknown") assert.match(page.text, /An update is available/);
+    // While connecting, the page is only about choosing accounts.
+    const claude = new Browser(mf);
+    const consent = await claude.fetch(authorizeUrl(firstClientId, "z".repeat(43)));
+    await claude.googleSignIn((await answerConsent(claude, consent.text)).location, fake, PERSONAL);
+    const connecting = await claude.fetch("/accounts");
+    assert.match(connecting.text, /Done — connect to Claude/);
+    assert.doesNotMatch(connecting.text, /An update is available/);
   });
 
   test("attachments are read inside the Worker runtime (PDF and Word)", async () => {
@@ -1134,10 +1201,16 @@ describe("rate limits (per Worker instance)", () => {
   before(async () => {
     const fake3 = new FakeGmail();
     fake3.addMailbox(PERSONAL, "rt-personal");
-    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL });
+    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL, UPSTREAM_REPO: "tester/same" });
   });
   after(async () => {
     await mf3?.dispose();
+  });
+
+  test("no update notice when the running commit is the newest", async () => {
+    const page = await new Browser(mf3).fetch("/");
+    assert.equal(page.status, 200);
+    assert.doesNotMatch(page.text, /An update is available/);
   });
 
   test("client registration: 5 a minute per address, 20 per instance", async () => {
@@ -1173,10 +1246,18 @@ describe("a connector with its settings changed", () => {
     mf4 = await startWorker(fake4, {
       ALLOWED_EMAILS: PERSONAL,
       ALLOWED_REDIRECT_URIS: "https://claude.ai/api/*, https://app.example/cb ,http://localhost/oauth/*, https://bad.example*, not a url",
+      UPSTREAM_REPO: "tester/limited",
     });
   });
   after(async () => {
     await mf4?.dispose();
+  });
+
+  test("when GitHub's API is rate-limited, the commit feed is used instead", async () => {
+    githubHits.length = 0;
+    const page = await new Browser(mf4).fetch("/");
+    assert.deepEqual(githubHits, ["https://api.github.com/repos/tester/limited/commits/main", "https://github.com/tester/limited/commits/main.atom"]);
+    if (runningCommit !== "unknown") assert.match(page.text, /An update is available/);
   });
 
   test("ALLOWED_REDIRECT_URIS replaces the list of places sign-in codes may go", async () => {
@@ -1216,7 +1297,11 @@ describe("a new connector without ALLOWED_EMAILS", () => {
   });
 
   test("refuses every sign-in until ALLOWED_EMAILS is set, so nobody can claim it first", async () => {
+    githubHits.length = 0;
     const setup = await new Browser(mf2).fetch("/");
+    // Updates are looked for in this project's own repository by default; a failure shows nothing.
+    assert.deepEqual(githubHits, ["https://api.github.com/repos/sebob2491/gmailconnector/commits/main"]);
+    assert.doesNotMatch(setup.text, /An update is available/);
     assert.match(setup.text, /Say who owns it <span class="status todo">/);
 
     const browser = new Browser(mf2);
