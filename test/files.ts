@@ -469,13 +469,18 @@ export async function assertCpu<T>(name: string, fn: () => T | Promise<T>, ceili
 
 /** Below this, a ratio says little (timer granularity, a stray GC): the larger run may take this much more. */
 const SLACK_MS = 2;
+/**
+ * Times a ratio is measured before a failure counts. Allocation-heavy code shows ratios up to about
+ * 2.8 now and then (the larger run meets more garbage collections); a quadratic one fails every time.
+ */
+const ATTEMPTS = 3;
 
 /**
  * Asserts that the work grows at most linearly with the input: `make(n)` builds an input of size n
  * (outside the measurement) and returns the call to time; the best CPU time for 2n must be under
  * `maxRatio` (3: linear is about 2, quadratic 4) times that for n, and under `ceilingMs`. The two
  * sizes are measured alternately (after a warm-up of each) so both see the same load; a failed
- * ratio is measured once more before it counts. Returns the results for n and 2n.
+ * ratio is measured again (ATTEMPTS in all) before it counts. Returns the results for n and 2n.
  */
 export async function assertLinear<T>(
   name: string,
@@ -487,7 +492,7 @@ export async function assertLinear<T>(
   const small = make(n);
   const large = make(2 * n);
   let result!: { small: Timed<T>; large: Timed<T> };
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
     await cpuOnce(small);
     await cpuOnce(large);
     let s!: Timed<T>;

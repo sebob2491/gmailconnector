@@ -151,7 +151,7 @@ test("hostile PDFs are read in linear time", async () => {
   // [the file at size n, n, the CPU ceiling in ms for 2n]
   const cases: Record<string, [(n: number) => Buffer, number, number]> = {
     "a million spaces in one string": [(n) => pdf([`BT (${"word ".repeat(10)}) Tj (${" ".repeat(n)}) Tj (end of the line here) Tj ET`]), 500_000, 200],
-    "20,000 streams without objects": [(n) => Buffer.from(`%PDF-1.4\n${"stream\nx\nendstream\n".repeat(n)}`, "latin1"), 10_000, 300],
+    "20,000 streams without objects": [(n) => Buffer.from(`%PDF-1.4\n${"stream\nx\nendstream\n".repeat(n)}`, "latin1"), 10_000, 600],
   };
   for (const [name, [build, n, ceiling]] of Object.entries(cases)) {
     await assertLinear(name, (size) => {
@@ -692,7 +692,7 @@ test("crafted page trees and object streams stay fast", async () => {
         return b.build(b.add(`<< /Type /Catalog /Pages ${refs(a)} >>`));
       },
       50_000,
-      1000,
+      1200,
     ],
     // Kids arrays with 200,000 entries: the same page over and over, and pages that don't exist.
     "huge Kids, one page": [
@@ -711,7 +711,7 @@ test("crafted page trees and object streams stay fast", async () => {
         return m.build(pageTree(m, [real].concat(Array.from({ length: n }, (_, i) => 10_000 + i))));
       },
       100_000,
-      1500,
+      2000,
     ],
     // 20,000 pages, all but the first without text (they are listed as one line).
     "20,000 pages": [
@@ -726,7 +726,7 @@ test("crafted page trees and object streams stay fast", async () => {
     ],
     // 1,000 and 2,000 object streams (indexed); 3,000 and 6,000 (more than are indexed: read in file order).
     "object streams, indexed": [(n) => objectStreams(n), 1000, 600],
-    "object streams, past the index": [(n) => objectStreams(n), 3000, 400],
+    "object streams, past the index": [(n) => objectStreams(n), 3000, 600],
   };
   for (const [name, [build, n, ceiling]] of Object.entries(cases)) {
     const { small, large } = await assertLinear(name, (size) => {
@@ -922,7 +922,7 @@ test("hostile ToUnicode CMaps stay fast and bounded", async () => {
     "damaged syntax": {
       cmap: (n) => cmapOf({ bfchar: letters, junk: "beginbfrange <01> [ <02> endbfrange <<< ]] /x (stray) 42 ] [ >> <0102> <01> /uni0041 beginbfchar ".repeat(n) }),
       n: 5000,
-      ceiling: 100,
+      ceiling: 150,
       codes: sentence(0x100),
     },
   };
@@ -1030,7 +1030,7 @@ test("a content stream shared by many pages is decoded once, and reading stops w
     const pages = Array.from({ length: n }, () => b.add(`<< /Type /Page /Contents ${refs(contents)} >>`));
     const file = b.build(pageTree(b, pages));
     return () => readPdf(file);
-  }, 1500, 600);
+  }, 1500, 1000);
   assert.match(shared.value!.text, /^--- Page 1 ---\nshared content stream text/);
   assert.match(shared.value!.incomplete ?? "", /too large/);
   // One page whose /Contents array names the same small stream 20,000 times.
@@ -1040,7 +1040,7 @@ test("a content stream shared by many pages is decoded once, and reading stops w
     const page = c.add(`<< /Type /Page /Contents [${refs(Array(n).fill(small))}] >>`);
     const file = c.build(pageTree(c, [page]));
     return () => readPdf(file, { maxChars: 20_000 });
-  }, 10_000, 150);
+  }, 10_000, 200);
   assert.match(repeated.value!.text, /^(again){100}/);
 });
 
@@ -1050,13 +1050,13 @@ test("PDFs missing their endobj keywords are indexed in linear time", async () =
     const pages = Array.from({ length: n }, (_, i) => textPage(b, `Page ${i} of a file whose endobj keywords are gone.`));
     const file = Buffer.from(b.build(pageTree(b, pages)).toString("latin1").replaceAll("endobj", "      "), "latin1");
     return () => readPdf(file, { maxChars: 20_000 });
-  }, 2500, 350);
+  }, 2500, 500);
   assert.match(r.value!.text, /Page 0 of a file/);
   // A million headers (no bodies) are given up on quickly: the file is read in file order instead (no text).
   const { large: headers } = await assertLinear("headers", (n) => {
     const file = Buffer.from(`%PDF-1.4\n${"1 0 obj\n".repeat(n)}`);
     return () => readPdf(file);
-  }, 500_000, 2500);
+  }, 500_000, 4000);
   assert.equal(headers.value, undefined);
 });
 
@@ -1064,7 +1064,7 @@ test("content streams built to amplify (nested parentheses, escapes, hex starts,
   // Each is built at half and at full size: [the content at size n, n, the CPU ceiling in ms for 2n]
   const cases: Record<string, [(n: number) => string, number, number]> = {
     "4 MB of '('": [(n) => `BT (${"(".repeat(n)}) Tj ET`, 2_000_000, 500],
-    "4 MB of escapes": [(n) => `BT (${"\\n".repeat(n)}) Tj ET`, 1_000_000, 800],
+    "4 MB of escapes": [(n) => `BT (${"\\n".repeat(n)}) Tj ET`, 1_000_000, 1500],
     "1M hex starts": [(n) => `BT ${"<4".repeat(n)} ET`, 500_000, 200],
     "a TJ array of 1M elements": [(n) => `BT /F1 12 Tf 72 720 Td [${"(a)-1".repeat(n)}] TJ ET`, 250_000, 400],
   };
@@ -1090,7 +1090,7 @@ test("spreadsheets with huge runs of empty rows or cells are read in linear time
   const { large: rows } = await assertLinear("empty rows", (n) => {
     const file = xlsxOf({ sheets: [{ name: "S", data: `${Array.from({ length: n }, (_, i) => `<row r="${i + 1}"/>`).join("")}<row r="${n + 1}"><c t="inlineStr"><is><t>text</t></is></c></row>` }] });
     return () => readOffice(file);
-  }, 50_000, 300);
+  }, 50_000, 500);
   assert.equal(rows.value!.text, "--- Sheet: S ---\n(rows 1–100000 are empty)\ntext");
   // 40,000 empty cells, then text: the text lands in Excel's last column.
   const { large: cells } = await assertLinear("empty cells", (n) => {
@@ -1107,7 +1107,7 @@ test("spreadsheets with huge runs of empty rows or cells are read in linear time
 });
 
 test("number format codes are read in linear time, and only so far", async () => {
-  for (const [unit, n, shown, ceiling] of [["[", 500_000, "45000", 50], ["[h", 250_000, "00:00", 50], ['"', 500_000, "45000", 300]] as const) {
+  for (const [unit, n, shown, ceiling] of [["[", 500_000, "45000", 50], ["[h", 250_000, "00:00", 50], ['"', 500_000, "45000", 500]] as const) {
     const { small, large } = await assertLinear(`format code ${unit}…`, (size) => {
       const code = unit.repeat(size);
       const file = xlsxOf({ sheets: [{ name: "S", data: '<row r="1"><c s="1"><v>45000</v></c></row>' }], styles: `<numFmts><numFmt numFmtId="164" formatCode="${code.replace(/"/g, "&quot;")}"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs>` });

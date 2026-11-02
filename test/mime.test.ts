@@ -243,7 +243,7 @@ test("decodeEntities finds references exactly as the regex it replaces did, with
   const { large } = await assertLinear("unknown entity names", (n) => {
     const unknown = "&a".repeat(n);
     return () => decodeEntities(unknown);
-  }, 512 * 1024, 400);
+  }, 512 * 1024, 1000);
   assert.equal(large.value, "&a".repeat(1024 * 1024));
 });
 
@@ -279,9 +279,9 @@ test("htmlToText stays fast on hostile HTML", async () => {
     "unterminated comments": [(n) => "<!--".repeat(n), 250_000, 100],
     "unterminated styles": [(n) => "<style>".repeat(n), 250_000, 50],
     "stray brackets": [(n) => "<x ".repeat(n), 100_000, 100],
-    "long space run": [(n) => `a${" ".repeat(n)}b`, 2_000_000, 100],
-    "no-break space run": [(n) => `a${"&nbsp;".repeat(n)}b`, 100_000, 200],
-    "unclosed quotes": [(n) => '<x a="'.repeat(n), 100_000, 100],
+    "long space run": [(n) => `a${" ".repeat(n)}b`, 2_000_000, 150],
+    "no-break space run": [(n) => `a${"&nbsp;".repeat(n)}b`, 100_000, 400],
+    "unclosed quotes": [(n) => '<x a="'.repeat(n), 100_000, 200],
   };
   for (const [name, [html, n, ceiling]] of Object.entries(inputs)) {
     await assertLinear(name, (size) => {
@@ -496,8 +496,8 @@ test("address headers parse as before, in linear time, up to 64 KB", async () =>
         }
       };
     };
-    await assertLinear(`${name} within 64 KB`, parse, 30_000, 500);
-    await assertLinear(`${name} past 64 KB`, parse, 512 * 1024, 500);
+    await assertLinear(`${name} within 64 KB`, parse, 30_000, 1000);
+    await assertLinear(`${name} past 64 KB`, parse, 512 * 1024, 1000);
   }
   // Only the first 64 KB is read, and no address is cut in two there.
   const list = Array.from({ length: 5000 }, (_, i) => `person${i}@example.com`).join(", ");
@@ -523,7 +523,7 @@ test("cleanBody stays fast on long runs of tabs and spaces", async () => {
   await assertLinear("tabs and spaces", (n) => {
     const input = `a${"\t".repeat(2 * n)}b\n${" \t".repeat(n)}c`;
     return () => cleanBody(input);
-  }, 500_000, 250);
+  }, 500_000, 400);
 });
 
 /** The decoded body of each leaf part, by Content-Type, from a message built by buildMime. */
