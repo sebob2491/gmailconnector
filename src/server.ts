@@ -8,6 +8,7 @@ import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, GMAIL_SETTINGS_SCOPE, type FetchLike } from "./google.js";
 import { attachmentResult, FileTooLargeError, kindOf, readOffice, readPdf, readTextFile, sniffType, type ReadResult } from "./attachments.js";
 import { attachmentCharset, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
+import { logToolCalls, registerHistoryTools, withRawResult, type HistoryStore } from "./history.js";
 import {
   isPrivateAddress,
   Mailbox,
@@ -287,7 +288,7 @@ function mergeTimeline(result: { accounts: Record<string, any>[]; nextPageToken?
 }
 
 function ok(value: unknown): CallToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(value) }] };
+  return withRawResult({ content: [{ type: "text", text: JSON.stringify(value) }] }, value);
 }
 
 function fail(err: unknown): CallToolResult {
@@ -429,6 +430,8 @@ export interface ServerDeps {
    */
   maxAttachmentBytes?: number;
   maxAttachmentNote?: string;
+  /** Where the activity log is kept (see history.ts). Without it nothing is logged and there is no undo. */
+  history?: HistoryStore;
 }
 
 /**
@@ -511,6 +514,8 @@ export function createServer(deps: ServerDeps): McpServer {
   );
 
   slimToolList(server);
+  // Logs the calls of the tools in LOGGED_TOOLS (history.ts) registered below.
+  if (deps.history) logToolCalls(server, { history: deps.history, router });
 
   const read = { readOnlyHint: true, openWorldHint: false } as const;
   const write = { readOnlyHint: false, destructiveHint: false, openWorldHint: false } as const;
@@ -1627,6 +1632,10 @@ export function createServer(deps: ServerDeps): McpServer {
   simpleTool("unmark_thread_spam", "threads", "Moves an entire thread out of Spam back to the inbox.", write, (mb, id) =>
     mb.modifyIds("threads", id, ["INBOX"], ["SPAM"]),
   );
+
+  // ---------- activity log & undo ----------
+
+  if (deps.history) registerHistoryTools(server, { history: deps.history, router });
 
   return server;
 }

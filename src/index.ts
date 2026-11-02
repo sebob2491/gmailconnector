@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { AccountStore, describeAccount, normalizeAlias } from "./accountStore.js";
+import { AccountStore, describeAccount, FileHistoryStore, normalizeAlias } from "./accountStore.js";
 import { TokenProvider } from "./gmailClient.js";
 import {
   BUILTIN_CLIENT_FILE,
@@ -27,6 +27,7 @@ Usage:
                                           Give ACCOUNT a short name such as "work"
 
 ACCOUNT is an email address or alias. Accounts are stored in ${new AccountStore().file}
+and the activity log (what Claude changed, for undo) in ${new FileHistoryStore().file}
 (override the folder with GMAIL_MCP_CONFIG_DIR).`;
 
 /** Written next to the bundled server by `npm run pack:desktop` when the build has a Google client. */
@@ -154,6 +155,7 @@ async function main(): Promise<void> {
     store,
     tokens: new TokenProvider(loadClient, undefined, DESKTOP_RELINK_HINT),
     manageHint: DESKTOP_MANAGE_HINT,
+    history: new FileHistoryStore(store.dir),
   });
   registerAccountTools(server, { store, loadClient });
   await server.connect(new StdioServerTransport());

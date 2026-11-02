@@ -11,6 +11,7 @@ import {
   type AccountsFile,
   type LinkedAccount,
 } from "./accounts.js";
+import { JsonHistoryStore } from "./history.js";
 
 export * from "./accounts.js";
 
@@ -83,5 +84,39 @@ export class AccountStore implements AccountSource {
     account.alias = normalizeAlias(alias);
     await this.save(data);
     return account;
+  }
+}
+
+/**
+ * The activity log of the local server: activity.json next to accounts.json, readable only by the
+ * user (like accounts.json). Written whole each time, through a temporary file.
+ */
+export class FileHistoryStore extends JsonHistoryStore {
+  constructor(readonly dir: string = configDir()) {
+    super();
+  }
+
+  get file(): string {
+    return path.join(this.dir, "activity.json");
+  }
+
+  protected async read(): Promise<string | null> {
+    try {
+      return await fs.readFile(this.file, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  protected async write(text: string): Promise<void> {
+    await fs.mkdir(this.dir, { recursive: true, mode: 0o700 });
+    const tmp = `${this.file}.${process.pid}.tmp`;
+    await fs.writeFile(tmp, text + "\n", { mode: 0o600 });
+    await fs.rename(tmp, this.file);
+  }
+
+  protected async remove(): Promise<void> {
+    await fs.rm(this.file, { force: true });
   }
 }
