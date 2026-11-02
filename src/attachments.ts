@@ -2596,14 +2596,88 @@ function toMatrix(value: PdfValue | PdfStream | undefined): Matrix | undefined {
 }
 
 /**
+ * Most pieces of a page with annotations kept for placing them by position (below 65,536; a piece
+ * is a run, or runs that follow each other on a line); past it, the page reads in drawing order.
+ */
+const MAX_POSITIONED_RUNS = 20_000;
+/** Numbers kept per recorded piece: x0 y0 (its start) x1 y1 (its end) dx dy size flags annotation, and the start of its last run. */
+const RUN_FIELDS = 11;
+const EXACT = 1;
+const MOVED = 2;
+const BREAK = 4;
+
+/** A line of positioned runs: its baseline (across the text direction), largest font size, and runs (indexes). */
+interface PositionedLine {
+  across: number;
+  size: number;
+  runs: number[];
+}
+
+/** The axis a direction runs along: 0 right, 1 up, 2 left, 3 down; -1 for anything else (skewed text). */
+function axisOf(dx: number, dy: number): number {
+  return dx > 0.99 ? 0 : dy > 0.99 ? 1 : dx < -0.99 ? 2 : dy < -0.99 ? 3 : -1;
+}
+
+/**
+ * Sorts run indexes by `keys` (rounded to 1/64 point), descending or not, ties in index order: a
+ * native sort of numbers that hold both, several times faster than sorting with a comparison function.
+ */
+function sortRuns(runs: number[], keys: Float64Array, descending: boolean) {
+  const packed = new Float64Array(runs.length);
+  for (let k = 0; k < runs.length; k++) {
+    const i = runs[k];
+    let q = Math.round((descending ? -keys[i] : keys[i]) * 64);
+    if (!(q > -(2 ** 30))) q = q !== q ? 0 : -(2 ** 30);
+    else if (q > 2 ** 30) q = 2 ** 30;
+    packed[k] = (q + 2 ** 30) * 65_536 + i;
+  }
+  packed.sort();
+  for (let k = 0; k < runs.length; k++) runs[k] = (packed[k] % 65_536) | 0;
+}
+
+/**
+ * Groups runs into lines by baseline: top first, a run joining the current line when its baseline is
+ * within 0.4 of the font size of the line's first one (the writer's own test for a new line).
+ */
+function groupLines(runs: number[], across: Float64Array, sizes: Float64Array): PositionedLine[] {
+  sortRuns(runs, across, true);
+  const lines: PositionedLine[] = [];
+  let line: PositionedLine | undefined;
+  for (const i of runs) {
+    const size = Math.max(sizes[i], 1);
+    if (line && line.across - across[i] <= 0.4 * Math.max(line.size, size)) {
+      line.runs.push(i);
+      line.size = Math.max(line.size, size);
+    } else lines.push((line = { across: across[i], size, runs: [i] }));
+  }
+  return lines;
+}
+
+/** The first of `lines` (top first) whose baseline is at or below `across`: a binary search. */
+function lineAtOrBelow(lines: PositionedLine[], across: number): number {
+  let lo = 0;
+  let hi = lines.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (lines[mid].across > across) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
  * Collects a page's text runs as lines. A run starts a new line only when the baseline moves by
  * more than a fraction of the font size, and a blank line when it moves more than 1.5 line spacings
  * (a paragraph gap). Runs on the same line are joined directly when adjacent (Word writes each
  * formatting run separately), with a space after a gap, or with a tab after a wide gap (columns).
  * Where glyph widths are only guessed, a run placed further right on the line counts as a new word.
+ *
+ * Runs are written in drawing order, except on pages whose annotations (filled-in form fields)
+ * draw text: there the runs are also recorded, and placed by position at the end (see positioned()),
+ * so that a field's value lands on its label's line.
  */
 class PdfTextWriter {
-  private readonly parts: string[] = [];
+  private parts: string[] = [];
   length = 0;
   private lastChar = "";
   /** The previous run on the page (when `hasLast`): its line (across), where it starts and ends along it, its direction and size. */
@@ -2617,6 +2691,14 @@ class PdfTextWriter {
   private spacing?: number;
   /** A line break the content asked for explicitly (T* with no leading set). */
   breakLine = false;
+  /** The pieces recorded for placing by position (after record()): their text, and RUN_FIELDS numbers each. */
+  private runTexts?: string[];
+  private runData = new Float64Array(0);
+  /** The annotation the runs being placed belong to (an index into `rects`, four numbers each), or -1 for the page's own content. */
+  private annotation = -1;
+  private readonly rects: number[] = [];
+  /** Whether a recorded run came from an annotation. */
+  private annotated = false;
 
   constructor(readonly limit: number) {}
 
@@ -2630,6 +2712,17 @@ class PdfTextWriter {
     this.lastChar = s[s.length - 1];
   }
 
+  /** Records the runs placed from now on as well (for a page with annotations), so they can be placed by position. */
+  record() {
+    this.runTexts = [];
+  }
+
+  /** The runs placed from now on are drawn by an annotation whose /Rect is (x0, y0)–(x1, y1) on the page. */
+  beginAnnotation(x0: number, y0: number, x1: number, y1: number) {
+    this.annotation = this.rects.length / 4;
+    this.rects.push(x0, y0, x1, y1);
+  }
+
   /**
    * Places `text`, drawn from (x0, y0) to (x1, y1) along the direction (dx, dy) at font size `size`.
    * `exact` says the end point comes from real glyph widths; `moved` that the run was positioned
@@ -2638,8 +2731,65 @@ class PdfTextWriter {
   place(text: string, x0: number, y0: number, x1: number, y1: number, dx: number, dy: number, size: number, exact: boolean, moved: boolean) {
     if (!text) return;
     const along = x0 * dx + y0 * dy;
-    const across = y0 * dx - x0 * dy;
+    const texts = this.runTexts;
+    if (!texts) {
+      this.emit(text, along, along, x1 * dx + y1 * dy, y0 * dx - x0 * dy, dx, dy, size, exact, moved);
+      return;
+    }
+    const gap = along - this.lastAlongEnd;
+    const h = Math.max(size, this.lastSize, 1);
+    const breakLine = this.breakLine;
+    const separator = this.emit(text, along, along, x1 * dx + y1 * dy, y0 * dx - x0 * dy, dx, dy, size, exact, moved);
+    const count = texts.length;
+    // A run that goes on from the last one on its line, after at most a space (nothing could be placed between them), extends its piece.
+    if ((separator === "" || separator === " ") && gap >= -0.5 * h && gap <= 2 * h && count && this.runData[count * RUN_FIELDS - 3] === this.annotation) {
+      const o = (count - 1) * RUN_FIELDS;
+      const data = this.runData;
+      texts[count - 1] += separator + text;
+      data[o + 2] = x1;
+      data[o + 3] = y1;
+      data[o + 6] = Math.max(data[o + 6], size);
+      data[o + 9] = x0;
+      data[o + 10] = y0;
+      return;
+    }
+    if (count >= MAX_POSITIONED_RUNS) {
+      // Too many to sort cheaply: this page stays in drawing order.
+      this.runTexts = undefined;
+      this.runData = new Float64Array(0);
+      return;
+    }
+    let o = count * RUN_FIELDS;
+    if (o === this.runData.length) {
+      const grown = new Float64Array(Math.max(256 * RUN_FIELDS, 2 * o));
+      grown.set(this.runData);
+      this.runData = grown;
+    }
+    const data = this.runData;
+    data[o++] = x0;
+    data[o++] = y0;
+    data[o++] = x1;
+    data[o++] = y1;
+    data[o++] = dx;
+    data[o++] = dy;
+    data[o++] = size;
+    data[o++] = (exact ? EXACT : 0) | (moved ? MOVED : 0) | (breakLine ? BREAK : 0);
+    data[o++] = this.annotation;
+    data[o++] = x0;
+    data[o] = y0;
+    texts.push(text);
+    if (this.annotation >= 0) this.annotated = true;
+  }
+
+  /**
+   * Writes a run (or a piece of runs) that starts at `along`, the last run at `lastAlong`, and ends at
+   * `alongEnd` in its direction (dx, dy), on the line at `across`. Returns what was written before
+   * it: a line break, a tab, a space or nothing, or undefined when it is the first run (after newline()).
+   */
+  private emit(text: string, along: number, lastAlong: number, alongEnd: number, across: number, dx: number, dy: number, size: number, exact: boolean, moved: boolean): string | undefined {
+    let separator: string | undefined;
     if (this.hasLast) {
+      separator = "";
       const h = Math.max(size, this.lastSize, 1);
       const sameDirection = this.lastDx * dx + this.lastDy * dy > 0.99;
       const down = this.lastAcross - across;
@@ -2649,21 +2799,24 @@ class PdfTextWriter {
         if (sameDirection && !blank && down >= 0.8 * h) this.spacing = Math.min(this.spacing ?? down, down);
         if (this.lastChar !== "\n") this.add(blank ? "\n\n" : "\n");
         else if (blank && !this.parts.at(-1)?.endsWith("\n\n")) this.add("\n");
+        separator = "\n";
       } else if (this.lastChar !== "\n" && !isSpaceChar(text.charCodeAt(0)) && !isSpaceChar(this.lastChar.charCodeAt(0))) {
         const gap = along - this.lastAlongEnd;
-        if (gap > 2 * h) this.add("\t");
-        else if (gap > 0.2 * h || gap < -3 * h || (!exact && moved && along > this.lastAlong + 0.5 * h)) this.add(" ");
+        if (gap > 2 * h) separator = "\t";
+        else if (gap > 0.2 * h || gap < -3 * h || (!exact && moved && along > this.lastAlong + 0.5 * h)) separator = " ";
+        if (separator) this.add(separator);
       }
     }
     this.breakLine = false;
     this.add(text);
     this.hasLast = true;
     this.lastAcross = across;
-    this.lastAlong = along;
-    this.lastAlongEnd = x1 * dx + y1 * dy;
+    this.lastAlong = lastAlong;
+    this.lastAlongEnd = alongEnd;
     this.lastDx = dx;
     this.lastDy = dy;
     this.lastSize = size;
+    return separator;
   }
 
   /** Starts a new line (between separately read content, e.g. annotations after the page). */
@@ -2673,7 +2826,117 @@ class PdfTextWriter {
   }
 
   text(): string {
+    if (this.runTexts && this.annotated) {
+      // `length` keeps counting what was read (as `full` did while reading), not the reordered text.
+      const length = this.length;
+      this.positioned();
+      this.length = length;
+    }
     return tidyLines(this.parts.join(""));
+  }
+
+  /**
+   * Writes the recorded pieces again, placed by position: the page's own pieces grouped into lines by
+   * baseline (top first), each annotation's lines joining the page's line at their height (within
+   * 0.4 of the font size; a one-line field also joins the only line whose baseline crosses its
+   * rect) or else making lines of their own, and every line's runs left to right; then the usual
+   * spacing rules apply. The reading direction is the axis most text runs along, so pages turned
+   * with /Rotate (whose text runs up or down the page) read the same way; runs in other directions
+   * follow in drawing order (a limitation: a field drawn upright on such a page comes after its text).
+   * Sorting makes this O(n log n) in the number of pieces (at most MAX_POSITIONED_RUNS).
+   */
+  private positioned() {
+    const texts = this.runTexts!;
+    const data = this.runData;
+    const count = texts.length;
+    const chars = [0, 0, 0, 0];
+    for (let i = 0; i < count; i++) {
+      const axis = axisOf(data[i * RUN_FIELDS + 4], data[i * RUN_FIELDS + 5]);
+      if (axis >= 0) chars[axis] += texts[i].length;
+    }
+    let axis = 0;
+    for (let k = 1; k < 4; k++) if (chars[k] > chars[axis]) axis = k;
+    const fx = axis === 0 ? 1 : axis === 2 ? -1 : 0;
+    const fy = axis === 1 ? 1 : axis === 3 ? -1 : 0;
+    // Each piece's start, its last run's start and its end along the reading direction, its baseline across it, and its size.
+    const along = new Float64Array(count);
+    const lastAlong = new Float64Array(count);
+    const alongEnd = new Float64Array(count);
+    const across = new Float64Array(count);
+    const sizes = new Float64Array(count);
+    const own: number[] = [];
+    const fields: number[] = [];
+    const others: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const o = i * RUN_FIELDS;
+      if (axisOf(data[o + 4], data[o + 5]) !== axis) {
+        others.push(i);
+        continue;
+      }
+      along[i] = data[o] * fx + data[o + 1] * fy;
+      lastAlong[i] = data[o + 9] * fx + data[o + 10] * fy;
+      alongEnd[i] = data[o + 2] * fx + data[o + 3] * fy;
+      across[i] = data[o + 1] * fx - data[o] * fy;
+      sizes[i] = data[o + 6];
+      (data[o + 8] < 0 ? own : fields).push(i);
+    }
+    const lines = groupLines(own, across, sizes);
+    // Annotation runs come one annotation after another: each annotation's lines are matched in turn.
+    const unmatched: number[] = [];
+    const joins: [PositionedLine, number[]][] = [];
+    for (let start = 0; start < fields.length; ) {
+      const annotation = data[fields[start] * RUN_FIELDS + 8];
+      let end = start + 1;
+      while (end < fields.length && data[fields[end] * RUN_FIELDS + 8] === annotation) end++;
+      const fieldLines = groupLines(fields.slice(start, end), across, sizes);
+      start = end;
+      // The rect's extent across the reading direction.
+      const r = annotation * 4;
+      const a1 = this.rects[r + 1] * fx - this.rects[r] * fy;
+      const a2 = this.rects[r + 3] * fx - this.rects[r + 2] * fy;
+      for (const fieldLine of fieldLines) {
+        // The nearest of the page's lines: the first at or below this one, or the one above it.
+        const below = lineAtOrBelow(lines, fieldLine.across);
+        let target: PositionedLine | undefined;
+        for (const k of [below - 1, below]) {
+          const line = lines[k];
+          if (!line || Math.abs(line.across - fieldLine.across) > 0.4 * Math.max(line.size, fieldLine.size)) continue;
+          if (!target || Math.abs(line.across - fieldLine.across) < Math.abs(target.across - fieldLine.across)) target = line;
+        }
+        if (!target && fieldLines.length === 1) {
+          const first = lineAtOrBelow(lines, Math.max(a1, a2));
+          if (first < lines.length && lines[first].across >= Math.min(a1, a2) && !(lines[first + 1]?.across >= Math.min(a1, a2))) target = lines[first];
+        }
+        if (target) joins.push([target, fieldLine.runs]);
+        else unmatched.push(...fieldLine.runs);
+      }
+    }
+    for (const [line, runs] of joins) {
+      for (const i of runs) across[i] = line.across;
+      line.runs.push(...runs);
+    }
+    const all = lines.concat(groupLines(unmatched, across, sizes)).sort((a, b) => b.across - a.across);
+    this.parts = [];
+    this.lastChar = "";
+    this.hasLast = false;
+    this.spacing = undefined;
+    for (const line of all) {
+      const runs = line.runs;
+      sortRuns(runs, along, false);
+      for (let k = 0; k < runs.length; k++) {
+        const i = runs[k];
+        const flags = data[i * RUN_FIELDS + 7];
+        this.breakLine = k === 0 || (flags & BREAK) !== 0;
+        this.emit(texts[i], along[i], lastAlong[i], alongEnd[i], line.across, fx, fy, sizes[i], (flags & EXACT) !== 0, (flags & MOVED) !== 0);
+      }
+    }
+    for (const i of others) {
+      const o = i * RUN_FIELDS;
+      const [x0, y0, x1, y1, dx, dy] = data.subarray(o, o + 6);
+      this.breakLine = (data[o + 7] & BREAK) !== 0;
+      const lastAlong = data[o + 9] * dx + data[o + 10] * dy;
+      this.emit(texts[i], x0 * dx + y0 * dy, lastAlong, x1 * dx + y1 * dy, y0 * dx - x0 * dy, dx, dy, data[o + 6], (data[o + 7] & EXACT) !== 0, (data[o + 7] & MOVED) !== 0);
+    }
   }
 }
 
@@ -3205,7 +3468,11 @@ function pageContent(file: PdfFile, page: PdfPage): string | undefined {
   return parts.join("\n");
 }
 
-/** Text drawn by a page's annotations, such as filled-in form fields (their appearance streams). */
+/**
+ * Text drawn by a page's annotations, such as filled-in form fields (their appearance streams),
+ * each drawn into its /Rect: the appearance's /BBox, transformed by its /Matrix, is fitted to the
+ * rect (PDF 32000-1, 12.5.5). The writer then places it by position, next to the page's text.
+ */
 function readAnnotations(file: PdfFile, page: PdfPage, ctx: ContentContext) {
   const annotations = file.array(page.dict.get("Annots"))?.slice(0, MAX_ANNOTATIONS) ?? [];
   for (const ref of annotations) {
@@ -3222,16 +3489,41 @@ function readAnnotations(file: PdfFile, page: PdfPage, ctx: ContentContext) {
     if (num !== undefined) ctx.formsOnPage.add(num);
     const content = file.decode(appearance, num);
     if (!content) continue;
-    const bbox = file.array(appearance.dict.get("BBox"));
-    const [bx, by] = bbox?.length === 4 && typeof bbox[0] === "number" && typeof bbox[1] === "number" ? [bbox[0], bbox[1]] : [0, 0];
+    const [r0, r1, r2, r3] = rect as number[];
+    const [x0, y0, x1, y1] = [Math.min(r0, r2), Math.min(r1, r3), Math.max(r0, r2), Math.max(r1, r3)];
     const matrix = toMatrix(file.get(appearance.dict.get("Matrix"))) ?? IDENTITY;
-    const [x, y] = [Math.min(rect[0] as number, rect[2] as number), Math.min(rect[1] as number, rect[3] as number)];
     ctx.writer.newline();
+    ctx.writer.beginAnnotation(x0, y0, x1, y1);
     runContent(content, ctx, file.dict(appearance.dict.get("Resources")) ?? page.resources, {
       ...initialState(),
-      ctm: multiply(matrix, [1, 0, 0, 1, x - bx, y - by]),
+      ctm: multiply(matrix, fitToRect(file.array(appearance.dict.get("BBox")), matrix, x0, y0, x1, y1)),
     });
   }
+}
+
+/**
+ * The matrix that fits an appearance's bounding box, transformed by its matrix, to the rect
+ * (x0, y0)–(x1, y1): a scale and a translation. Without a usable box, the box's corner (or the
+ * origin) goes to the rect's lower left corner, unscaled.
+ */
+function fitToRect(bbox: PdfValue[] | undefined, matrix: Matrix, x0: number, y0: number, x1: number, y1: number): Matrix {
+  if (bbox?.length !== 4 || !bbox.every((v) => typeof v === "number")) return [1, 0, 0, 1, x0, y0];
+  const [b0, b1, b2, b3] = bbox as number[];
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [x, y] of [[b0, b1], [b2, b1], [b0, b3], [b2, b3]]) {
+    const tx = x * matrix[0] + y * matrix[2] + matrix[4];
+    const ty = x * matrix[1] + y * matrix[3] + matrix[5];
+    minX = Math.min(minX, tx);
+    minY = Math.min(minY, ty);
+    maxX = Math.max(maxX, tx);
+    maxY = Math.max(maxY, ty);
+  }
+  const sx = maxX > minX && x1 > x0 ? (x1 - x0) / (maxX - minX) : 1;
+  const sy = maxY > minY && y1 > y0 ? (y1 - y0) / (maxY - minY) : 1;
+  return [sx, 0, 0, sy, x0 - minX * sx, y0 - minY * sy];
 }
 
 const pageMarker = (n: number) => `--- Page ${n} ---\n`;
@@ -3286,6 +3578,8 @@ function readPageTree(file: PdfFile, budget: Budget): ReadResult | undefined {
     const marker = multi ? pageMarker(pages.length + 1).length : 0;
     const writer = new PdfTextWriter(Math.max(1, budget.chars - total - marker));
     const ctx: ContentContext = { file, writer, budget, formsOnPage: new Set(), formsActive: new Set(), fonts };
+    // On a page with annotations, the runs are recorded too, so that form field values can be placed next to their labels.
+    if (step.value.dict.has("Annots")) writer.record();
     runContent(content, ctx, step.value.resources, initialState());
     if (!writer.full) readAnnotations(file, step.value, ctx);
     const text = writer.text();

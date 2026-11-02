@@ -165,6 +165,18 @@ export class PdfBuilder {
   }
 
   /**
+   * A form field: a widget annotation over `rect` ([x0 y0 x1 y1] on the page) whose appearance
+   * stream draws `content`, in a box [0 0 width height] of the rect's size unless `bbox` says
+   * otherwise; `matrix` is the appearance's /Matrix. Returns the annotation's object number.
+   */
+  widget(rect: number[], content: string, opts: { bbox?: number[]; matrix?: number[] } = {}): number {
+    const bbox = opts.bbox ?? [0, 0, rect[2] - rect[0], rect[3] - rect[1]];
+    const matrix = opts.matrix ? ` /Matrix [${opts.matrix.join(" ")}]` : "";
+    const appearance = this.add(`/Type /XObject /Subtype /Form /BBox [${bbox.join(" ")}]${matrix} /Filter /FlateDecode`, deflateSync(Buffer.from(`/Tx BMC q ${content} Q EMC`, "latin1")));
+    return this.add(`<< /Type /Annot /Subtype /Widget /FT /Tx /Rect [${rect.join(" ")}] /AP << /N ${refs(appearance)} >> >>`);
+  }
+
+  /**
    * The file. Objects are written in `order` (the others follow by number); objects listed in
    * `packed` go into one compressed object stream; `xrefStream` writes the trailer as a
    * cross-reference stream (as PDFs with object streams do) instead of a "trailer" dictionary.

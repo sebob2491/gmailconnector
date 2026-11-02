@@ -481,14 +481,122 @@ test("PDF lines are rebuilt from text positions (Word writes one text object per
   assert.equal((await readPdf(pdf(["BT /F1 12 Tf 72 700 Td (Hello) Tj 28.3 0 Td (World,) Tj 36 0 Td (again and again.) Tj ET"])))!.text, "Hello World, again and again.");
 });
 
-test("filled-in form fields (annotation appearances) are read after the page", async () => {
+test("filled-in form fields (annotation appearances) are read next to their labels", async () => {
   const b = new PdfBuilder();
   const appearance = b.add("/Type /XObject /Subtype /Form /BBox [0 0 200 20] /Filter /FlateDecode", deflateSync(Buffer.from("/Tx BMC BT /Helv 10 Tf 2 5 Td (Jane Q. Applicant) Tj ET EMC")));
   const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
   const field = b.add(`<< /Type /Annot /Subtype /Widget /Rect [150 690 350 710] /AP << /N ${refs(appearance)} >> >>`);
   const box = b.add(`<< /Type /Annot /Subtype /Widget /Rect [150 670 160 680] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`);
   const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (Applicant name:) Tj ET"))} /Annots [${refs(field, box)}] >>`);
-  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Applicant name:\nJane Q. Applicant");
+  // The value's baseline (695) is 5 below the label's, but the label's baseline is the only one inside the field's rect.
+  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Applicant name: Jane Q. Applicant");
+});
+
+/**
+ * A form: labels drawn by the page at the given baselines, each with a text field right after it
+ * (a rect 18 high, from 5 below the baseline; the value 1 below it), plus a check box; the
+ * annotations listed in another order than the page draws its labels.
+ */
+function formFile(rows: { label: string; x?: number; y: number; value?: string; width?: number }[], extra = "") {
+  const b = new PdfBuilder();
+  const content = [`BT /F1 16 Tf 72 740 Td (Application form) Tj ET`];
+  const fields: number[] = [];
+  for (const { label, x = 72, y, value, width = 150 } of rows) {
+    content.push(`BT /F1 12 Tf ${x} ${y} Td (${label}) Tj ET`);
+    // The default font's guessed widths: 6 points per character at 12 points.
+    const left = x + label.length * 6 + 4;
+    if (value !== undefined) fields.push(b.widget([left, y - 5, left + width, y + 13], `BT /Helv 10 Tf 2 4 Td (${value}) Tj ET`));
+  }
+  const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
+  fields.push(b.add(`<< /Type /Annot /Subtype /Widget /FT /Btn /Rect [200 618 210 628] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`));
+  const page = b.add(`<< /Type /Page /MediaBox [0 0 612 792] /Contents ${refs(b.content(content.join("\n")))} /Annots [${refs(fields.reverse())}]${extra} >>`);
+  return b.build(pageTree(b, [page]));
+}
+
+const FORM = [
+  { label: "Name:", y: 700, value: "Sebastian" },
+  { label: "Date:", y: 680, value: "2024-01-05" },
+  { label: "City:", y: 660, value: "Springfield", width: 120 },
+  { label: "Zip:", x: 300, y: 660, value: "12345", width: 60 },
+  { label: "Subscribe to updates", y: 620 },
+  { label: "Amount due:", y: 600, value: "$120.00" },
+];
+
+test("form field values land on their labels' lines, after the label, in reading order", async () => {
+  // Before, the values followed the page's text, in the order the annotations were listed:
+  // "Application form\n\nName:\nDate:\nCity:\tZip:\n\nSubscribe to updates\nAmount due:\n$120.00\n12345\nSpringfield\n2024-01-05\nSebastian".
+  assert.equal(
+    (await readPdf(formFile(FORM)))!.text,
+    "Application form\n\nName: Sebastian\nDate: 2024-01-05\nCity: Springfield\tZip: 12345\n\nSubscribe to updates\nAmount due: $120.00",
+  );
+  // A field without a label of its own (its own line, at its height), and an empty one.
+  const rows = [...FORM.slice(0, 2), { label: "", y: 660, value: "Second address line" }, { label: "Phone:", y: 580, value: "" }];
+  assert.equal((await readPdf(formFile(rows)))!.text, "Application form\n\nName: Sebastian\nDate: 2024-01-05\nSecond address line\n\nPhone:");
+});
+
+test("form fields between lines, over several lines, and on turned pages", async () => {
+  // A field whose rect lies between two lines (crossing neither baseline) is a line of its own between them.
+  {
+    const b = new PdfBuilder();
+    const field = b.widget([150, 676, 400, 696], "BT /Helv 10 Tf 2 5 Td (In between) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (The line above) Tj 0 -28 Td (The line below) Tj ET"))} /Annots [${refs(field)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "The line above\nIn between\nThe line below");
+  }
+  // A multi-line text field: its first line joins the label's, the others follow, before the next label.
+  {
+    const b = new PdfBuilder();
+    const field = b.widget([140, 450, 400, 510], "BT /Helv 10 Tf 12 TL 2 49 Td (First line of the comment) Tj T* (the second line) Tj T* (and the third.) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 500 Td (Comments:) Tj 0 -70 Td (Signature:) Tj ET"))} /Annots [${refs(field)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Comments: First line of the comment\nthe second line\nand the third.\n\nSignature:");
+  }
+  // A page turned with /Rotate 90 whose text runs up the page (drawn rotated), and fields whose appearances are rotated
+  // by their /Matrix: read as the upright page.
+  {
+    const b = new PdfBuilder();
+    // Text space (x, y) is page space (612 - y, x).
+    const content = "q 0 1 -1 0 612 0 cm BT /F1 12 Tf 72 500 Td (Name:) Tj 0 -20 Td (Date:) Tj ET Q";
+    const rotated = { bbox: [0, 0, 150, 18], matrix: [0, 1, -1, 0, 0, 0] };
+    const name = b.widget([612 - 513, 106, 612 - 495, 256], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET", rotated);
+    const date = b.widget([612 - 493, 106, 612 - 475, 256], "BT /Helv 10 Tf 2 4 Td (2024-01-05) Tj ET", rotated);
+    const page = b.add(`<< /Type /Page /MediaBox [0 0 612 792] /Rotate 90 /Contents ${refs(b.content(content))} /Annots [${refs(date, name)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Name: Sebastian\nDate: 2024-01-05");
+  }
+});
+
+test("pages whose annotations draw no text keep their drawing order", async () => {
+  // Lines drawn bottom first, with a link and a check box: as before, in drawing order (not sorted by position).
+  const b = new PdfBuilder();
+  const content = "BT /F1 12 Tf 72 600 Td (Drawn first, at the bottom.) Tj 0 100 Td (Drawn second, at the top.) Tj ET";
+  const link = b.add("<< /Type /Annot /Subtype /Link /Rect [72 595 300 615] /A << /S /URI /URI (https://example.com) >> >>");
+  const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
+  const box = b.add(`<< /Type /Annot /Subtype /Widget /Rect [50 600 60 610] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`);
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content(content))} /Annots [${refs(link, box)}] >>`);
+  const expected = "Drawn first, at the bottom.\n\nDrawn second, at the top.";
+  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, expected);
+  assert.equal((await readPdf(pdf([content])))!.text, expected);
+  // Past 20,000 pieces to place (runs, or runs that follow each other), a page with a filled-in field is read in drawing order:
+  // the value after the page.
+  const c = new PdfBuilder();
+  const field = c.widget([150, 695, 350, 713], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET");
+  const many = c.add(`<< /Type /Page /Contents ${refs(c.content(`BT /F1 12 Tf 72 700 Td (Name:) Tj ET BT /F1 12 Tf 72 500 Td ${"(x) Tj 40 0 Td ".repeat(20_000)}ET`))} /Annots [${refs(field)}] >>`);
+  assert.equal((await readPdf(c.build(pageTree(c, [many])), { maxChars: 0 }))!.text, `Name:\n\n${Array(20_000).fill("x").join("\t")}\nSebastian`);
+});
+
+test("placing form fields by position stays cheap: 480 fields, and the most runs sorted", async () => {
+  // 480 fields in columns of 60, and a check box (of the 500 annotations read per page): the count is bounded, so is the cost.
+  const file = formFile(Array.from({ length: 480 }, (_, i) => ({ label: `F${i}:`, y: 710 - (i % 60) * 11, x: 20 + Math.floor(i / 60) * 72, value: `v${i}`, width: 30 })));
+  const r = await assertCpu("480 form fields", () => readPdf(file, { maxChars: 0 }), 1000);
+  assert.match(r.value!.text, /^Application form\n\nF0: v0\tF60: v60\t[^\n]* F420: v420\nF1: v1\tF61: v61\t/);
+  // About 10,000 and 20,000 runs far apart (each a piece of its own: 20,000 is the most placed by position) on a page with a field.
+  const { large: runs } = await assertLinear("runs with a field", (n) => {
+    const c = new PdfBuilder();
+    const field = c.widget([150, 695, 350, 713], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET");
+    const lines = Array.from({ length: n / 10 }, (_, i) => `1 0 0 1 72 ${690 - (i % 60) * 10} Tm ${"(ab) Tj 40 0 Td ".repeat(10)}`).join("\n");
+    const page = c.add(`<< /Type /Page /Contents ${refs(c.content(`BT /F1 12 Tf 72 700 Td (Name:) Tj ${lines} ET`))} /Annots [${refs(field)}] >>`);
+    const file = c.build(pageTree(c, [page]));
+    return () => readPdf(file, { maxChars: 0 });
+  }, 9_990, 300);
+  assert.match(runs.value!.text, /^Name:\tSebastian\n(ab)+\t(ab)+\t/);
 });
 
 test("PDFs whose page tree can't be used are read in file order", async () => {

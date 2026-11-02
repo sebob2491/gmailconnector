@@ -44,9 +44,9 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   text (when the PDF has a text layer: standard fonts, or embedded fonts with ToUnicode maps),
   otherwise as the PDF file itself for clients that read PDFs. PDF text comes in page order with
   "--- Page N ---" markers, with lines rebuilt from where the text sits on the page (so Word-made
-  PDFs don't break mid-sentence) and filled-in form fields included. Spreadsheets keep empty cells in
-  place and show dates as dates; Word tables come out row by row. Text files are decoded in their own
-  character set. Very large files (and booby-trapped ones) are read only as far as needed, with a
+  PDFs don't break mid-sentence) and filled-in form fields on their labels' lines. Spreadsheets keep
+  empty cells in place and show dates as dates; Word tables come out row by row. Text files are
+  decoded in their own character set. Very large files (and booby-trapped ones) are read only as far as needed, with a
   note saying what was left out. Emails list their attachments with file name, type, size and a stable
   `partId`, which is what `get_attachment` takes (Gmail's attachment IDs, often hundreds of characters
   long, are left out of results).
