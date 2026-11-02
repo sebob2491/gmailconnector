@@ -218,10 +218,66 @@ namespace**, name the binding `OAUTH_KV`, pick that namespace, and redeploy.
 
 ## Setup: local, for Claude Desktop or Claude Code
 
+### Claude Desktop (one click)
+
+1. Download **`gmail-multi-mcp.mcpb`** from the
+   [latest release](https://github.com/sebob2491/gmailconnector/releases/latest).
+2. Double-click it (or drag it into Claude Desktop, or use **Settings → Extensions → Advanced
+   settings → Install Extension…**) and click **Install**.
+3. In a chat, say **"link my Gmail"**. Google's sign-in page opens in your browser: pick the
+   account and allow Gmail access. Claude replies with the address it linked. Say it again for each
+   other account ("link my work Gmail as work").
+
+That's all: no terminal, no Google Cloud project, no config file. Claude Desktop ships its own
+Node.js, so nothing else needs installing. Ask Claude to "unlink my work account" or "call
+me@gmail.com home" to remove or rename accounts (`unlink_account`, `set_account_nickname`).
+
+Things to know:
+
+- **"Google hasn't verified this app."** The release's built-in sign-in client belongs to the
+  maintainer's own, unverified Google project. Click **Advanced → Go to … (unsafe)** to continue.
+  Google lets an unverified app sign in at most **100 users, ever**, so the built-in client is meant
+  for the maintainer, family and friends. Please don't publish the `.mcpb` file more widely; anyone
+  else should use their own client (next point).
+- **Your own Google client.** In **Settings → Extensions → Gmail (multiple accounts) → Configure**,
+  fill in **Your own Google client ID** and **secret** (create them as in
+  [step 1 of the manual setup](#1-create-a-google-oauth-client-one-time-about-5-minutes)). The
+  extension then signs in with your project instead. Accounts linked with the other client have to
+  be linked again afterwards (refresh tokens belong to the client that issued them). Which client
+  is used, in order: these settings → `credentials.json` / `GOOGLE_CLIENT_ID` from the manual setup →
+  the built-in client. A release built without a built-in client says so in its release notes, and
+  Claude tells you to fill in these settings when you try to link an account.
+- If the browser can't be opened, Claude shows you the sign-in link instead. Sign-in links expire
+  after 3 minutes; just ask again.
+- The extension and the manual setup share the same files (see
+  [Where things are stored](#where-things-are-stored)), so accounts linked one way also show up in
+  the other.
+
+#### For the maintainer: publishing a release
+
+1. In your Google Cloud project (with the **Gmail API** enabled and the consent screen set up as in
+   [step 1 below](#1-create-a-google-oauth-client-one-time-about-5-minutes), published **In
+   production** so tokens don't expire after 7 days), create a client: **Google Auth Platform →
+   Clients → Create client** (or **APIs & Services → Credentials → Create credentials → OAuth
+   client ID**), application type **Desktop app**. Google documents that a desktop app's client
+   secret can't be kept confidential, so shipping it inside the extension is expected; the limits
+   above are what keep it personal.
+2. In this GitHub repository, add two secrets under **Settings → Secrets and variables → Actions**:
+   `GMAIL_MCP_DESKTOP_CLIENT_ID` and `GMAIL_MCP_DESKTOP_CLIENT_SECRET`.
+3. Push a tag: `git tag v0.1.0 && git push origin v0.1.0` (or run the **Release desktop extension**
+   workflow by hand). The workflow builds `gmail-multi-mcp.mcpb` with the client inside it and
+   attaches it to a GitHub Release named after the tag; the tag also sets the extension's version.
+
+To build the bundle yourself: `npm run pack:desktop` writes `dist-desktop/gmail-multi-mcp.mcpb`
+(set the two variables above to include a built-in client; they end up in the bundle's
+`server/google-client.json`, never in the repository).
+
+### Manual setup (Claude Desktop or Claude Code)
+
 You need Node.js 22 or newer. Setup has three parts: create a Google OAuth client (once), link each
 Gmail account (once per account), and add the server to Claude.
 
-### 1. Create a Google OAuth client (one time, about 5 minutes)
+#### 1. Create a Google OAuth client (one time, about 5 minutes)
 
 Every Gmail account you link uses this one client.
 
@@ -246,7 +302,7 @@ Every Gmail account you link uses this one client.
 > with "access blocked", ask your admin to allow the app's client ID. If your Cloud project is inside
 > that Workspace org, you can use user type **Internal** instead.
 
-### 2. Install and link your accounts
+#### 2. Install and link your accounts
 
 ```bash
 git clone https://github.com/sebob2491/gmailconnector
@@ -273,7 +329,7 @@ node dist/src/index.js accounts remove work            # unlinks and revokes the
 
 (Run `npm link` once if you'd rather type `gmail-multi-mcp` instead of `node dist/src/index.js`.)
 
-### 3. Add it to Claude
+#### 3. Add it to Claude
 
 **Claude Desktop:** edit `claude_desktop_config.json`, found under
 *Settings → Developer → Edit Config*. On macOS it's at `~/Library/Application Support/Claude/`,
@@ -298,7 +354,9 @@ Then restart Claude Desktop.
 claude mcp add --scope user gmail-multi -- node /ABSOLUTE/PATH/TO/gmailconnector/dist/src/index.js
 ```
 
-You can link more accounts at any time. The server picks them up without a restart.
+You can link more accounts at any time, with `accounts add` or by asking Claude to "link my Gmail"
+(the `link_account` tool works here too, with your own client). The server picks them up without a
+restart.
 
 ## Where things are stored
 
