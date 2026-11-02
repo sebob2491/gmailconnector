@@ -144,6 +144,30 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   it checks that you asked for exactly that (attachment text comes back under a line naming the file it
   is from).
 
+## Activity log and undo
+
+The connector keeps a log of what Claude changed in your mail: emails sent, replied to or forwarded,
+drafts, bulk and label changes, trash and spam, filters, labels and unsubscribes (searches and reads
+aren't logged). Each entry has the time, the account, a one-line summary (e.g. *Archived 312 emails
+matching category:promotions older_than:30d*, *Created filter: from:linkedin.com → archive*) and
+whether it failed. Recipients, subjects and searches are kept, cut to about 200 characters; email
+bodies, attachments and tokens never are. The latest 100 entries are kept.
+
+- Ask Claude *"what did you do in my email today?"*: the `recent_activity` tool reads the log.
+- Ask Claude to **undo** a change: `undo_last_change` reverses archiving, read/unread, stars, labels,
+  trash and spam (from `bulk_update`, `bulk_trash` and the single-email tools), exactly as they
+  happened: an email that was already out of the inbox isn't put back in it. Claude tells you which
+  change it will undo first. Up to 2,000 emails per change are recorded (a bigger change is undone
+  for those only), and the oldest big changes give up their undo data first when the log reaches
+  its size limit (128 KB). Sent mail, unsubscribes, filters, labels and drafts can't be undone this
+  way; Claude says how to reverse them by hand (e.g. delete the filter). Gmail empties Trash and
+  Spam after 30 days, so undoing an older trash change may not bring everything back.
+- Hosted: the accounts page shows the last 20 entries (times in UTC) under **Recent activity**,
+  with **Clear activity**. The log is one KV entry, so each logged action (and each undo) costs one
+  KV write: a busy day of 50 changes is 50 of the free plan's 1,000 writes a day. Reading the log
+  (Claude or the accounts page) writes nothing.
+- Local: the log is `activity.json` next to `accounts.json` (owner-only permissions).
+
 ## Setup: hosted, for claude.ai on the web and phone
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sebob2491/gmailconnector)
@@ -466,7 +490,7 @@ restart.
 **Hosted:** linked accounts and their Google refresh tokens live in the Worker's KV namespace in
 your Cloudflare account. The refresh tokens are useless without `GOOGLE_CLIENT_SECRET`, which is
 stored as an encrypted Worker secret. Claude's own tokens for the connector are stored only as
-hashes.
+hashes. The [activity log](#activity-log-and-undo) is one more KV entry (`gmail:history`).
 
 **Local:**
 
@@ -474,6 +498,7 @@ hashes.
   The file is created with owner-only permissions (0600). Anyone who can read it can read and send
   your mail, so treat it like a password. Set `GMAIL_MCP_CONFIG_DIR` to use another folder.
 - `~/.config/gmail-multi-mcp/credentials.json` holds your OAuth client.
+- `~/.config/gmail-multi-mcp/activity.json` holds the [activity log](#activity-log-and-undo) (0600).
 
 The scopes requested are `gmail.modify` (read, compose, send, label and trash) and
 `gmail.settings.basic` (filters; optional: an account linked without it works, except for creating
