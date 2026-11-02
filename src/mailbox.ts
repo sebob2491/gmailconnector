@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { sameMailbox } from "./accounts.js";
+import { canonicalAddress, sameMailbox } from "./accounts.js";
 import { GmailApiError, GmailClient, type BatchResult } from "./gmailClient.js";
 import { AuthError } from "./google.js";
 import {
@@ -467,6 +467,91 @@ function changeFilter(add: ApiLabel[], remove: ApiLabel[], includeSpamTrash: boo
   return { q: terms.length === 1 ? terms[0] : `(${terms.join(" OR ")})` };
 }
 
+// ---------- contacts ----------
+
+/** Headers find_contact reads. */
+const CONTACT_HEADERS = ["From", "To", "Cc", "Date"];
+/** Recipients find_contact looks at per email (a mass mailing's thousands would only cost CPU time). */
+const CONTACT_RECIPIENTS = 50;
+/** How much of an address header find_contact parses: the start, cut at a comma (50 addresses or more). */
+const CONTACT_HEADER_CHARS = 4 * 1024;
+
+function contactHeader(msg: ApiMessage, name: string): string | undefined {
+  const value = header(msg.payload, name);
+  if (!value || value.length <= CONTACT_HEADER_CHARS) return value;
+  const comma = value.lastIndexOf(",", CONTACT_HEADER_CHARS);
+  return value.slice(0, comma > 0 ? comma : CONTACT_HEADER_CHARS);
+}
+
+/** Text for matching a query: lower case, without accents ("Angélica" matches "angelica"). */
+export function foldText(text: string): string {
+  return text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+}
+
+/**
+ * A find_contact query made safe to quote word by word in a Gmail search: a double quote can't be
+ * escaped inside quotes, so quotes, backslashes and control characters become spaces. Empty if nothing is left.
+ */
+export function contactPhrase(query: string): string {
+  return query
+    .replace(/[\u0000-\u001f\u007f"\\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** One address as seen in the emails find_contact scanned, in one account or merged across accounts. */
+export interface ContactTally {
+  /** The address as most recently written. */
+  address: string;
+  /** The display name most recently given with it, and when. */
+  name?: string;
+  nameTime: number;
+  /** Every display name seen with it (up to 5), for matching the query. */
+  names: string[];
+  /** The newest email it was on (ms). */
+  time: number;
+  /** On emails the user sent, and on emails the user received. */
+  sent: boolean;
+  received: boolean;
+  messages: number;
+  accounts: string[];
+}
+
+/** Adds one sighting (or another account's tally) of an address to `tallies`, keyed by canonical address. */
+export function addContact(tallies: Map<string, ContactTally>, t: ContactTally): void {
+  const key = canonicalAddress(t.address);
+  const known = tallies.get(key);
+  if (!known) {
+    tallies.set(key, { ...t, names: [...t.names], accounts: [...t.accounts] });
+    return;
+  }
+  if (t.time > known.time) {
+    known.time = t.time;
+    known.address = t.address;
+  }
+  if (t.name && t.nameTime >= known.nameTime) {
+    known.name = t.name;
+    known.nameTime = t.nameTime;
+  }
+  for (const n of t.names) if (known.names.length < 5 && !known.names.includes(n)) known.names.push(n);
+  for (const a of t.accounts) if (!known.accounts.includes(a)) known.accounts.push(a);
+  known.sent ||= t.sent;
+  known.received ||= t.received;
+  known.messages += t.messages;
+}
+
+/** True when every word of the query is in one of the address's names or in the address (accents ignored). */
+export function contactMatches(t: ContactTally, words: string[]): boolean {
+  const address = foldText(t.address);
+  return [...t.names.map(foldText), address].some((text) => words.every((w) => text.includes(w) || address.includes(w)));
+}
+
+/** Most recent first (by day), then most emails, then the exact time. */
+export function rankContacts(a: ContactTally, b: ContactTally): number {
+  const day = (t: number) => Math.floor(t / 86_400_000);
+  return day(b.time) - day(a.time) || b.messages - a.messages || b.time - a.time;
+}
+
 // ---------- unsubscribing ----------
 
 /** Headers a sender scan needs (defined here rather than in format.ts, which other tools share). */
@@ -901,7 +986,7 @@ export class Mailbox {
   }
 
   /** The addresses known to be the user's without asking Gmail: the primary, plus any cached send-as ones. */
-  private ownAddresses(): string[] {
+  ownAddresses(): string[] {
     return [this.email, ...(this.cachedSendAs() ?? []).map((e) => e.sendAsEmail)];
   }
 
@@ -1753,6 +1838,58 @@ export class Mailbox {
       } else failed.push({ id: ids[i], error: r.error.message });
     });
     return { changed, failed, ...(notFound ? { notFound } : {}) };
+  }
+
+  // ---------- contacts ----------
+
+  /**
+   * Who appears on the newest emails (up to `limit`, drafts left out) sent to, from or copying someone
+   * matching every word of `phrase` (see contactPhrase): every address in From, To and Cc but the user's own, with
+   * how many of those emails it was on, the newest, and whether the user sent or received them. Three
+   * Gmail calls at most for 100 emails: the search and two metadata batches.
+   */
+  async scanContacts(phrase: string, limit: number) {
+    // Each word quoted, so the words match in any order ("Ruiz, Angelica") and none is read as an operator.
+    const words = phrase
+      .split(" ")
+      .map((w) => `"${w}"`)
+      .join(" ");
+    const q = `(from:(${words}) OR to:(${words}) OR cc:(${words})) -in:draft`;
+    const page = await this.client.request("GET", "messages", { query: { q, maxResults: limit } });
+    const ids = ((page.messages ?? []) as { id: string }[]).map((m) => m.id).slice(0, limit);
+    const fetched = await this.client.batchGet<ApiMessage>(
+      ids.map((id) => ({ path: `messages/${id}`, query: { format: "metadata", metadataHeaders: CONTACT_HEADERS } })),
+    );
+    const { found, failed } = settle(ids, fetched);
+    const tallies = new Map<string, ContactTally>();
+    const own = new Set(this.ownAddresses().map(canonicalAddress));
+    for (const { value: msg } of found) {
+      if (msg.labelIds?.includes("DRAFT")) continue;
+      const from = parseMailboxes(contactHeader(msg, "From"))[0];
+      const sent = Boolean(msg.labelIds?.includes("SENT")) || (from !== undefined && own.has(canonicalAddress(from.address)));
+      const internal = Number(msg.internalDate);
+      const time = msg.internalDate && Number.isFinite(internal) ? internal : Date.parse(header(msg.payload, "Date") ?? "") || 0;
+      const onThis = new Set<string>();
+      const recipients = [...parseMailboxes(contactHeader(msg, "To")), ...parseMailboxes(contactHeader(msg, "Cc"))].slice(0, CONTACT_RECIPIENTS);
+      for (const person of from ? [from, ...recipients] : recipients) {
+        const key = canonicalAddress(person.address);
+        if (onThis.has(key) || own.has(key) || !isValidAddress(person.address)) continue;
+        onThis.add(key);
+        const name = person.name && !sameMailbox(person.name, person.address) ? person.name.slice(0, 200) : undefined;
+        addContact(tallies, {
+          address: person.address,
+          ...(name ? { name } : {}),
+          nameTime: name ? time : -1,
+          names: name ? [name] : [],
+          time,
+          sent,
+          received: !sent,
+          messages: 1,
+          accounts: [this.email],
+        });
+      }
+    }
+    return { tallies, ...(failed.length ? { unavailable: failed.map((f) => f.id) } : {}) };
   }
 
   // ---------- filters ----------

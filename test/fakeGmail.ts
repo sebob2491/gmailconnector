@@ -476,7 +476,7 @@ export class FakeGmail {
   };
 
   /**
-   * A small subset of Gmail search: category:, from:, to:, subject:, is:, in:, label: (quoted names
+   * A small subset of Gmail search: category:, from:, to:, cc:, subject:, is:, in:, label: (quoted names
    * too), "-" to negate, ( ) and OR, which as in Gmail binds tighter than the implicit AND. Other
    * terms match all. Thread and draft lists honour it too, so query behaviour is testable.
    */
@@ -490,14 +490,23 @@ export class FakeGmail {
       const colon = body.indexOf(":");
       if (colon < 0) return true;
       const key = body.slice(0, colon).toLowerCase();
-      const value = body.slice(colon + 1).replace(/^"(.*)"$/, "$1").replace(/^\((.*)\)$/, "$1");
+      const value = body.slice(colon + 1).replace(/^\((.*)\)$/, "$1").replace(/^"(.*)"$/, "$1");
+      // Address headers are matched like Gmail does: case and accents ignored.
+      const fold = (text: string) => text.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase();
+      // from:("a" "b") needs both words, in any order.
+      const words = (body.slice(colon + 1).replace(/^\((.*)\)$/, "$1").match(/"[^"]*"|[^\s"]+/g) ?? []).map((w) => fold(w.replace(/^"(.*)"$/, "$1")));
+      const inHeader = (name: string) => {
+        const text = fold(msg.payload?.headers?.find((h) => h.name === name)?.value ?? "");
+        return words.every((w) => text.includes(w));
+      };
       let hit: boolean;
       if (key === "category") hit = labels.includes(`CATEGORY_${value.toLowerCase() === "primary" ? "PERSONAL" : value.toUpperCase()}`);
-      else if (key === "from") hit = (msg.payload?.headers?.find((h) => h.name === "From")?.value ?? "").toLowerCase().includes(value.toLowerCase());
+      else if (key === "from") hit = inHeader("From");
       else if (key === "is") hit = labels.includes(value.toUpperCase());
       else if (key === "in") hit = value === "anywhere" || labels.includes(value.toUpperCase());
       else if (key === "subject") hit = (msg.payload?.headers?.find((h) => h.name === "Subject")?.value ?? "").toLowerCase().includes(value.toLowerCase());
-      else if (key === "to") hit = (msg.payload?.headers?.find((h) => h.name === "To")?.value ?? "").toLowerCase().includes(value.toLowerCase());
+      else if (key === "to") hit = inHeader("To");
+      else if (key === "cc") hit = inHeader("Cc");
       else if (key === "label") hit = labels.some((l) => l === value || mb.labels.find((x) => x.id === l)?.name.toLowerCase() === value.toLowerCase());
       else return true;
       return hit !== negate;

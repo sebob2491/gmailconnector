@@ -184,6 +184,7 @@ describe("tool catalogue", () => {
       "delete_draft",
       "delete_filter",
       "delete_label",
+      "find_contact",
       "forward",
       "get_attachment",
       "get_draft",
@@ -3029,6 +3030,111 @@ describe("smaller results", () => {
     assert.deepEqual(res.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED"] });
     const trashed = await call("move_to", { account: "work", threadIds: ["wt1"], destination: "trash" });
     assert.deepEqual(trashed.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED", "TRASH"] });
+  });
+});
+
+describe("find_contact", () => {
+  /** Sets when an email arrived. */
+  const at = (msg: { internalDate?: string }, iso: string) => {
+    msg.internalDate = String(Date.parse(iso));
+  };
+
+  test("finds a person across accounts, accents and Gmail spellings aside, with each of their addresses", async () => {
+    const { call, fake, personal, work } = await setup();
+    at(fake.deliver(personal, crlf(["From: Angélica Ruiz <angelica.ruiz@gmail.com>", `To: ${PERSONAL}`, "Subject: Hi", "", "x"])), "2026-06-01T10:00:00Z");
+    at(
+      fake.deliver(
+        personal,
+        crlf([`From: ${PERSONAL}`, "To: Angelica Ruiz <AngelicaRuiz@gmail.com>", 'Cc: "Ruiz, Angélica" <angelica@studio.example>, Dana <dana@x.example>', "Subject: Re: Hi", "", "x"]),
+        { labelIds: ["SENT"] },
+      ),
+      "2026-07-01T10:00:00Z",
+    );
+    at(fake.deliver(work, crlf(["From: Boss <boss@work.example>", `To: ${WORK}`, "Cc: Angie <angelica.ruiz+work@googlemail.com>", "Subject: Intro", "", "x"])), "2026-05-01T10:00:00Z");
+    const before = fake.outboundCalls;
+    const batches = fake.batchCalls;
+    const res = await call("find_contact", { query: "ANGELICA" });
+    assert.equal(res.isError, false, res.text);
+    assert.deepEqual(res.json, {
+      contacts: [
+        { name: "Angelica Ruiz", address: "AngelicaRuiz@gmail.com", accounts: [PERSONAL, WORK], lastContact: "2026-07-01T10:00:00Z", direction: "both", messages: 3 },
+        { name: "Ruiz, Angélica", address: "angelica@studio.example", accounts: [PERSONAL], lastContact: "2026-07-01T10:00:00Z", direction: "sent", messages: 1 },
+      ],
+    });
+    // Per account: an access token, the search and one metadata batch.
+    assert.equal(fake.outboundCalls - before, 6);
+    assert.equal(fake.batchCalls - batches, 2);
+    const search = fake.requests.find((r) => r.path === "messages" && r.method === "GET")!;
+    assert.equal(search.query.get("q"), '(from:("ANGELICA") OR to:("ANGELICA") OR cc:("ANGELICA")) -in:draft');
+    assert.equal(search.query.get("maxResults"), "100");
+    assert.equal(fake.batchItems.filter((i) => i.startsWith("GET messages/")).length, 3, "the 3 matching emails' headers");
+
+    // Several words match in any order.
+    const reversed = await call("find_contact", { query: "ruiz angelica", account: "personal" });
+    assert.deepEqual(reversed.json.contacts.map((c: any) => c.address), ["AngelicaRuiz@gmail.com", "angelica@studio.example"]);
+
+    // An accented query finds the unaccented name too, and one account can be chosen.
+    const accented = await call("find_contact", { query: "angélica ruiz", account: "work" });
+    assert.deepEqual(accented.json.contacts, [
+      { name: "Angie", address: "angelica.ruiz+work@googlemail.com", accounts: [WORK], lastContact: "2026-05-01T10:00:00Z", direction: "received", messages: 1 },
+    ]);
+  });
+
+  test("someone only in Cc is found; the user's own addresses (send-as ones once known) are not", async () => {
+    const { call, fake, personal, work } = await setup();
+    const carol = await call("find_contact", { query: "carol" });
+    assert.deepEqual(carol.json.contacts.map(({ lastContact, ...c }: any) => c), [
+      { address: "carol@example.com", accounts: [PERSONAL], direction: "received", messages: 1 },
+    ]);
+
+    personal.sendAs = [{ sendAsEmail: PERSONAL, isPrimary: true, isDefault: true }, { sendAsEmail: "me@alias.example" }];
+    fake.deliver(work, crlf([`From: Me <me@alias.example>`, `To: ${WORK}`, "Cc: Me Too <me.personal+news@gmail.com>, Mel <mel@x.example>", "Subject: Note", "", "x"]));
+    fake.deliver(personal, crlf([`From: ${WORK}`, `To: ${PERSONAL}`, "Subject: From work", "", "x"]));
+    const names = async () => (await call("find_contact", { query: "me" })).json.contacts.map((c: any) => c.address).sort();
+    assert.deepEqual(await names(), ["me@alias.example", "mel@x.example"], "the send-as address isn't known yet");
+    await call("list_accounts"); // reads (and caches) each account's send-as addresses
+    assert.deepEqual(await names(), ["mel@x.example"]);
+  });
+
+  test("scans the newest 100 emails per account: a search and two metadata batches", async () => {
+    const { call, fake, work } = await setup();
+    for (let i = 0; i < 120; i++) fake.deliver(work, crlf(["From: Zed <zed@z.example>", `To: ${WORK}`, `Subject: ${i}`, "", "x"]));
+    await call("list_labels", { account: "work" }); // gets the access token first
+    const [calls, batches] = [fake.outboundCalls, fake.batchCalls];
+    const res = await call("find_contact", { query: "zed", account: "work" });
+    assert.equal(res.json.contacts[0].messages, 100);
+    assert.equal(fake.outboundCalls - calls, 3);
+    assert.equal(fake.batchCalls - batches, 2);
+  });
+
+  test("ranks by the day of the last email, then by how many; quotes in the query can't change the search", async () => {
+    const { call, fake, work } = await setup();
+    const mail = (from: string, iso: string) => at(fake.deliver(work, crlf([`From: ${from}`, `To: ${WORK}`, "Subject: s", "", "x"])), iso);
+    mail("Sam Lee <sam@lee.example>", "2026-10-01T09:00:00Z");
+    mail("Sam Lee <sam@lee.example>", "2026-10-02T08:00:00Z");
+    mail("Samira Lee <samira@lee.example>", "2026-10-02T18:00:00Z");
+    mail("Samuel Lee <samuel@lee.example>", "2026-09-01T09:00:00Z");
+    mail("Samuel Lee <samuel@lee.example>", "2026-09-02T09:00:00Z");
+    mail("Samuel Lee <samuel@lee.example>", "2026-09-03T09:00:00Z");
+    const res = await call("find_contact", { query: "sam", account: "work" });
+    assert.deepEqual(res.json.contacts.map((c: any) => [c.address, c.messages]), [
+      ["sam@lee.example", 2],
+      ["samira@lee.example", 1],
+      ["samuel@lee.example", 3],
+    ]);
+    const limited = await call("find_contact", { query: "lee.example", account: "work", limit: 1 });
+    assert.deepEqual(limited.json.contacts.map((c: any) => c.address), ["sam@lee.example"]);
+
+    const sneaky = await call("find_contact", { query: 'sam") OR in:anywhere ("', account: "work" });
+    assert.equal(sneaky.isError, false, sneaky.text);
+    const q = fake.requests.filter((r) => r.path === "messages").at(-1)!.query.get("q")!;
+    const words = '"sam" ")" "OR" "in:anywhere" "("';
+    assert.equal(q, `(from:(${words}) OR to:(${words}) OR cc:(${words})) -in:draft`);
+    assert.deepEqual(sneaky.json.contacts, []);
+    assert.match(sneaky.json.note, /^No one matching/);
+
+    assert.match((await call("find_contact", { query: '""' })).text, /`query` needs a name or part of an address/);
+    assert.equal((await call("find_contact", { query: "sam", limit: 26 })).isError, true);
   });
 });
 

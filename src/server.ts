@@ -3,14 +3,20 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema, type CallToolResult, type ListToolsResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { jsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/types.js";
-import { AccountError, describeAccount, findAccount, sameEmail, type AccountSource, type LinkedAccount } from "./accounts.js";
+import { AccountError, canonicalAddress, describeAccount, findAccount, sameEmail, type AccountSource, type LinkedAccount } from "./accounts.js";
 import { GmailApiError, GmailClient, TokenProvider } from "./gmailClient.js";
 import { AuthError, defaultFetch, GMAIL_SETTINGS_SCOPE, type FetchLike } from "./google.js";
 import { attachmentResult, FileTooLargeError, kindOf, readOffice, readPdf, readTextFile, sniffType, type ReadResult } from "./attachments.js";
-import { attachmentCharset, DEFAULT_MAX_BODY_CHARS, limitLength, viewUrl } from "./format.js";
+import { attachmentCharset, DEFAULT_MAX_BODY_CHARS, isoTime, limitLength, viewUrl } from "./format.js";
 import {
+  addContact,
+  contactMatches,
+  contactPhrase,
+  foldText,
   isPrivateAddress,
   Mailbox,
+  rankContacts,
+  type ContactTally,
   mapLimit,
   registrableDomain,
   unsafeUnsubscribeHost,
@@ -35,7 +41,7 @@ const INSTRUCTIONS = `This server connects several Gmail accounts at once.
 - Message, thread, draft, label and filter IDs belong to one account. When you act on an ID, pass the same \`account\` that returned it.
 - change_labels (labels, read/unread, archive, star) and move_to (Trash, Spam, inbox) act on message or thread IDs; bulk_update and bulk_trash on many emails chosen by a search.
 - send_message, reply and forward require \`account\` whenever more than one account is linked. If the user has not said which address to send from, ask them.
-- Recipient lists (to, cc, bcc) take addresses, plain or with a name: "Ann Lee <ann@example.com>". \`body\` is plain text: don't format it with Markdown; use \`htmlBody\` for rich text (\`body\` is then the plain-text alternative). Attachments are base64 \`content\` with a \`filename\`, 25 MB in all.
+- Recipient lists (to, cc, bcc) take addresses, plain or with a name: "Ann Lee <ann@example.com>"; find_contact turns a name the user gives into an address. \`body\` is plain text: don't format it with Markdown; use \`htmlBody\` for rich text (\`body\` is then the plain-text alternative). Attachments are base64 \`content\` with a \`filename\`, 25 MB in all.
 - messageFormat (get_message, get_thread, get_draft): PLAIN_TEXT (default) gives the plain-text body (HTML converted to text; get_message and get_thread cut links over 200 characters to their website) and attachment info; MINIMAL gives headers and snippet, no body; FULL_CONTENT adds the HTML body and keeps full links; METADATA_ONLY gives senders, recipients, date and flags; RAW gives the MIME source, with Gmail's \`labelIds\`. Bodies longer than maxBodyChars (default 20000; 0: no limit) are shortened, with a note.
 - Results are compact JSON. Emails show \`from\`, \`to\`, \`cc\`, \`date\` and \`body\` (plain text). Labels are flags present only when true: \`unread\`, \`starred\`, \`important\`, \`inInbox\` or \`archived\`, \`sent\`, \`draft\`, \`trash\`, \`spam\`, \`category\` (primary, social, promotions, updates, forums) and \`labels\` (user label names). On a thread they describe the whole thread, and each listed email adds its own \`unread\`/\`starred\`. Empty lists and false flags are left out.
 - Lists give one \`viewUrlTemplate\` instead of a link per item: to link the user to an email in Gmail, replace {account} with the account's email and {id} with the thread or message ID (or {messageId} with a draft's messageId). Single items (get_message, get_draft, sent mail, new drafts) have their own \`viewUrl\`.
@@ -778,6 +784,67 @@ export function createServer(deps: ServerDeps): McpServer {
       run(async () => {
         const mb = await router.one(args.account);
         return { account: mb.email, ...(await mb.deleteDraft(args.draftId)) };
+      }),
+  );
+
+  // ---------- contacts ----------
+
+  server.registerTool(
+    "find_contact",
+    {
+      title: "Find a contact's address",
+      description:
+        'Finds people the user has emailed with, by name or part of an address, across accounts: `name`, `address`, which `accounts` know them, `lastContact`, `direction` (sent: only on emails the user sent; received: only on emails the user received; both) and `messages` (how many of the newest matching emails they were on). Most recent first. Use it to turn "email Angelica" into an address; if several match, show the user which address before sending.',
+      inputSchema: strictArgs({
+        query: z.string().min(1).max(100).describe('A name or part of an address, e.g. "Angelica" or "ruiz@".'),
+        account: z.string().optional().describe('One account (email or alias), or "all" (default).'),
+        limit: z.number().int().min(1).max(25).optional().describe("Most people (default 10, max 25)."),
+      }),
+      annotations: read,
+    },
+    async (args) =>
+      run(async () => {
+        const phrase = contactPhrase(args.query);
+        const words = foldText(phrase).split(" ").filter(Boolean);
+        if (!words.length) throw new AccountError("`query` needs a name or part of an address.");
+        const mailboxes = await router.many(args.account);
+        // Per account: a search and up to two metadata batches (one when more than three accounts are scanned).
+        const perAccount = mailboxes.length > 3 ? 50 : 100;
+        const scans = await Promise.all(
+          mailboxes.map(async (mb) => {
+            try {
+              return { mb, ...(await mb.scanContacts(phrase, perAccount)) };
+            } catch (err) {
+              if (mailboxes.length === 1) throw err;
+              return { mb, error: (err as Error).message };
+            }
+          }),
+        );
+        // The user's own addresses in any linked account (send-as ones when known) are never contacts.
+        const own = new Set(mailboxes.flatMap((mb) => mb.ownAddresses()).map(canonicalAddress));
+        const merged = new Map<string, ContactTally>();
+        for (const scan of scans) for (const tally of "tallies" in scan ? scan.tallies.values() : []) addContact(merged, tally);
+        const contacts = [...merged]
+          .filter(([key, t]) => !own.has(key) && contactMatches(t, words))
+          .map(([, t]) => t)
+          .sort(rankContacts)
+          .slice(0, args.limit ?? 10)
+          .map((t) => ({
+            ...(t.name ? { name: t.name } : {}),
+            address: t.address,
+            accounts: t.accounts,
+            ...(t.time ? { lastContact: isoTime(t.time) } : {}),
+            direction: t.sent && t.received ? "both" : t.sent ? "sent" : "received",
+            messages: t.messages,
+          }));
+        const errors = scans.flatMap((s) => ("error" in s ? [{ account: s.mb.email, error: s.error }] : []));
+        const unavailable = scans.flatMap((s) => ("unavailable" in s && s.unavailable ? [{ account: s.mb.email, messageIds: s.unavailable }] : []));
+        return {
+          contacts,
+          ...(contacts.length ? {} : { note: `No one matching "${phrase}" in the newest emails of ${mailboxes.length > 1 ? "these accounts" : "this account"}. Try part of the name or address, or ask the user for the address.` }),
+          ...(errors.length ? { errors } : {}),
+          ...(unavailable.length ? { unavailable } : {}),
+        };
       }),
   );
 

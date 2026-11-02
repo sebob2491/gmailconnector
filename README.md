@@ -17,7 +17,7 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 | Situation | Behaviour |
 |---|---|
-| `search_threads`, `list_drafts`, `list_labels`, `list_filters` with no `account` | Runs on **every** linked account. `search_threads` merges the results from all accounts into one list in true newest-first order, across accounts and across pages, and each thread says which account it's in; `list_drafts`, `list_labels` and `list_filters` group results by account. The returned `nextPageToken` continues every account at once: a page holds the newest threads of all accounts together (so it can be shorter than pageSize × accounts), and the next page carries on from there with nothing skipped or repeated. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
+| `search_threads`, `list_drafts`, `list_labels`, `list_filters`, `find_contact` with no `account` | Runs on **every** linked account. `find_contact` merges the people it finds into one list. `search_threads` merges the results from all accounts into one list in true newest-first order, across accounts and across pages, and each thread says which account it's in; `list_drafts`, `list_labels` and `list_filters` group results by account. The returned `nextPageToken` continues every account at once: a page holds the newest threads of all accounts together (so it can be shorter than pageSize × accounts), and the next page carries on from there with nothing skipped or repeated. If one account fails, the others still return results, and the next page tries the failed one again. Threads or drafts Gmail can't return just then are skipped and listed under `unavailable`. |
 | Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
 | IDs (message, thread, draft, label, filter) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
@@ -74,6 +74,14 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   accounts; and the plan notes when an unsubscribe address isn't on the sender's own domain. Up to 10
   senders per run (`maxSenders` up to 20); the emails you already have stay until you archive or trash
   them with the bulk tools.
+- New `find_contact` tool: "email Angelica" works without you looking up her address. It searches each
+  account for emails from, to or copying someone matching a name or part of an address, reads the
+  senders and recipients of the newest 100 (a search and two batched calls per account), and lists the
+  matching people, most recent first: name, address, which of your accounts know them, the last email,
+  whether you wrote to them, heard from them or both, and how many of those emails they were on. Accents
+  and case don't matter, the dotted, `+tagged` and googlemail.com forms of a Gmail address count as one,
+  and your own addresses are left out. When several people or addresses match, Claude is told to show
+  you which address it will use before sending.
 - New `list_filters`, `create_filter` and `delete_filter` tools: "file everything from my bank under
   Finance and skip the inbox". A filter matches on sender, recipient, subject, a Gmail search (or one
   that must not match), attachments or size, and can add existing labels, archive, mark read, star, mark
@@ -101,7 +109,7 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   changed. Lists give one `viewUrlTemplate` instead of a Gmail link per item; single items (an email, a
   draft, sent mail) keep their own `viewUrl`. On sample data with two accounts, a 50-thread search of
   both went from 129,000 to 77,000 characters and a list of 20 drafts from 6,100 to 2,700.
-- The tool list Claude loads at the start of every session is about 40% smaller (about 30,600 instead
+- The tool list Claude loads at the start of every session is about 40% smaller (about 31,600 instead
   of 51,900 characters, the new filter tools included): rules shared by many tools (the `account` argument, recipient formats, plain-text
   bodies, `messageFormat`) are stated once in the server instructions instead of in every tool, and the
   arguments' descriptions are short. Label colors are plain names (`colorPreset: "blue"`).
