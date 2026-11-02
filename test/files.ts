@@ -1,4 +1,5 @@
-/** Builds small but real PDF / ZIP-based Office files for tests. */
+/** Builds small but real PDF / ZIP-based Office files for tests, and measures CPU time for the tests that bound it. */
+import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { crc32, deflateRawSync, deflateSync } from "node:zlib";
 
@@ -397,4 +398,100 @@ export function xlsxOf(opts: {
     `<${x}workbook ${ns}="main" xmlns:r="${REL}">${opts.date1904 ? `<${x}workbookPr date1904="1"/>` : ""}<${x}sheets>${sheets.join("")}</${x}sheets></${x}workbook>`;
   files["xl/_rels/workbook.xml.rels"] = `<Relationships>${rels.join("")}</Relationships>`;
   return zip(files);
+}
+
+// ---------- CPU timing ----------
+
+/**
+ * Tests that guard against quadratic (or unbounded) work measure CPU time, not wall time, take the
+ * best of a few runs after a warm-up, and check how the cost grows with the input rather than an
+ * absolute figure: on a loaded machine (several test files run in parallel) a single run can take
+ * many times its usual cost, and a fixed bound tight enough to catch a regression also fails
+ * there. Absolute bounds are only generous ceilings, at least 10 times the usual cost.
+ * Set CPU_LOG=1 to print every measurement (to re-check the bounds).
+ */
+export interface Timed<T> {
+  value?: T;
+  error?: unknown;
+  /** CPU milliseconds (user + system) of the process. */
+  ms: number;
+}
+
+/** Runs `fn` once and returns its result (or error) and the CPU milliseconds it used. */
+export async function cpuOnce<T>(fn: () => T | Promise<T>): Promise<Timed<T>> {
+  const start = process.cpuUsage();
+  const ms = () => {
+    const used = process.cpuUsage(start);
+    return (used.user + used.system) / 1000;
+  };
+  try {
+    const value = await fn();
+    return { value, ms: ms() };
+  } catch (error) {
+    return { error, ms: ms() };
+  }
+}
+
+const RUNS = 3;
+const log = (name: string, text: string) => {
+  if (process.env.CPU_LOG) console.error(`cpu ${name}: ${text}`);
+};
+
+/** One warm-up run of `fn`, then the best of three: its result (or error) and CPU milliseconds. */
+export async function cpuBest<T>(fn: () => T | Promise<T>): Promise<Timed<T>> {
+  let best = await cpuOnce(fn);
+  for (let i = 0; i < RUNS; i++) {
+    const r = await cpuOnce(fn);
+    if (i === 0 || r.ms < best.ms) best = r;
+  }
+  return best;
+}
+
+/** Asserts that `fn` costs less than `ceilingMs` of CPU (best of three after a warm-up); returns its result. */
+export async function assertCpu<T>(name: string, fn: () => T | Promise<T>, ceilingMs: number): Promise<Timed<T>> {
+  const r = await cpuBest(fn);
+  log(name, `${r.ms.toFixed(1)} ms (ceiling ${ceilingMs})`);
+  assert.ok(r.ms < ceilingMs, `${name}: ${r.ms.toFixed(0)} ms of CPU (ceiling ${ceilingMs} ms)`);
+  return r;
+}
+
+/** Below this, a ratio says little (timer granularity, a stray GC): the larger run may take this much more. */
+const SLACK_MS = 2;
+
+/**
+ * Asserts that the work grows at most linearly with the input: `make(n)` builds an input of size n
+ * (outside the measurement) and returns the call to time; the best CPU time for 2n must be under
+ * `maxRatio` (3: linear is about 2, quadratic 4) times that for n, and under `ceilingMs`. The two
+ * sizes are measured alternately (after a warm-up of each) so both see the same load; a failed
+ * ratio is measured once more before it counts. Returns the results for n and 2n.
+ */
+export async function assertLinear<T>(
+  name: string,
+  make: (n: number) => () => T | Promise<T>,
+  n: number,
+  ceilingMs: number,
+  maxRatio = 3,
+): Promise<{ small: Timed<T>; large: Timed<T> }> {
+  const small = make(n);
+  const large = make(2 * n);
+  let result!: { small: Timed<T>; large: Timed<T> };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await cpuOnce(small);
+    await cpuOnce(large);
+    let s!: Timed<T>;
+    let l!: Timed<T>;
+    for (let i = 0; i < RUNS; i++) {
+      const a = await cpuOnce(small);
+      const b = await cpuOnce(large);
+      if (i === 0 || a.ms < s.ms) s = a;
+      if (i === 0 || b.ms < l.ms) l = b;
+    }
+    result = { small: s, large: l };
+    log(name, `n=${n}: ${s.ms.toFixed(1)} ms, 2n: ${l.ms.toFixed(1)} ms, ratio ${(l.ms / s.ms).toFixed(2)} (max ${maxRatio}, ceiling ${ceilingMs})`);
+    if (l.ms < maxRatio * s.ms + SLACK_MS) break;
+  }
+  const { small: s, large: l } = result;
+  assert.ok(l.ms < maxRatio * s.ms + SLACK_MS, `${name}: ${l.ms.toFixed(1)} ms for 2n vs ${s.ms.toFixed(1)} ms for n (n = ${n}): more than ${maxRatio} times`);
+  assert.ok(l.ms < ceilingMs, `${name}: ${l.ms.toFixed(0)} ms of CPU (ceiling ${ceilingMs} ms)`);
+  return result;
 }
