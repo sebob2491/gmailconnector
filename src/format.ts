@@ -719,7 +719,8 @@ function quotes(quote: string, whole: boolean, key: QuoteKey): boolean {
   return whole && quote.includes(" ") && start.startsWith(quote) && (start.length === quote.length || start[quote.length] === " ");
 }
 
-export const QUOTE_HIDDEN = "[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]";
+/** Replaces a reply's quoted history in thread views (get_thread's description says get_message shows the email whole). */
+export const QUOTE_HIDDEN = "[Quoted earlier messages hidden]";
 
 /**
  * Removes a reply's quoted history, for thread views, where the messages it quotes are shown anyway:
@@ -861,6 +862,11 @@ export interface FormattedMessage {
   /** Set when long links were cut; says how to get them. */
   linksShortened?: string;
   viewUrl: string;
+  /**
+   * What happened to the body, for notes given once per thread (see bodyNotes); left out of results.
+   * `partial`: only its start was read; `omitted`: characters cut; `links`: long links cut.
+   */
+  bodyInfo?: { partial: boolean; omitted: number; links: number };
 }
 
 /** Whether a format shows bodies, which then have to be read. */
@@ -955,6 +961,154 @@ function formatContent(
         `For the full links, call again with messageFormat FULL_CONTENT (and maxBodyChars: 0 if the body was also shortened).`;
     }
     if (content.attachments.length) out.attachments = content.attachments.map(({ id: _id, ...listed }) => listed);
+    if (!body.complete || omitted || shortenedLinks) out.bodyInfo = { partial: !body.complete, omitted, links: shortenedLinks };
   }
   return out;
+}
+
+// ---------- compact results ----------
+
+/** Gmail's own label IDs (user labels are "Label_…"): INBOX, UNREAD, CATEGORY_…, CHAT, YELLOW_STAR and the like. */
+export function isSystemLabel(id: string): boolean {
+  return /^[A-Z][A-Z0-9_]*$/.test(id) && !id.startsWith("Label_");
+}
+
+/** A message's (or a whole thread's) labels as flags present only when true, user labels by name. */
+export interface LabelFlags {
+  unread?: true;
+  starred?: true;
+  important?: true;
+  inInbox?: true;
+  /** Out of the inbox, and not only sent mail, drafts, Trash or Spam. */
+  archived?: true;
+  sent?: true;
+  draft?: true;
+  trash?: true;
+  spam?: true;
+  /** Gmail's inbox category: primary, social, promotions, updates or forums. */
+  category?: string;
+  /** User labels, by name. */
+  labels?: string[];
+}
+
+/** The user label IDs among `labelIds` (the ones that need a name lookup). */
+export function userLabelIds(labelIds: readonly string[] | undefined): string[] {
+  return (labelIds ?? []).filter((id) => !isSystemLabel(id));
+}
+
+/**
+ * The flags of one message's labels, or of a thread's (the label lists of all its messages): each
+ * flag is set when any message has it, except `archived`, set when no message is in the inbox and
+ * some message is neither sent mail, a draft, in Trash nor in Spam. `names` maps user label IDs to
+ * their names (an ID without a name is shown as it is).
+ */
+export function labelFlags(labelLists: readonly (readonly string[] | undefined)[], names: ReadonlyMap<string, string> = new Map()): LabelFlags {
+  const all = new Set(labelLists.flatMap((l) => l ?? []));
+  const flags: LabelFlags = {};
+  if (all.has("UNREAD")) flags.unread = true;
+  if (all.has("STARRED")) flags.starred = true;
+  if (all.has("IMPORTANT")) flags.important = true;
+  if (all.has("INBOX")) flags.inInbox = true;
+  else if (
+    !all.has("TRASH") &&
+    !all.has("SPAM") &&
+    labelLists.some((l) => !(l ?? []).some((id) => id === "SENT" || id === "DRAFT"))
+  ) {
+    flags.archived = true;
+  }
+  if (all.has("SENT")) flags.sent = true;
+  if (all.has("DRAFT")) flags.draft = true;
+  if (all.has("TRASH")) flags.trash = true;
+  if (all.has("SPAM")) flags.spam = true;
+  const category = [...all].find((id) => id.startsWith("CATEGORY_"));
+  if (category) flags.category = category === "CATEGORY_PERSONAL" ? "primary" : category.slice("CATEGORY_".length).toLowerCase();
+  const user = [...all].filter((id) => !isSystemLabel(id)).map((id) => names.get(id) ?? id);
+  if (user.length) flags.labels = user.sort((a, b) => a.localeCompare(b));
+  return flags;
+}
+
+/** Characters that need a display name to be quoted (RFC 5322 specials). */
+const NAME_SPECIALS = /[",;:<>@()[\]\\]/;
+
+/**
+ * An address as shown in results: `Ann Lee <ann@example.com>` (the name quoted only when it has to
+ * be, as in `"Lee, Ann" <ann@example.com>`), or the bare address when there is no name or the name is
+ * just the address. Anything that isn't a single address is returned as it is.
+ */
+export function displayAddress(value: string): string {
+  const parsed = parseMailboxes(value);
+  if (parsed.length !== 1) return value.trim();
+  const { address, name } = parsed[0];
+  if (!name || name.toLowerCase() === address.toLowerCase()) return address;
+  const shown = NAME_SPECIALS.test(name) ? `"${name.replace(/(["\\])/g, "\\$1")}"` : name;
+  return `${shown} <${address}>`;
+}
+
+/** Previews (search results, list_drafts) are cut to this many characters. */
+export const PREVIEW_CHARS = 140;
+
+/** Cuts a preview to `max` characters at a word break, with "…" when something was cut. */
+export function preview(text: string, max = PREVIEW_CHARS): string {
+  if (text.length <= max) return text;
+  let end = text.lastIndexOf(" ", max - 1);
+  if (end < max * 0.6) end = max - 1;
+  if (isHighSurrogate(text.charCodeAt(end - 1))) end--;
+  return `${text.slice(0, end).trimEnd()}…`;
+}
+
+/**
+ * A message in the compact shape results use: `from`/`to`/`cc`/`bcc` instead of the header names,
+ * `body` for the plain-text body, flags (see labelFlags) instead of label IDs (`labelIds` is kept only
+ * with `keepLabelIds`, for RAW), no empty lists, and no per-message link (results give a
+ * viewUrlTemplate) nor notes (see bodyNotes). `flags: false` leaves the flags out.
+ */
+export function compactMessage(
+  m: FormattedMessage,
+  opts: { names?: ReadonlyMap<string, string>; flags?: boolean; keepLabelIds?: boolean } = {},
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { id: m.id };
+  if (m.threadId !== undefined && m.threadId !== m.id) out.threadId = m.threadId;
+  if (m.subject !== undefined) out.subject = m.subject;
+  if (m.sender !== undefined) out.from = displayAddress(m.sender);
+  if (m.toRecipients?.length) out.to = m.toRecipients.map(displayAddress);
+  if (m.ccRecipients?.length) out.cc = m.ccRecipients.map(displayAddress);
+  if (m.bccRecipients?.length) out.bcc = m.bccRecipients.map(displayAddress);
+  if (m.date !== undefined) out.date = m.date;
+  if (opts.keepLabelIds) out.labelIds = m.labelIds ?? [];
+  else if (opts.flags !== false && m.labelIds) Object.assign(out, labelFlags([m.labelIds], opts.names));
+  if (m.snippet !== undefined) out.snippet = m.snippet;
+  if (m.plaintextBody !== undefined) out.body = m.plaintextBody;
+  if (m.htmlBody !== undefined) out.htmlBody = m.htmlBody;
+  if (m.attachments?.length) out.attachments = m.attachments;
+  if (m.raw !== undefined) out.raw = m.raw;
+  return out;
+}
+
+/**
+ * The notes on shortened bodies and links, once for a result: for one message as formatContent wrote
+ * them, for several (a thread) one of each naming the messages concerned.
+ */
+export function bodyNotes(messages: readonly FormattedMessage[]): { truncated?: string; linksShortened?: string } {
+  if (messages.length === 1) {
+    const [m] = messages;
+    return { ...(m.truncated ? { truncated: m.truncated } : {}), ...(m.linksShortened ? { linksShortened: m.linksShortened } : {}) };
+  }
+  const cut = messages.filter((m) => m.bodyInfo && (m.bodyInfo.partial || m.bodyInfo.omitted));
+  const links = messages.reduce((n, m) => n + (m.bodyInfo?.links ?? 0), 0);
+  return {
+    ...(cut.length
+      ? {
+          truncated:
+            `The bod${cut.length === 1 ? "y" : "ies"} of ${cut.map((m) => m.id).join(", ")} ${cut.length === 1 ? "was" : "were"} shortened (maxBodyChars); ` +
+            `get_message with maxBodyChars: 0 shows one in full.`,
+        }
+      : {}),
+    ...(links
+      ? {
+          linksShortened:
+            `${links} long link${links === 1 ? " was" : "s were"} cut to ${links === 1 ? "its" : "their"} website (https://site/…); ` +
+            `messageFormat FULL_CONTENT shows them in full.`,
+        }
+      : {}),
+  };
 }

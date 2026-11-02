@@ -78,11 +78,20 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   HTML-only emails are converted the way a browser shows them, without what the sender hid (a
   newsletter's preview text, mobile-only copies of the content), and tables come out one row per line
   with tabs between cells, also when Outlook puts a paragraph in every cell.
-- `search_threads` shows each thread's **5 most recent** messages (not the oldest), plus `totalMessages`
-  and the subject its first email had. Results are compact: one-email threads are shown flat, previews
-  are cleaned of the invisible padding and HTML codes that marketing emails contain, and recipients are
-  listed only when an email wasn't addressed to just you. A 50-email search comes back about half the
-  size of the raw Gmail data. The search help Claude sees covers Gmail's full operator syntax.
+- Results are compact JSON, so more mail fits in Claude's context. Emails show `from`, `to`, `cc`, `date`
+  and `body`; addresses read `Ann Lee <ann@example.com>`. Instead of Gmail's label IDs, an email (or a
+  thread) has flags that appear only when true: `unread`, `starred`, `important`, `inInbox` or
+  `archived`, `sent`, `trash`, `spam`, `category` ("promotions", …) and `labels` with your own labels'
+  names (read from the label list once per call, only when one appears, and kept for 10 minutes).
+  `messageFormat: "RAW"` keeps Gmail's `labelIds`, and the label tools still return the label IDs they
+  changed. Lists give one `viewUrlTemplate` instead of a Gmail link per item; single items (an email, a
+  draft, sent mail) keep their own `viewUrl`. On sample data with two accounts, a 50-thread search of
+  both went from 129,000 to 77,000 characters and a list of 20 drafts from 6,100 to 2,700.
+- `search_threads` shows each thread's **3 most recent** emails (not the oldest), the thread's `total`
+  and flags, and the subject its first email had. One-email threads are shown flat, previews are cleaned
+  of the invisible padding and HTML codes that marketing emails contain and cut to 140 characters, and
+  recipients are listed only when an email wasn't addressed to just you. The search help Claude sees
+  covers Gmail's full operator syntax.
 - `get_message`, `get_thread` and `get_draft` shorten bodies over 20,000 characters (with a note saying
   so, and how much was left out when the body was read whole). Only the start of a long body is read
   and converted, so a 2 MB newsletter takes a few milliseconds. Pass `maxBodyChars: 0` for the full
@@ -97,8 +106,13 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   the result anyway. A real 13-email conversation went from about 41,000 to 4,700 characters. Only text
   that copies an earlier message of the thread is hidden: forwarded emails, quotes of emails from
   elsewhere and replies that answer between quoted lines are left alone, and `get_message` still shows
-  any one email in full. With bodies, the subject is given once for the thread (and on a message only when
-  it changes), and messages don't repeat their preview snippet or the thread ID.
+  any one email in full. The subject and flags are given once for the thread (a message has its own
+  subject only when it changes, and its own `unread`/`starred`), messages don't repeat their preview
+  snippet or the thread ID, and notes on shortened bodies or links come once, naming the messages.
+- `get_thread` keeps long threads within a budget: once the bodies add up to more than 60,000
+  characters (`maxTotalChars`), the oldest are cut to their first 200 characters (or left out) and listed
+  under `shortened`, so Claude can open any of them with `get_message`. The latest email always keeps its
+  body; `maxTotalChars: 0` returns everything.
 - `update_draft` **keeps** existing attachments unless you pass `attachments`. Pass `[]` to remove them.
 - `reply` and `create_draft` with `replyToMessageId` quote the original message the way Gmail does.
 - `forward` re-attaches the original message's attachments, up to Gmail's 25 MB limit (2 MB on the

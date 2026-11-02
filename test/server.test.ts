@@ -8,7 +8,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AccountStore } from "../src/accountStore.js";
 import { setRetryWait, TokenProvider } from "../src/gmailClient.js";
 import { AuthError } from "../src/google.js";
-import { decodeBase64Url, isPrivateAddress, registrableDomain, sendAsCache, unsubscribeOptions, withoutBodyData } from "../src/mailbox.js";
+import { labelFlags } from "../src/format.js";
+import { decodeBase64Url, isPrivateAddress, labelNameCache, registrableDomain, sendAsCache, unsubscribeOptions, withoutBodyData } from "../src/mailbox.js";
 import { createServer } from "../src/server.js";
 import { FakeGmail, FakeWeb, parseHeaders, type FakeMailbox } from "./fakeGmail.js";
 import { docx, pdf, png, xlsx } from "./files.js";
@@ -47,6 +48,7 @@ async function setup(
   const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-mcp-test-"));
   tmpDirs.push(dir);
   sendAsCache.clear(); // kept per process, like in a Worker isolate
+  labelNameCache.clear();
   const store = new AccountStore(dir);
   const fake = new FakeGmail();
   const personal = fake.addMailbox(PERSONAL, "rt-personal");
@@ -341,7 +343,8 @@ describe("search_threads", () => {
       ],
     );
     assert.deepEqual(Object.keys(res.json.threads[0]).slice(0, 2), ["account", "id"]);
-    assert.match(res.json.threads[1].viewUrl, /authuser=me%40work\.example#all\/wt2$/);
+    assert.equal(res.json.threads[1].viewUrl, undefined, "one link template for the list instead of a link per thread");
+    assert.equal(res.json.viewUrlTemplate, "https://mail.google.com/mail/?authuser={account}#all/{id}");
     assert.equal(res.json.errors, undefined);
     const qs = fake.requests.filter((r) => r.path === "threads").map((r) => r.query.get("q"));
     assert.deepEqual(qs, ["(report OR lunch) -in:draft", "(report OR lunch) -in:draft"]);
@@ -352,9 +355,13 @@ describe("search_threads", () => {
     const res = await call("search_threads", { account: "personal" });
     assert.equal(res.json.account, PERSONAL);
     assert.equal(res.json.threads.length, 1);
-    assert.equal(res.json.threads[0].totalMessages, 1);
-    assert.equal(res.json.threads[0].sender, "Alice <alice@example.com>");
-    assert.deepEqual(res.json.threads[0].toRecipients, [PERSONAL, '"Doe, Bob" <bob@example.com>']);
+    assert.equal(res.json.threads[0].total, undefined, "a count only for threads of several emails");
+    assert.equal(res.json.threads[0].from, "Alice <alice@example.com>");
+    assert.deepEqual(res.json.threads[0].to, [PERSONAL, '"Doe, Bob" <bob@example.com>']);
+    assert.deepEqual(res.json.threads[0].cc, ["carol@example.com"]);
+    assert.equal(res.json.threads[0].labelIds, undefined);
+    assert.equal(res.json.threads[0].unread, true);
+    assert.equal(res.json.threads[0].inInbox, true);
   });
 
   test("the combined page token continues the accounts with more, holding back what may not be next", async () => {
@@ -394,7 +401,7 @@ describe("reading", () => {
     const { call } = await setup();
     const res = await call("get_thread", { account: "work", threadId: "wt1" });
     const [msg] = res.json.messages;
-    assert.equal(msg.plaintextBody, "Please review the attached report & reply.\n\nThanks");
+    assert.equal(msg.body, "Please review the attached report & reply.\n\nThanks");
     assert.equal(msg.htmlBody, undefined);
     assert.equal(msg.attachments[0].filename, "report.pdf");
     assert.equal(msg.attachments[0].mimeType, "application/pdf");
@@ -408,7 +415,7 @@ describe("reading", () => {
     assert.match(full.json.htmlBody, /<b>attached<\/b>/);
     const meta = await call("get_message", { account: WORK, messageId: "w1", messageFormat: "METADATA_ONLY" });
     assert.equal(meta.json.subject, undefined);
-    assert.equal(meta.json.sender, "Boss <boss@work.example>");
+    assert.equal(meta.json.from, "Boss <boss@work.example>");
     assert.match(meta.json.date, /^2026-09-01T12:\d\d:\d\dZ$/, "dates are given to the second");
   });
 });
@@ -560,8 +567,8 @@ describe("drafts", () => {
     assert.equal(updated.isError, false, updated.text);
     const got = await call("get_draft", { account: "personal", draftId: created.json.id });
     assert.equal(got.json.subject, "Invoice #42");
-    assert.deepEqual(got.json.toRecipients, ["x@example.com"]);
-    assert.equal(got.json.plaintextBody, "See attached.");
+    assert.deepEqual(got.json.to, ["x@example.com"]);
+    assert.equal(got.json.body, "See attached.");
     assert.equal(got.json.attachments[0].filename, "invoice.txt");
     const attId = personal.messages.get(got.json.messageId)!.payload!.parts!.find((p) => p.filename === "invoice.txt")!.body!.attachmentId;
     assert.equal(Buffer.from(personal.attachments.get(`${got.json.messageId}/${attId}`)!, "base64url").toString(), "invoice-bytes");
@@ -593,7 +600,7 @@ describe("drafts", () => {
     assert.deepEqual(subjects, { [PERSONAL]: ["P"], [WORK]: ["W"] });
     const meta = await call("list_drafts", { account: "work" });
     assert.equal(meta.json.drafts[0].subject, undefined);
-    assert.deepEqual(meta.json.drafts[0].toRecipients, ["a@example.com"]);
+    assert.deepEqual(meta.json.drafts[0].to, ["a@example.com"]);
   });
 
   test("delete_draft removes the draft", async () => {
@@ -837,7 +844,7 @@ describe("fixes from the code review", () => {
       { id: "s1" },
     );
     const res = await call("get_message", { account: "personal", messageId: "s1" });
-    assert.equal(res.json.plaintextBody, "Here is the contract:\nPlease sign by Friday.");
+    assert.equal(res.json.body, "Here is the contract:\nPlease sign by Friday.");
     assert.deepEqual(res.json.attachments.map((a: any) => a.filename), ["c.pdf", "earlier.eml"]);
   });
 
@@ -864,7 +871,7 @@ describe("fixes from the code review", () => {
       { id: "e1" },
     );
     const res = await call("get_message", { account: "personal", messageId: "e1" });
-    assert.equal(res.json.plaintextBody, "Your invoice is ready.");
+    assert.equal(res.json.body, "Your invoice is ready.");
   });
 
   test('"-in:draft" in a query still filters drafts out', async () => {
@@ -874,7 +881,8 @@ describe("fixes from the code review", () => {
     const q = fake.requests.filter((r) => r.path === "threads").at(-1)!.query.get("q");
     assert.equal(q, "(from:alice -in:draft) -in:draft");
     for (const thread of res.json.threads) {
-      for (const m of thread.messages ?? [thread]) assert.ok(!m.labelIds.includes("DRAFT"));
+      for (const m of thread.messages ?? [thread]) assert.equal(m.draft, undefined);
+      assert.equal(thread.draft, undefined);
     }
   });
 
@@ -1069,10 +1077,10 @@ describe("cleaner, smaller results", () => {
     const single = res.json.threads.find((t: any) => t.id === "wt2");
     assert.equal(single.messages, undefined);
     assert.equal(single.subject, "Benefits");
-    assert.equal(single.sender, "hr@work.example");
-    assert.equal(single.toRecipients, undefined, "addressed only to this account");
+    assert.equal(single.from, "hr@work.example");
+    assert.equal(single.to, undefined, "addressed only to this account");
     assert.equal(single.threadId, undefined);
-    assert.match(single.viewUrl, /#all\/wt2$/);
+    assert.equal(single.viewUrl, undefined);
 
     fake.deliver(work, crlf(["From: Boss <boss@work.example>", `To: ${WORK}`, "Subject: Re: Q3 report", "", "Looks good"]), {
       threadId: "wt1",
@@ -1083,7 +1091,7 @@ describe("cleaner, smaller results", () => {
     const again = await call("search_threads", { account: "work" });
     const thread = again.json.threads.find((t: any) => t.id === "wt1");
     assert.equal(thread.subject, "Q3 report");
-    assert.equal(thread.totalMessages, 3);
+    assert.equal(thread.total, 3);
     assert.equal(thread.messages.length, 3);
     for (const m of thread.messages) {
       assert.equal(m.subject, undefined, "replies don't repeat the thread subject");
@@ -1099,7 +1107,7 @@ describe("cleaner, smaller results", () => {
       id: "huge",
     });
     const short = await call("get_message", { account: "personal", messageId: "huge" });
-    assert.ok(short.json.plaintextBody.length <= 20_000);
+    assert.ok(short.json.body.length <= 20_000);
     // Only the start of a body far over the limit is read, so the note can't say how much more there is.
     assert.equal(short.json.truncated, "Body shortened; the rest is available with maxBodyChars: 0.");
     // One read whole says how much was left out: 25,000 characters, less the trailing space, less 20,000.
@@ -1110,14 +1118,14 @@ describe("cleaner, smaller results", () => {
     assert.match(counted.json.truncated, /^Body shortened: 4,999 more characters not shown/);
 
     const custom = await call("get_message", { account: "personal", messageId: "huge", maxBodyChars: 500 });
-    assert.equal(custom.json.plaintextBody.length, 500);
+    assert.equal(custom.json.body.length, 500);
 
     const full = await call("get_message", { account: "personal", messageId: "huge", maxBodyChars: 0 });
     assert.equal(full.json.truncated, undefined);
-    assert.equal(full.json.plaintextBody, long.trim());
+    assert.equal(full.json.body, long.trim());
 
     const thread = await call("get_thread", { account: "personal", threadId: "huge", maxBodyChars: 1000 });
-    assert.equal(thread.json.messages[0].plaintextBody.length, 1000);
+    assert.equal(thread.json.messages[0].body.length, 1000);
   });
 
   test("forwarding and replying still use the whole email, not the shortened one", async () => {
@@ -1148,7 +1156,7 @@ describe("cleaner, smaller results", () => {
       { id: "pad" },
     );
     const res = await call("get_message", { account: "personal", messageId: "pad" });
-    assert.equal(res.json.plaintextBody, "Big sale today\n\nShop now");
+    assert.equal(res.json.body, "Big sale today\n\nShop now");
   });
 
   test("blank padding made of other spaces and CRLF line ends is collapsed; tabs are kept", async () => {
@@ -1160,7 +1168,7 @@ describe("cleaner, smaller results", () => {
       { id: "spaces" },
     );
     const res = await call("get_message", { account: "personal", messageId: "spaces" });
-    assert.equal(res.json.plaintextBody, "Ends tonight.\n\nItem\t\tPrice");
+    assert.equal(res.json.body, "Ends tonight.\n\nItem\t\tPrice");
   });
 
   test("get_thread hides quoted history that repeats earlier messages; get_message keeps it", async () => {
@@ -1177,15 +1185,15 @@ describe("cleaner, smaller results", () => {
     mail("q4", "Ann <ann@example.com>", "Re: Interview", ["Thanks!", "", "On Monday the team wrote:", "We are hiring two people."]);
 
     const thread = await call("get_thread", { account: "personal", threadId: "conv" });
-    const bodies = thread.json.messages.map((m: any) => m.plaintextBody);
+    const bodies = thread.json.messages.map((m: any) => m.body);
     assert.match(bodies[0], /> Earlier note$/, "the first message keeps its quote");
-    assert.equal(bodies[1], "Friday works.\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+    assert.equal(bodies[1], "Friday works.\n\n[Quoted earlier messages hidden]");
     assert.match(bodies[2], /^Great, see you then\.\n\n\[Quoted earlier messages hidden/);
     assert.match(bodies[3], /Downtown office\.\n> When\?\n10am\.$/, "answers written between quoted lines are kept");
     assert.equal(bodies[4], "Thanks!\n\nOn Monday the team wrote:\nWe are hiring two people.", "prose isn't mistaken for a quote");
 
     const one = await call("get_message", { account: "personal", messageId: "q1" });
-    assert.match(one.json.plaintextBody, /wrote:\n\n> Can you do Friday\?\n>$/);
+    assert.match(one.json.body, /wrote:\n\n> Can you do Friday\?\n>$/);
   });
 
   test("get_thread hides Outlook and Apple Mail quotes of earlier messages, but never a forwarded email", async () => {
@@ -1223,10 +1231,10 @@ describe("cleaner, smaller results", () => {
     ]);
     mail("m3", "Hans <hans@example.de>", "Re: Treffen", ["Super.", "", "> Am 01.01.2024 um 10:05 schrieb Me <me@example.com>:", "> ", "> Passt, danke!", "> "]);
     const thread = await call("get_thread", { account: "personal", threadId: "mixed" });
-    const bodies = thread.json.messages.map((m: any) => m.plaintextBody);
-    assert.equal(bodies[1], "Passt, danke!\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+    const bodies = thread.json.messages.map((m: any) => m.body);
+    assert.equal(bodies[1], "Passt, danke!\n\n[Quoted earlier messages hidden]");
     assert.match(bodies[2], /---------- Forwarded message ---------\nFrom: Vendor Support[^]*A fix will ship on Jan 4\.$/);
-    assert.equal(bodies[3], "Super.\n\n[Quoted earlier messages hidden: they're above in this thread. get_message shows this email in full.]");
+    assert.equal(bodies[3], "Super.\n\n[Quoted earlier messages hidden]");
   });
 
   test("long tracking links are cut to their site when reading, but kept in drafts and FULL_CONTENT", async () => {
@@ -1245,22 +1253,21 @@ describe("cleaner, smaller results", () => {
       ]),
       { id: "sale" },
     );
-    for (const res of [
-      await call("get_message", { account: "personal", messageId: "sale" }),
-      { json: (await call("get_thread", { account: "personal", threadId: "sale" })).json.messages[0] },
-    ]) {
-      assert.equal(res.json.plaintextBody, `Sale ends tonight\n\nSHOP JEANS (https://click.mail.shop.example/…)\n\nJoin: ${meeting}`);
+    const thread = (await call("get_thread", { account: "personal", threadId: "sale" })).json;
+    for (const res of [await call("get_message", { account: "personal", messageId: "sale" }), { json: { ...thread.messages[0], linksShortened: thread.linksShortened } }]) {
+      assert.equal(res.json.body, `Sale ends tonight\n\nSHOP JEANS (https://click.mail.shop.example/…)\n\nJoin: ${meeting}`);
       assert.match(res.json.linksShortened, /^1 long link was cut to its website.*FULL_CONTENT/);
     }
+    assert.equal(thread.messages[0].linksShortened, undefined, "notes come once per result");
     const full = await call("get_message", { account: "personal", messageId: "sale", messageFormat: "FULL_CONTENT" });
-    assert.ok(full.json.plaintextBody.includes(tracking));
+    assert.ok(full.json.body.includes(tracking));
     assert.equal(full.json.linksShortened, undefined);
 
     const draft = await call("create_draft", { account: "personal", to: ["a@example.com"], subject: "Link", body: `See ${tracking}` });
     const got = await call("get_draft", { account: "personal", draftId: draft.json.id });
-    assert.equal(got.json.plaintextBody, `See ${tracking}`, "drafts keep their links, so editing one can't break them");
+    assert.equal(got.json.body, `See ${tracking}`, "drafts keep their links, so editing one can't break them");
     const listed = await call("list_drafts", { account: "personal", view: "DRAFT_VIEW_FULL" });
-    assert.ok(listed.json.drafts.some((d: any) => d.plaintextBody?.includes(tracking)));
+    assert.ok(listed.json.drafts.some((d: any) => d.body?.includes(tracking)));
   });
 });
 
@@ -1317,7 +1324,7 @@ test("an Outlook invite's unnamed calendar part is listed as invite.ics", async 
     { id: "invite" },
   );
   const res = await call("get_message", { account: "personal", messageId: "invite" });
-  assert.equal(res.json.plaintextBody, "When: Friday 10am");
+  assert.equal(res.json.body, "When: Friday 10am");
   assert.deepEqual(
     res.json.attachments.map(({ filename, mimeType, partId }: any) => ({ filename, mimeType, partId })),
     [{ filename: "invite.ics", mimeType: "text/calendar", partId: "2" }],
@@ -1869,18 +1876,19 @@ describe("smaller thread views", () => {
     for (const m of res.json.messages) {
       assert.equal(m.snippet, undefined);
       assert.equal(m.threadId, undefined);
-      assert.match(m.viewUrl, /#all\/p\d$/);
-      assert.ok(m.plaintextBody);
+      assert.equal(m.viewUrl, undefined, "the result's viewUrlTemplate links to each message");
+      assert.ok(m.body);
     }
+    assert.equal(res.json.viewUrlTemplate, "https://mail.google.com/mail/?authuser={account}#all/{id}");
     const full = await call("get_thread", { account: "personal", threadId: "pt1", messageFormat: "FULL_CONTENT" });
     assert.equal(full.json.subject, "Lunch?");
     assert.equal(full.json.messages[0].snippet, undefined);
 
-    // Without bodies the snippet is the content, so nothing changes there.
+    // Without bodies the snippet is the content, so it stays.
     const minimal = await call("get_thread", { account: "personal", threadId: "pt1", messageFormat: "MINIMAL" });
-    assert.equal(minimal.json.subject, undefined);
-    assert.deepEqual(minimal.json.messages.map((m: any) => m.subject), ["Lunch?", "Re: Lunch?", "Change of plans"]);
-    assert.ok(minimal.json.messages.every((m: any) => m.snippet && m.threadId === "pt1"));
+    assert.equal(minimal.json.subject, "Lunch?");
+    assert.deepEqual(minimal.json.messages.map((m: any) => m.subject), [undefined, undefined, "Change of plans"]);
+    assert.ok(minimal.json.messages.every((m: any) => m.snippet && m.threadId === undefined));
   });
 });
 
@@ -2462,7 +2470,7 @@ describe("send-as awareness", () => {
     assert.deepEqual(thread.json.messages.map((m: any) => m.fromMe), [undefined, true, true]);
     const msg = await call("get_message", { account: "personal", messageId: "p3" });
     const keys = Object.keys(msg.json);
-    assert.equal(keys[keys.indexOf("sender") + 1], "fromMe", "right after the sender");
+    assert.equal(keys[keys.indexOf("from") + 1], "fromMe", "right after the sender");
     assert.equal((await call("get_message", { account: "personal", messageId: "p1" })).json.fromMe, undefined);
   });
 
@@ -2660,7 +2668,7 @@ describe("descriptions and empty results", () => {
     assert.match(prop("list_drafts", "account"), /grouped per account/);
     assert.match(prop("bulk_update", "query"), /same syntax as search_threads/);
     assert.match(tools.find((t) => t.name === "reply")!.description!, /the user's own addresses are never included/);
-    assert.match(tools.find((t) => t.name === "get_thread")!.description!, /Gmail, Apple Mail and Outlook quote styles/);
+    assert.match(tools.find((t) => t.name === "get_thread")!.description!, /\[Quoted earlier messages hidden\]/);
     const { instructions } = { instructions: (client.getInstructions() ?? "") };
     assert.match(instructions, /ISO 8601 in UTC/);
     assert.match(instructions, /fromMe: true/);
@@ -2685,8 +2693,8 @@ describe("small defects", () => {
     const res = await call("search_threads", { account: "work", query: "subject:kickoff" });
     const thread = res.json.threads.find((t: any) => t.id === "kick");
     assert.equal(thread.subject, "Project kickoff");
-    assert.equal(thread.totalMessages, 7);
-    assert.equal(thread.omittedOlderMessages, 2);
+    assert.equal(thread.total, 7);
+    assert.equal(thread.omittedOlderMessages, undefined, "total says how many there are");
     assert.ok(thread.messages.every((m: any) => m.subject === undefined));
   });
 
@@ -2727,7 +2735,7 @@ describe("small defects", () => {
     const { call } = await setup();
     const plain = await call("get_message", { account: "work", messageId: "w1" });
     assert.equal(plain.json.snippet, undefined);
-    assert.ok(plain.json.plaintextBody);
+    assert.ok(plain.json.body);
     assert.equal((await call("get_message", { account: "work", messageId: "w1", messageFormat: "MINIMAL" })).json.snippet, "snippet of w1");
 
     await call("create_draft", {
@@ -2916,5 +2924,127 @@ describe("smaller results", () => {
     assert.deepEqual(res.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED"] });
     const trashed = await call("trash_thread", { account: "work", threadId: "wt1" });
     assert.deepEqual(trashed.json, { account: WORK, id: "wt1", messagesChanged: 2, labelIds: ["INBOX", "UNREAD", "STARRED", "TRASH"] });
+  });
+});
+
+describe("compact results", () => {
+  test("labels become flags present only when true, with user labels by name", () => {
+    assert.deepEqual(labelFlags([["INBOX", "UNREAD", "CATEGORY_PROMOTIONS", "Label_7"]], new Map([["Label_7", "Reports"]])), {
+      unread: true,
+      inInbox: true,
+      category: "promotions",
+      labels: ["Reports"],
+    });
+    assert.deepEqual(labelFlags([["CATEGORY_PERSONAL", "STARRED", "IMPORTANT"]]), { starred: true, important: true, archived: true, category: "primary" });
+    // A thread: archived when no email is in the inbox and one was received, whatever the user's own replies carry.
+    assert.deepEqual(labelFlags([["CATEGORY_PERSONAL"], ["SENT"]]), { archived: true, sent: true, category: "primary" });
+    assert.deepEqual(labelFlags([["SENT"]]), { sent: true }, "sent mail alone isn't archived");
+    assert.deepEqual(labelFlags([["TRASH"]]), { trash: true });
+    assert.deepEqual(labelFlags([["SPAM", "UNREAD"]]), { unread: true, spam: true });
+    assert.deepEqual(labelFlags([["Label_9", "CHAT"]]), { archived: true, labels: ["Label_9"] }, "an unknown user label shows its ID");
+  });
+
+  test("search results: flags, label names read once and cached, short snippets, 3 previews, one link template", async () => {
+    const { call, fake, work } = await setup();
+    work.messages.get("w1")!.labelIds = ["CATEGORY_UPDATES", "Label_7", "STARRED"];
+    work.messages.get("w2")!.snippet = "Open enrollment &amp; benefits " + "word ".repeat(60);
+    for (let i = 1; i <= 4; i++) {
+      fake.deliver(work, crlf([`From: p${i}@x.example`, `To: ${WORK}`, "Subject: Re: Q3 report", "", `reply ${i}`]), {
+        threadId: "wt1",
+        labelIds: i === 4 ? ["INBOX", "UNREAD"] : ["INBOX"],
+      });
+    }
+    const res = await call("search_threads", { account: "work" });
+    assert.equal(res.isError, false, res.text);
+    const [thread, single] = res.json.threads;
+    assert.equal(thread.id, "wt1");
+    assert.equal(thread.total, 5);
+    assert.equal(thread.messages.length, 3, "the 3 most recent emails");
+    assert.deepEqual(
+      Object.fromEntries(["unread", "starred", "inInbox", "archived", "category", "labels"].map((k) => [k, thread[k]])),
+      { unread: true, starred: true, inInbox: true, archived: undefined, category: "updates", labels: ["Reports"] },
+      "a thread's flags cover all its emails",
+    );
+    assert.deepEqual(thread.messages.map((m: any) => m.unread), [undefined, undefined, true], "each email shows its own unread");
+    assert.ok(thread.messages.every((m: any) => m.inInbox === undefined && m.labelIds === undefined));
+    assert.equal(single.id, "wt2");
+    assert.ok(single.snippet.length <= 140 && single.snippet.endsWith("…"), single.snippet);
+    assert.match(single.snippet, /^Open enrollment & benefits word/);
+    assert.deepEqual(Object.keys(single), ["id", "messageId", "subject", "from", "date", "unread", "inInbox", "snippet"]);
+    assert.equal(res.json.viewUrlTemplate, "https://mail.google.com/mail/?authuser={account}#all/{id}");
+    assert.ok(!res.text.includes("viewUrl\""), "no link per thread or message");
+
+    // The label list was read once, and is reused (per isolate) for the next calls.
+    const labelReads = () => fake.requests.filter((r) => r.path === "labels" && r.method === "GET").length;
+    assert.equal(labelReads(), 1);
+    await call("search_threads", { account: "work" });
+    await call("get_thread", { account: "work", threadId: "wt1" });
+    assert.equal(labelReads(), 1);
+    // Changing a label forgets the names, so the next result shows the new one.
+    await call("update_label", { account: "work", labelId: "Reports", displayName: "Board reports" });
+    const renamed = await call("search_threads", { account: "work" });
+    assert.deepEqual(renamed.json.threads[0].labels, ["Board reports"]);
+    // Results without user labels never read the list.
+    const before = labelReads();
+    await call("search_threads", { account: "personal" });
+    assert.equal(labelReads(), before);
+  });
+
+  test("get_message shows flags and its own viewUrl; RAW keeps Gmail's labelIds", async () => {
+    const { call } = await setup();
+    const msg = await call("get_message", { account: "work", messageId: "w1" });
+    assert.equal(msg.json.unread, true);
+    assert.equal(msg.json.inInbox, true);
+    assert.equal(msg.json.labelIds, undefined);
+    assert.match(msg.json.viewUrl, /authuser=me%40work\.example#all\/w1$/);
+    const raw = await call("get_message", { account: "work", messageId: "w1", messageFormat: "RAW" });
+    assert.deepEqual(raw.json.labelIds, ["INBOX", "UNREAD"]);
+    assert.equal(raw.json.unread, undefined);
+  });
+
+  test("get_thread keeps its bodies within a budget, shortening the oldest first", async () => {
+    const { call, fake, personal } = await setup();
+    for (let i = 0; i < 5; i++) {
+      fake.deliver(
+        personal,
+        crlf([`From: p${i}@x.example`, `To: ${PERSONAL}`, `Subject: Plan`, "", `Part ${i}. ${"words and more words ".repeat(100)}`.trim()]),
+        { id: `b${i}`, threadId: "big" },
+      );
+    }
+    const res = await call("get_thread", { account: "personal", threadId: "big", maxTotalChars: 5000 });
+    assert.equal(res.isError, false, res.text);
+    const bodies = res.json.messages.map((m: any) => m.body as string);
+    const total = bodies.reduce((n: number, b: string) => n + b.length, 0);
+    assert.ok(total <= 5000, `bodies add up to ${total}`);
+    assert.deepEqual(res.json.shortened.messageIds, ["b0", "b1", "b2"], "the oldest, in order");
+    assert.match(res.json.shortened.note, /get_message shows one in full; maxTotalChars: 0 returns every body/);
+    assert.ok(bodies[0].length <= 200 && bodies[0].startsWith("Part 0.") && bodies[0].endsWith("…"));
+    assert.equal(bodies[4].length, 2107, "the latest keeps its body");
+    // The default budget (60,000) holds this thread, and 0 means no limit.
+    assert.equal((await call("get_thread", { account: "personal", threadId: "big" })).json.shortened, undefined);
+    const tiny = await call("get_thread", { account: "personal", threadId: "big", maxTotalChars: 1 });
+    assert.deepEqual(tiny.json.shortened.messageIds, ["b0", "b1", "b2", "b3"]);
+    assert.ok(tiny.json.messages.slice(0, 4).every((m: any) => m.body === ""), "left out when previews don't fit either");
+    assert.equal(tiny.json.messages[4].body.length, 2107);
+    assert.equal((await call("get_thread", { account: "personal", threadId: "big", maxTotalChars: 0 })).json.shortened, undefined);
+
+    // Bodies shortened by maxBodyChars are named once for the thread, not noted on every message.
+    const cut = await call("get_thread", { account: "personal", threadId: "big", maxBodyChars: 1000 });
+    assert.match(cut.json.truncated, /^The bodies of b0, b1, b2, b3, b4 were shortened \(maxBodyChars\); get_message with maxBodyChars: 0/);
+    assert.ok(cut.json.messages.every((m: any) => m.truncated === undefined));
+  });
+
+  test("list_drafts gives a link template, and leaves out the account's own From", async () => {
+    const { call } = await setup();
+    await call("create_draft", { account: "personal", to: ["x@example.com"], subject: "Hi", body: "Draft" });
+    const res = await call("list_drafts", { account: "personal" });
+    const [draft] = res.json.drafts;
+    assert.equal(draft.viewUrl, undefined);
+    assert.equal(draft.from, undefined);
+    assert.equal(draft.labelIds, undefined);
+    assert.deepEqual(draft.to, ["x@example.com"]);
+    assert.equal(res.json.viewUrlTemplate, "https://mail.google.com/mail/?authuser={account}#drafts?compose={messageId}");
+    const got = await call("get_draft", { account: "personal", draftId: draft.id });
+    assert.match(got.json.viewUrl, new RegExp(`#drafts\\?compose=${draft.messageId}$`));
   });
 });
