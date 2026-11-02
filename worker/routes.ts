@@ -19,6 +19,7 @@ import {
   buildAuthUrl,
   exchangeCode,
   fetchProfileEmail,
+  GMAIL_SCOPES,
   pkceChallenge,
   randomToken,
   revokeToken,
@@ -27,7 +28,9 @@ import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal
 import { checkAccounts } from "./health.js";
 import {
   allowedEmails,
+  checkNickname,
   clientIdAllowed,
+  NICKNAME_ERRORS,
   emailAllowed,
   googleClient,
   GRANT_USER,
@@ -39,6 +42,9 @@ import {
   type Env,
   type GrantProps,
 } from "./owner.js";
+import { checkGoogleClient } from "./clientCheck.js";
+import { allowClientCheck } from "./guard.js";
+import { build, checkForUpdate, upstreamRepo, versionJson, versionLabel } from "./version.js";
 import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
 const SESSION_COOKIE = "__Host-gmail-connector";
@@ -453,6 +459,15 @@ function accountsNotice(url: URL) {
     };
   }
   if (removed) return { kind: "ok" as const, text: `Removed ${removed}.` };
+  const nickname = q.get("nickname");
+  if (nickname) {
+    const error = q.get("nickname_error");
+    if (error !== null) {
+      const reason = Object.hasOwn(NICKNAME_ERRORS, error) ? NICKNAME_ERRORS[error as keyof typeof NICKNAME_ERRORS] : NICKNAME_ERRORS.invalid;
+      return { kind: "bad" as const, text: `Nickname not saved for ${nickname}. ${reason}` };
+    }
+    return { kind: "ok" as const, text: `Saved the nickname for ${nickname}.` };
+  }
   if (disconnected !== null) {
     const n = Number(disconnected) || 0;
     return {
@@ -471,16 +486,23 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
   if (!session) return startGoogleSignIn(env, origin, request, { purpose: "signin" });
   const rec = await loadOwner(env.OAUTH_KV);
   // One token refresh per account, in parallel, so the page shows which ones need re-linking.
-  const health = await checkAccounts(googleClient(env), rec.accounts);
+  // Not while connecting Claude: that page is about choosing accounts.
+  const [health, update] = await Promise.all([
+    checkAccounts(googleClient(env), rec.accounts),
+    session.data.request ? undefined : checkForUpdate(env),
+  ]);
   return htmlResponse(
     accountsPage({
-      accounts: rec.accounts.map((a, i) => ({ email: a.email, health: health[i] })),
+      accounts: rec.accounts.map((a, i) => ({ email: a.email, alias: a.alias, health: health[i] })),
       owner: rec.owner,
       csrf: await csrfToken(session.handle),
       notice: accountsNotice(new URL(request.url)),
       connecting: session.data.request
         ? { clientName: session.data.clientName ?? "Claude", redirectHost: hostnameOf(session.data.request.redirectUri) }
         : undefined,
+      version: versionLabel(),
+      update,
+      repo: build.repo || undefined,
     }),
   );
 }
@@ -534,6 +556,22 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
       }
       return redirect(`${origin}/accounts?removed=${encodeURIComponent(email)}${revoked ? "" : "&revoked=0"}`, undefined, 303);
     }
+    case "nickname": {
+      const email = String(form.get("email") ?? "");
+      const rec = await loadOwner(env.OAUTH_KV);
+      const account = rec.accounts.find((a) => sameEmail(a.email, email));
+      if (!account) return redirect(`${origin}/accounts`, undefined, 303);
+      const result = checkNickname(rec, account.email, String(form.get("nickname") ?? "").slice(0, 200));
+      const back = `${origin}/accounts?nickname=${encodeURIComponent(account.email)}`;
+      if (!result.ok) return redirect(`${back}&nickname_error=${result.error}`, undefined, 303);
+      // One storage write per change; saving the same nickname again writes nothing.
+      if ((account.alias ?? "") !== (result.alias ?? "")) {
+        if (result.alias) account.alias = result.alias;
+        else delete account.alias;
+        await saveOwner(env.OAUTH_KV, rec);
+      }
+      return redirect(back, undefined, 303);
+    }
     case "disconnect": {
       const count = await disconnectClaude(env);
       return redirect(`${origin}/accounts?disconnected=${count}`, undefined, 303);
@@ -584,17 +622,32 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
     case "GET /": {
       // The copy buttons' script is the only script on any page; the nonce lets just that one run.
       const nonce = randomToken(16);
+      const client = googleClient(env);
+      const [clientCheck, claimed, update] = await Promise.all([
+        client ? checkGoogleClient(client, `${origin}/google/callback`, () => allowClientCheck(request)) : undefined,
+        isClaimed(env),
+        checkForUpdate(env),
+      ]);
       return htmlResponse(
         statusPage({
           origin,
-          googleConfigured: Boolean(googleClient(env)),
+          googleConfigured: Boolean(client),
+          clientCheck,
           allowedEmailsSet: allowedEmails(env).length > 0,
-          claimed: await isClaimed(env),
+          claimed,
+          scopes: GMAIL_SCOPES,
+          upstream: upstreamRepo(env),
           nonce,
+          version: versionLabel(),
+          update,
         }),
         { nonce },
       );
     }
+    case "GET /version":
+      return new Response(JSON.stringify(versionJson(env)), {
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*" },
+      });
     case "GET /privacy":
       return htmlResponse(privacyPage(origin));
     case "GET /authorize":
@@ -607,6 +660,7 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
       return accountsGet(request, env, origin);
     case "POST /accounts/link":
     case "POST /accounts/remove":
+    case "POST /accounts/nickname":
     case "POST /accounts/disconnect":
     case "POST /accounts/cancel":
     case "POST /accounts/done":

@@ -5,3 +5,6 @@ accounts.json
 dist-worker/
 .wrangler/
 dist-desktop/
+worker/version.generated.ts
+.dev.vars
+.env

@@ -21,7 +21,14 @@ export interface Env {
   GOOGLE_CLIENT_SECRET?: string;
   /** Optional comma-separated list of Google accounts allowed to sign in. */
   ALLOWED_EMAILS?: string;
-  /** Optional comma-separated list of hosts Claude may redirect back to (defaults to Claude's). */
+  /**
+   * Optional comma-separated list of the redirect URIs sign-in codes may be sent to: exact URIs, or
+   * prefixes ending in `*` (defaults to Claude's callback and loopback addresses).
+   */
+  ALLOWED_REDIRECT_URIS?: string;
+  /** "owner/repo" of the repository to look for updates in (defaults to this project's). */
+  UPSTREAM_REPO?: string;
+  /** Older setting: hosts Claude may redirect back to, any path. Used only without ALLOWED_REDIRECT_URIS. */
   ALLOWED_REDIRECT_HOSTS?: string;
 }
 
@@ -72,7 +79,18 @@ export function allowedEmails(env: Env): string[] {
 }
 
 const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
-const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com", ...LOOPBACK_HOSTS];
+const CLAUDE_HOSTS = ["claude.ai", "claude.com"];
+
+/**
+ * Where sign-in codes may go by default: Claude's documented callback for custom connectors
+ * (claude.ai on the web, Desktop, mobile; claude.com is the announced future address), and any path
+ * on a loopback address, any port (Claude Code and other local Claude apps, RFC 8252).
+ */
+export const DEFAULT_REDIRECT_URIS = [
+  "https://claude.ai/api/mcp/auth_callback",
+  "https://claude.com/api/mcp/auth_callback",
+  ...LOOPBACK_HOSTS.map((host) => `http://${host}/*`),
+];
 
 /** A redirect URI that may receive tokens, with its host and whether it is an app on this computer. */
 export interface RedirectTarget {
@@ -80,11 +98,54 @@ export interface RedirectTarget {
   local: boolean;
 }
 
+/** One entry of the allowed redirect list: an exact URI, or a prefix (written with a trailing `*`). */
+interface RedirectRule {
+  protocol: string;
+  host: string;
+  port: string;
+  /** Path and query that must match exactly, or (with `prefix`) that the URI's must start with. */
+  rest: string;
+  prefix: boolean;
+}
+
+function parseRule(entry: string): RedirectRule | undefined {
+  const prefix = entry.endsWith("*");
+  const text = prefix ? entry.slice(0, -1) : entry;
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return undefined;
+  }
+  // A prefix must include the path's first "/", so "https://claude.ai*" can't match claude.ai.evil.example.
+  if (prefix && !/^[a-z][a-z0-9+.-]*:\/\/[^/?#]+\//i.test(text)) return undefined;
+  if (url.username || url.password || url.hash) return undefined;
+  return { protocol: url.protocol, host: url.hostname.toLowerCase(), port: url.port, rest: url.pathname + url.search, prefix };
+}
+
 /**
- * Only Claude (and local Claude apps) may receive tokens from this connector. The host must be on
- * the allowed list, and the URI must use https (or http to a loopback address, RFC 8252): a URI
- * like `someapp://claude.ai/…` has the host claude.ai but would hand the code to whichever app
- * owns that scheme.
+ * The allowed redirect list: ALLOWED_REDIRECT_URIS (comma-separated exact URIs, or prefixes ending in
+ * `*`) or the defaults. Unreadable entries are ignored.
+ */
+function redirectRules(env: Env): RedirectRule[] {
+  const entries = (env.ALLOWED_REDIRECT_URIS ?? "").split(/[\s,]+/).filter(Boolean);
+  return (entries.length ? entries : DEFAULT_REDIRECT_URIS).flatMap((e) => parseRule(e) ?? []);
+}
+
+function ruleMatches(rule: RedirectRule, url: URL, host: string, local: boolean): boolean {
+  if (rule.protocol !== url.protocol || rule.host !== host) return false;
+  // Local apps listen on a port that changes every time (RFC 8252 section 7.3).
+  if (!local && rule.port !== url.port) return false;
+  const rest = url.pathname + url.search;
+  return rule.prefix ? rest.startsWith(rule.rest) : rest === rule.rest && !url.hash;
+}
+
+/**
+ * Only Claude (and local Claude apps) may receive tokens from this connector. The URI must use https
+ * (or http to a loopback address, RFC 8252): a URI like `someapp://claude.ai/…` has the host
+ * claude.ai but would hand the code to whichever app owns that scheme. Then it must be on the allowed
+ * list: by default Claude's own callback, not just any page on claude.ai. With the older
+ * ALLOWED_REDIRECT_HOSTS (and no ALLOWED_REDIRECT_URIS), any path on those hosts is allowed.
  */
 export function redirectTarget(env: Env, redirectUri: string): RedirectTarget | undefined {
   let url: URL;
@@ -93,16 +154,28 @@ export function redirectTarget(env: Env, redirectUri: string): RedirectTarget | 
   } catch {
     return undefined;
   }
+  if (url.username || url.password) return undefined;
   const host = url.hostname.toLowerCase();
   const local = LOOPBACK_HOSTS.includes(host);
   const schemeOk = url.protocol === "https:" || (url.protocol === "http:" && local);
-  return schemeOk && allowedHosts(env).includes(host) ? { host, local } : undefined;
+  if (!schemeOk) return undefined;
+  const legacyHosts = list(env.ALLOWED_REDIRECT_HOSTS);
+  const allowed =
+    legacyHosts.length && !env.ALLOWED_REDIRECT_URIS?.trim()
+      ? legacyHosts.includes(host)
+      : redirectRules(env).some((rule) => ruleMatches(rule, url, host, local));
+  return allowed ? { host, local } : undefined;
 }
 
-/** The hosts that may receive tokens: ALLOWED_REDIRECT_HOSTS, or Claude's and loopback addresses. */
+/**
+ * The hosts client metadata documents may be read from: ALLOWED_REDIRECT_HOSTS, or the hosts on the
+ * allowed redirect list (by default claude.ai and claude.com), never a loopback address.
+ */
 export function allowedHosts(env: Env): string[] {
-  const hosts = list(env.ALLOWED_REDIRECT_HOSTS);
-  return hosts.length ? hosts : DEFAULT_REDIRECT_HOSTS;
+  const legacy = list(env.ALLOWED_REDIRECT_HOSTS);
+  if (legacy.length && !env.ALLOWED_REDIRECT_URIS?.trim()) return legacy;
+  const hosts = env.ALLOWED_REDIRECT_URIS?.trim() ? [...new Set(redirectRules(env).map((r) => r.host))] : CLAUDE_HOSTS;
+  return hosts.filter((h) => !LOOPBACK_HOSTS.includes(h));
 }
 
 export function redirectHostAllowed(env: Env, redirectUri: string): boolean {
@@ -123,8 +196,7 @@ export function clientIdAllowed(env: Env, clientId: string): boolean {
   } catch {
     return false;
   }
-  const host = url.hostname.toLowerCase();
-  return allowedHosts(env).includes(host) && !LOOPBACK_HOSTS.includes(host);
+  return allowedHosts(env).includes(url.hostname.toLowerCase());
 }
 
 /** Whether `email` may still use the connector: the owner, or an address in ALLOWED_EMAILS. */
@@ -202,4 +274,29 @@ export async function recordSignIn(
   }
   if (link || claimed) await saveOwner(env.OAUTH_KV, rec);
   return { ok: true, rec, claimed, linked: link };
+}
+
+/** What a nickname may look like: 1–32 letters, digits, spaces, hyphens or underscores. */
+const NICKNAME_PATTERN = /^[\p{L}\p{N} _-]{1,32}$/u;
+
+export const NICKNAME_ERRORS = {
+  invalid: "A nickname is 1 to 32 letters, digits, spaces, hyphens (-) or underscores (_).",
+  reserved: `"all" means every account, so it can't be a nickname.`,
+  taken: "Another linked account already has that nickname.",
+} as const;
+
+export type NicknameResult = { ok: true; alias?: string } | { ok: false; error: keyof typeof NICKNAME_ERRORS };
+
+/**
+ * Checks a nickname typed on the accounts page for `email`. Empty clears it. A nickname works as
+ * the `account` argument of every tool, so it must not look like an email address, be "all" (which
+ * means every account), or be another account's nickname.
+ */
+export function checkNickname(rec: OwnerRecord, email: string, raw: string): NicknameResult {
+  const alias = raw.trim().replace(/\s+/g, " ");
+  if (!alias) return { ok: true };
+  if (!NICKNAME_PATTERN.test(alias)) return { ok: false, error: "invalid" };
+  if (alias.toLowerCase() === "all") return { ok: false, error: "reserved" };
+  const taken = rec.accounts.some((a) => !sameEmail(a.email, email) && a.alias?.toLowerCase() === alias.toLowerCase());
+  return taken ? { ok: false, error: "taken" } : { ok: true, alias };
 }

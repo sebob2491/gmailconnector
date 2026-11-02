@@ -5,7 +5,10 @@
  */
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { convertV4MiniflareOptions, Miniflare, Request as MfRequest, Response as MfResponse } from "miniflare";
 import { FakeGmail } from "./fakeGmail.js";
@@ -126,6 +129,37 @@ let failRevoke = false;
  */
 let refreshFailure: "unreachable" | 503 | undefined;
 
+/** Google's answers for OAuth clients it doesn't accept (by client ID). */
+const REFUSED_CLIENTS: Record<string, { error: string; error_description: string }> = {
+  "unknown-client-id": { error: "invalid_client", error_description: "The OAuth client was not found." },
+  "wrong-secret-client-id": { error: "invalid_client", error_description: "Unauthorized" },
+  "desktop-client-id": { error: "unauthorized_client", error_description: "Unauthorized" },
+};
+/** The setup page's checks of the Google client, as Google received them. */
+const clientChecks: URLSearchParams[] = [];
+
+/** The commit the Worker under test was built from (read from GET /version). */
+let runningCommit = "";
+/** Every request the Worker made to GitHub. */
+const githubHits: string[] = [];
+const NEWER = "f".repeat(40);
+const feed = (sha: string, date: string) =>
+  `<?xml version="1.0"?><feed><entry><id>tag:github.com,2008:Grit::Commit/${sha}</id><updated>${date}</updated></entry></feed>`;
+/**
+ * GitHub, per upstream repository: "tester/newer" has a newer commit; "tester/same" is at the commit
+ * running; "tester/limited" rate-limits the API but serves the commit feed (with a newer commit);
+ * anything else fails.
+ */
+function fakeGitHub(url: string): MfResponse {
+  githubHits.push(url);
+  const json = (body: unknown) => new MfResponse(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
+  if (url === "https://api.github.com/repos/tester/newer/commits/main") return json({ sha: NEWER, commit: { committer: { date: "2099-01-01T00:00:00Z" } } });
+  if (url === "https://api.github.com/repos/tester/same/commits/main") return json({ sha: runningCommit, commit: { committer: { date: "2099-01-01T00:00:00Z" } } });
+  if (url === "https://api.github.com/repos/tester/limited/commits/main") return new MfResponse("rate limited", { status: 403 });
+  if (url === "https://github.com/tester/limited/commits/main.atom") return new MfResponse(feed(NEWER, "2099-01-02T00:00:00Z"));
+  return new MfResponse("unavailable", { status: 500 });
+}
+
 async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, string>): Promise<Miniflare> {
   const instance = new Miniflare(
     convertV4MiniflareOptions({
@@ -138,12 +172,22 @@ async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, strin
           kvNamespaces: ["OAUTH_KV"],
           bindings: { GOOGLE_CLIENT_ID: "google-client-id", GOOGLE_CLIENT_SECRET: "google-client-secret", ...bindings },
           outboundService: async (req: MfRequest) => {
+            if (req.url.startsWith("https://api.github.com/") || req.url.startsWith("https://github.com/")) {
+              assert.match(req.headers.get("User-Agent") ?? "", /\S/, "GitHub's API requires a User-Agent");
+              return fakeGitHub(req.url);
+            }
             if (cimdDocs.has(req.url) || req.url.startsWith("https://cimd.attacker.example/")) {
               cimdHits.push(req.url);
               // Not cacheable, so every lookup the library makes shows up here.
               return new MfResponse(JSON.stringify(cimdDocs.get(req.url) ?? attackerDoc(req.url)), {
                 headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
               });
+            }
+            if (req.url === "https://oauth2.googleapis.com/token" && req.method === "POST") {
+              const form = new URLSearchParams(await req.clone().text());
+              if (form.get("code") === "connector-setup-check") clientChecks.push(form);
+              const refusal = REFUSED_CLIENTS[form.get("client_id") ?? ""];
+              if (refusal) return new MfResponse(JSON.stringify(refusal), { status: 401, headers: { "Content-Type": "application/json" } });
             }
             if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
             const body = req.method === "GET" ? undefined : await req.text();
@@ -214,7 +258,8 @@ before(async () => {
     { id: "w1", threadId: "wt1" },
   );
 
-  mf = await startWorker(fake, { ALLOWED_EMAILS: PERSONAL });
+  mf = await startWorker(fake, { ALLOWED_EMAILS: PERSONAL, UPSTREAM_REPO: "tester/newer" });
+  runningCommit = ((await (await mf.dispatchFetch(`${ORIGIN}/version`)).json()) as any).commit;
 });
 
 after(async () => {
@@ -391,10 +436,55 @@ describe("hosted connector (Cloudflare Worker)", () => {
     // What Google's Branding page needs before the app can be published.
     assert.match(res.text, new RegExp(`${ORIGIN}/privacy`));
     assert.match(res.text, /<code>tester\.workers\.dev<\/code>/);
+    // Each step links to the exact Google Cloud page, with the values to paste beside it.
+    for (const page of ["projectcreate", "apis/library/gmail.googleapis.com", "auth/branding", "auth/scopes", "auth/audience", "auth/clients/create"]) {
+      assert.ok(res.text.includes(`href="https://console.cloud.google.com/${page}" target="_blank"`), page);
+    }
+    assert.match(res.text, /data-copy="https:\/\/www\.googleapis\.com\/auth\/gmail\.modify"/, "the scope, from the connector's own list");
+    assert.match(res.text, /Access blocked/);
+    assert.match(res.text, /7 days/);
+    // Live checks: the client is set, Google accepts it, ALLOWED_EMAILS is set, nobody signed in yet.
+    assert.match(res.text, /class="check ok">[^]*?<b>Google client configured</);
+    assert.match(res.text, /class="check ok">[^]*?<b>Client ID and secret accepted by Google</);
+    assert.match(res.text, /class="check ok">[^]*?<b>ALLOWED_EMAILS set</);
+    assert.match(res.text, /class="check todo">[^]*?<b>Owner signed in</);
+    const asked = clientChecks.at(-1)!;
+    assert.equal(asked.get("client_id"), "google-client-id");
+    assert.equal(asked.get("grant_type"), "authorization_code");
+    assert.equal(asked.get("redirect_uri"), `${ORIGIN}/google/callback`);
+    assert.match(res.text, /href="https:\/\/github\.com\/tester\/newer#setting-up-a-copy-for-a-friend"/);
+    // The Worker's own settings in Cloudflare, found from its address.
+    assert.ok(res.text.includes(`href="https://dash.cloudflare.com/?to=/:account/workers/services/view/gmail-multi-mcp/production/settings"`));
     const privacy = await new Browser(mf).fetch("/privacy");
     assert.equal(privacy.status, 200);
     assert.match(privacy.text, /Privacy policy/);
     assert.match(privacy.text, /gmail\.modify/);
+  });
+
+  test("GET /version says which commit is running, and nothing secret", async () => {
+    const res = await mf.dispatchFetch(`${ORIGIN}/version`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("Content-Type") ?? "", /application\/json/);
+    const body = (await res.json()) as any;
+    assert.deepEqual(Object.keys(body).sort(), ["builtAt", "commit", "commitDate", "upstream", "version"]);
+    assert.equal(body.version, JSON.parse(readFileSync("package.json", "utf8")).version);
+    assert.match(body.commit, /^([0-9a-f]{40}|unknown)$/);
+    assert.ok(!Number.isNaN(Date.parse(body.builtAt)));
+    assert.equal(body.upstream, "tester/newer");
+  });
+
+  test("the setup page says when the original repository has a newer version", async () => {
+    const page = await new Browser(mf).fetch("/");
+    assert.match(page.text, /Version \d+\.\d+\.\d+ \(/);
+    if (runningCommit === "unknown") return; // built without git: nothing to compare
+    assert.match(page.text, new RegExp(`Version [^<]*${runningCommit.slice(0, 7)}`));
+    assert.match(page.text, /An update is available/);
+    assert.ok(page.text.includes(`href="https://github.com/tester/newer/compare/${runningCommit}...main"`));
+    assert.match(page.text, /Sync fork/);
+    assert.match(page.text, /Update from upstream/);
+    // GitHub is asked at most once an hour per instance (the first setup page view above asked).
+    await new Browser(mf).fetch("/");
+    assert.deepEqual(githubHits.filter((u) => u.includes("tester/newer")), ["https://api.github.com/repos/tester/newer/commits/main"]);
   });
 
   test("the MCP endpoint demands OAuth and advertises discovery metadata", async () => {
@@ -510,6 +600,74 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const refused = await callTool("send_message", { to: ["x@example.com"], body: "hi" });
     assert.equal(refused.isError, true);
     assert.match(refused.text, /`account` is required when sending/);
+  });
+
+  test("nicknames set on the accounts page work as the account argument", async () => {
+    const { browser, csrf } = await ownerBrowser();
+    const kv = await mf.getKVNamespace("OAUTH_KV");
+    const save = (email: string, nickname: string, token = csrf) => browser.fetch("/accounts/nickname", { form: { csrf: token, email, nickname } });
+
+    // Like every form on the page, it needs the session's CSRF token.
+    assert.match((await save(WORK, "work", "wrong")).text, /Session expired/);
+    let res = await save(WORK, "  work ");
+    assert.equal(res.status, 303);
+    let page = await browser.fetch(res.location);
+    assert.match(page.text, /class="notice ok">Saved the nickname for me@work\.example/);
+    assert.match(accountRow(page.text, WORK), /name="nickname" value="work"/);
+    assert.match(accountRow(page.text, PERSONAL), /name="nickname" value=""/);
+
+    // Refused: an address, too long, odd characters, "all", or another account's nickname.
+    for (const [nickname, reason] of [
+      ["me@work.example", /letters, digits/],
+      ["x".repeat(33), /letters, digits/],
+      ["<b>", /letters, digits/],
+      ["ALL", /means every account/],
+      ["Work", /already has that nickname/],
+    ] as const) {
+      const before = await kv.get("gmail:owner", "text");
+      res = await save(PERSONAL, nickname);
+      page = await browser.fetch(res.location);
+      assert.match(page.text, /class="notice bad">Nickname not saved for me\.personal@gmail\.com\./, nickname);
+      assert.match(page.text, reason, nickname);
+      assert.equal(await kv.get("gmail:owner", "text"), before, `${nickname}: nothing is written`);
+    }
+    // A made-up error code in the address shows the general rule, not the text of the link.
+    page = await browser.fetch(`/accounts?nickname=x&nickname_error=${encodeURIComponent("Call 555")}`);
+    assert.doesNotMatch(page.text, /Call 555/);
+    assert.equal((await save(PERSONAL, "Personal mail_1")).status, 303);
+
+    // Claude sees them, and can use them instead of the address.
+    const accounts = await callTool("list_accounts");
+    assert.deepEqual(
+      accounts.json.accounts.map((a: any) => [a.email, a.alias]),
+      [[PERSONAL, "Personal mail_1"], [WORK, "work"]],
+    );
+    const search = await callTool("search_threads", { account: "work" });
+    assert.equal(search.isError, false, search.text);
+    assert.deepEqual(search.json.threads.map((t: any) => t.subject), ["Q3 report"]);
+    assert.equal((await callTool("get_thread", { account: "personal mail_1", threadId: "pt1" })).isError, false);
+
+    // Saving the same nickname again writes nothing; an empty one clears it.
+    const before = await kv.get("gmail:owner", "text");
+    assert.equal((await save(WORK, "work")).status, 303);
+    assert.equal(await kv.get("gmail:owner", "text"), before);
+    await save(PERSONAL, "");
+    assert.equal((await callTool("list_accounts")).json.accounts[0].alias, undefined);
+    await save(WORK, "");
+  });
+
+  test("the accounts page shows the version, and the update notice when not connecting Claude", async () => {
+    const { browser } = await ownerBrowser();
+    const page = await browser.fetch("/accounts");
+    assert.match(page.text, /class="muted version">Version /);
+    if (runningCommit !== "unknown") assert.match(page.text, /An update is available/);
+    // While connecting, the page is only about choosing accounts.
+    const claude = new Browser(mf);
+    const consent = await claude.fetch(authorizeUrl(firstClientId, "z".repeat(43)));
+    await claude.googleSignIn((await answerConsent(claude, consent.text)).location, fake, PERSONAL);
+    const connecting = await claude.fetch("/accounts");
+    assert.match(connecting.text, /Done — connect to Claude/);
+    assert.doesNotMatch(connecting.text, /An update is available/);
   });
 
   test("attachments are read inside the Worker runtime (PDF and Word)", async () => {
@@ -681,6 +839,36 @@ describe("hosted connector (Cloudflare Worker)", () => {
     const res = await new Browser(mf).fetch(authorizeUrl(evilClient, "x".repeat(43), "https://evil.example/callback"));
     assert.equal(res.status, 403);
     assert.match(res.text, /only works with Claude/);
+  });
+
+  test("sign-in codes go only to Claude's callback, not to any page on claude.ai", async () => {
+    // claude.com is the announced future address of the same callback.
+    const future = "https://claude.com/api/mcp/auth_callback";
+    const client = await registerClient(future);
+    const consent = await new Browser(mf).fetch(authorizeUrl(client, "x".repeat(43), future));
+    assert.equal(consent.status, 200, consent.text);
+    assert.match(consent.text, /Access will be sent to <b>claude\.com<\/b>/);
+
+    const elsewhere = [
+      "https://claude.ai/",
+      "https://claude.ai/new",
+      "https://claude.ai/api/mcp/auth_callback/x",
+      "https://claude.ai/api/mcp/auth_callback?next=https://evil.example",
+      "https://claude.ai/api/mcp/auth_callback#x",
+      "https://claude.ai:8443/api/mcp/auth_callback",
+      "https://claude.com/api/other",
+      "https://user@claude.ai/api/mcp/auth_callback",
+    ];
+    const reg = await register({ redirect_uris: elsewhere });
+    assert.equal(reg.status, 201, JSON.stringify(reg.body));
+    for (const redirect of elsewhere) {
+      const res = await new Browser(mf).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect));
+      assert.equal(res.status, 403, `${redirect}: ${res.status}`);
+      assert.match(res.text, /only works with Claude/, redirect);
+      // Request errors aren't sent there either.
+      const error = await new Browser(mf).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect).replace("response_type=code", "response_type=token"));
+      assert.notEqual(error.status, 302, redirect);
+    }
   });
 
   test("a claude.ai address with another scheme can't receive tokens", async () => {
@@ -1050,10 +1238,33 @@ describe("rate limits (per Worker instance)", () => {
   before(async () => {
     const fake3 = new FakeGmail();
     fake3.addMailbox(PERSONAL, "rt-personal");
-    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL });
+    // Deployed with the Google values left empty (as the Deploy button allows).
+    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL, UPSTREAM_REPO: "tester/same", GOOGLE_CLIENT_ID: "", GOOGLE_CLIENT_SECRET: "" });
   });
   after(async () => {
     await mf3?.dispose();
+  });
+
+  test("a Worker deployed without the Google values starts, and its setup page says what's missing", async () => {
+    const before = clientChecks.length;
+    const page = await new Browser(mf3).fetch("https://my-mail.friend.workers.dev/");
+    assert.equal(page.status, 200);
+    assert.match(page.text, /class="check todo">[^]*?<b>Google client configured<\/b><span class="detail">GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET aren(&#39;|')t set yet/);
+    assert.match(page.text, /class="check todo">[^]*?<b>Client ID and secret accepted by Google/);
+    assert.equal(clientChecks.length, before, "nothing to ask Google about");
+    // Nothing depends on the Worker's name: the page uses the address it was opened at.
+    assert.ok(page.text.includes("https://my-mail.friend.workers.dev/google/callback"));
+    assert.ok(page.text.includes("<code>friend.workers.dev</code>"));
+    assert.ok(page.text.includes("workers/services/view/my-mail/production/settings"));
+    const signIn = await new Browser(mf3).fetch("https://my-mail.friend.workers.dev/accounts");
+    assert.equal(signIn.status, 503);
+    assert.match(signIn.text, /Open setup page/);
+  });
+
+  test("no update notice when the running commit is the newest", async () => {
+    const page = await new Browser(mf3).fetch("/");
+    assert.equal(page.status, 200);
+    assert.doesNotMatch(page.text, /An update is available/);
   });
 
   test("client registration: 5 a minute per address, 20 per instance", async () => {
@@ -1081,6 +1292,65 @@ describe("rate limits (per Worker instance)", () => {
   });
 });
 
+describe("a connector with its settings changed", () => {
+  let mf4: Miniflare;
+  before(async () => {
+    const fake4 = new FakeGmail();
+    fake4.addMailbox(PERSONAL, "rt-personal");
+    mf4 = await startWorker(fake4, {
+      ALLOWED_EMAILS: PERSONAL,
+      GOOGLE_CLIENT_ID: "unknown-client-id",
+      ALLOWED_REDIRECT_URIS: "https://claude.ai/api/*, https://app.example/cb ,http://localhost/oauth/*, https://bad.example*, not a url",
+      UPSTREAM_REPO: "tester/limited",
+    });
+  });
+  after(async () => {
+    await mf4?.dispose();
+  });
+
+  test("the setup page says when Google rejects the client, and asks Google at most every 5 minutes", async () => {
+    const before = clientChecks.length;
+    const page = await new Browser(mf4).fetch("/");
+    assert.match(page.text, /class="check ok">[^]*?<b>Google client configured</);
+    assert.match(page.text, /class="check bad">[^]*?<b>Client ID and secret accepted by Google<\/b><span class="detail">Google doesn(&#39;|')t know this Client ID\. Check GOOGLE_CLIENT_ID[^<]*\(Google said invalid_client\.\)/);
+    assert.match(page.text, /<span class="status bad">✗ Rejected by Google<\/span>/);
+    for (let i = 0; i < 3; i++) await new Browser(mf4).fetch("/");
+    assert.equal(clientChecks.length, before + 1, "one call to Google, then the cached answer");
+    // Other pages never ask.
+    await new Browser(mf4).fetch("/privacy");
+    await new Browser(mf4).fetch("/version");
+    assert.equal(clientChecks.length, before + 1);
+  });
+
+  test("when GitHub's API is rate-limited, the commit feed is used instead", async () => {
+    const page = await new Browser(mf4).fetch("/");
+    assert.deepEqual(githubHits.filter((u) => u.includes("tester/limited")), ["https://api.github.com/repos/tester/limited/commits/main", "https://github.com/tester/limited/commits/main.atom"]);
+    if (runningCommit !== "unknown") assert.match(page.text, /An update is available/);
+  });
+
+  test("ALLOWED_REDIRECT_URIS replaces the list of places sign-in codes may go", async () => {
+    const cases: [string, number][] = [
+      ["https://claude.ai/api/mcp/auth_callback", 200],
+      ["https://claude.ai/api/anything", 200],
+      ["https://claude.ai/new", 403],
+      ["https://claude.com/api/mcp/auth_callback", 403],
+      ["https://app.example/cb", 200],
+      ["https://app.example/cb2", 403],
+      ["http://app.example/cb", 403],
+      ["http://localhost:5555/oauth/cb", 200],
+      ["http://localhost:5555/other", 403],
+      ["https://bad.example.evil/cb", 403],
+    ];
+    const reg = await register({ redirect_uris: cases.map(([uri]) => uri) }, mf4);
+    assert.equal(reg.status, 201, JSON.stringify(reg.body));
+    for (const [redirect, expected] of cases) {
+      const res = await new Browser(mf4).fetch(authorizeUrl(reg.body.client_id, "x".repeat(43), redirect));
+      assert.equal(res.status, expected, `${redirect}: ${res.status}\n${res.text.slice(0, 300)}`);
+      if (expected === 403) assert.match(res.text, /only works with Claude/, redirect);
+    }
+  });
+});
+
 describe("a new connector without ALLOWED_EMAILS", () => {
   let mf2: Miniflare;
   let fake2: FakeGmail;
@@ -1095,7 +1365,11 @@ describe("a new connector without ALLOWED_EMAILS", () => {
   });
 
   test("refuses every sign-in until ALLOWED_EMAILS is set, so nobody can claim it first", async () => {
+    githubHits.length = 0;
     const setup = await new Browser(mf2).fetch("/");
+    // Updates are looked for in this project's own repository by default; a failure shows nothing.
+    assert.deepEqual(githubHits, ["https://api.github.com/repos/sebob2491/gmailconnector/commits/main"]);
+    assert.doesNotMatch(setup.text, /An update is available/);
     assert.match(setup.text, /Say who owns it <span class="status todo">/);
 
     const browser = new Browser(mf2);
@@ -1128,5 +1402,170 @@ describe("a new connector without ALLOWED_EMAILS", () => {
     const refused = await stranger.googleSignIn((await stranger.fetch("/accounts")).location, fake2, STRANGER);
     assert.equal(refused.status, 403);
     assert.match(refused.text, /belongs to someone else/);
+  });
+});
+
+describe("the update-from-upstream workflow's script", () => {
+  const script = resolve(".github/scripts/update-from-upstream.sh");
+  const hasTools = process.platform !== "win32" && spawnSync("git", ["--version"]).status === 0 && spawnSync("bash", ["--version"]).status === 0;
+  let dir = "";
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  // Each commit a minute after the last, and no settings from this machine.
+  const gitEnv = () => {
+    clock += 60_000;
+    const date = new Date(clock).toISOString();
+    return {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+      GIT_AUTHOR_DATE: date,
+      GIT_COMMITTER_DATE: date,
+    };
+  };
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: gitEnv(), encoding: "utf8" }).trim();
+  const write = (repo: string, files: Record<string, string>) => {
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(repo, name), text);
+  };
+  const commit = (repo: string, message: string, files: Record<string, string>) => {
+    write(repo, files);
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", message);
+    return git(repo, "rev-parse", "HEAD");
+  };
+  const update = (repo: string, repository: string) => {
+    const res = spawnSync("bash", [script], {
+      cwd: repo,
+      env: { ...gitEnv(), GITHUB_REPOSITORY: repository, UPSTREAM_REPO: "sebob2491/gmailconnector", UPSTREAM_URL: join(dir, "upstream") },
+      encoding: "utf8",
+    });
+    return { status: res.status, out: `${res.stdout}${res.stderr}` };
+  };
+  /** A wrangler config long enough that a change at its end doesn't touch the name line. */
+  const wrangler = (name: string, extra = "") =>
+    ["{", `  "name": "${name}",`, '  "main": "worker/index.ts",', '  "compatibility_date": "2026-09-01",', '  "minify": true,', '  "keep_vars": true,', `  "workers_dev": true${extra}`, "}", ""].join("\n");
+  /** A copy's main branch, as pushed to GitHub. */
+  const pushed = (repo: string) => git(repo, "rev-parse", "origin/main");
+
+  before(() => {
+    if (!hasTools) return;
+    dir = mkdtempSync(join(tmpdir(), "update-from-upstream-"));
+    const upstream = join(dir, "upstream");
+    git(dir, "init", "-q", "-b", "main", upstream);
+    commit(upstream, "First", { "a.txt": "one\ntwo\nthree\n", "wrangler.jsonc": wrangler("gmail-multi-mcp") });
+  });
+  after(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does nothing in the upstream repository itself", { skip: !hasTools }, () => {
+    const res = update(join(dir, "upstream"), "SebOb2491/GmailConnector");
+    assert.equal(res.status, 0, res.out);
+    assert.match(res.out, /This is the upstream repository itself/);
+  });
+
+  test("a fork is fast-forwarded, and pushed without force", { skip: !hasTools }, () => {
+    const upstream = join(dir, "upstream");
+    git(dir, "clone", "-q", "--bare", upstream, "fork.git");
+    git(dir, "clone", "-q", "fork.git", "fork");
+    const fork = join(dir, "fork");
+    assert.match(update(fork, "friend/gmailconnector").out, /Already up to date/);
+    const latest = commit(upstream, "Second", { "a.txt": "one\ntwo\nthree\nfour\n" });
+    const res = update(fork, "friend/gmailconnector");
+    assert.equal(res.status, 0, res.out);
+    git(fork, "fetch", "-q");
+    assert.equal(pushed(fork), latest);
+  });
+
+  test("a fork with its own changes gets a merge; a conflict changes nothing and says why", { skip: !hasTools }, () => {
+    const upstream = join(dir, "upstream");
+    const fork = join(dir, "fork");
+    commit(fork, "My README", { "mine.txt": "my notes\n" });
+    git(fork, "push", "-q", "origin", "HEAD:main");
+    const latest = commit(upstream, "Third", { "b.txt": "new file\n" });
+    let res = update(fork, "friend/gmailconnector");
+    assert.equal(res.status, 0, res.out);
+    git(fork, "fetch", "-q");
+    assert.equal(git(fork, "merge-base", "--is-ancestor", latest, "origin/main"), "");
+    assert.equal(readFileSync(join(fork, "mine.txt"), "utf8"), "my notes\n");
+
+    // Both change the same line.
+    commit(fork, "Mine", { "a.txt": "one\nTWO (mine)\nthree\nfour\n" });
+    git(fork, "push", "-q", "origin", "HEAD:main");
+    const head = git(fork, "rev-parse", "HEAD");
+    commit(upstream, "Theirs", { "a.txt": "one\nTWO (theirs)\nthree\nfour\n" });
+    res = update(fork, "friend/gmailconnector");
+    assert.equal(res.status, 1);
+    assert.match(res.out, /::error::The update from sebob2491\/gmailconnector conflicts with changes made in this copy \(a\.txt\)/);
+    assert.equal(git(fork, "rev-parse", "HEAD"), head);
+    assert.equal(git(fork, "status", "--porcelain"), "", "the working tree is left clean");
+    git(fork, "fetch", "-q");
+    assert.equal(pushed(fork), head, "nothing was pushed");
+  });
+
+  test("a Deploy-button copy (unrelated history) gets the changes as one commit, keeping its own wrangler name", { skip: !hasTools }, () => {
+    const upstream = join(dir, "upstream");
+    const base = git(upstream, "rev-parse", "HEAD");
+    // Cloudflare's copy: the same files in a new repository, with the name the user picked.
+    git(dir, "init", "-q", "--bare", "-b", "main", "copy.git");
+    git(dir, "init", "-q", "-b", "main", "copy");
+    const copy = join(dir, "copy");
+    git(copy, "remote", "add", "origin", join(dir, "copy.git"));
+    for (const name of ["a.txt", "b.txt", "mine.txt"]) {
+      try {
+        writeFileSync(join(copy, name), git(upstream, "show", `${base}:${name}`) + "\n");
+      } catch {
+        // not in upstream
+      }
+    }
+    commit(copy, "Initial commit", { "wrangler.jsonc": wrangler("my-mail") });
+    git(copy, "push", "-q", "origin", "HEAD:main");
+    assert.match(update(copy, "friend/my-mail").out, /Already up to date/, "made from upstream's newest commit");
+
+    const latest = commit(upstream, "Config change", {
+      "wrangler.jsonc": wrangler("gmail-multi-mcp", ',\n  "observability": { "enabled": true }'),
+      "c.txt": "c\n",
+    });
+    let res = update(copy, "friend/my-mail");
+    assert.equal(res.status, 0, res.out);
+    git(copy, "fetch", "-q");
+    assert.equal(pushed(copy), git(copy, "rev-parse", "HEAD"));
+    assert.match(git(copy, "log", "-1", "--format=%B"), new RegExp(`Upstream-Commit: ${latest}`));
+    const config = readFileSync(join(copy, "wrangler.jsonc"), "utf8");
+    assert.match(config, /"name": "my-mail"/);
+    assert.match(config, /"observability"/);
+    assert.equal(readFileSync(join(copy, "c.txt"), "utf8"), "c\n");
+
+    // The next run starts from the recorded commit.
+    assert.match(update(copy, "friend/my-mail").out, /Already up to date/);
+    commit(upstream, "More", { "c.txt": "c2\n" });
+    res = update(copy, "friend/my-mail");
+    assert.equal(res.status, 0, res.out);
+    assert.match(res.out, new RegExp(`Applying the changes from ${latest.slice(0, 7)}`));
+    assert.equal(readFileSync(join(copy, "c.txt"), "utf8"), "c2\n");
+
+    // A conflicting local change: nothing is committed or pushed.
+    commit(copy, "Local", { "c.txt": "mine\n" });
+    git(copy, "push", "-q", "origin", "HEAD:main");
+    const head = git(copy, "rev-parse", "HEAD");
+    commit(upstream, "Clash", { "c.txt": "theirs\n" });
+    res = update(copy, "friend/my-mail");
+    assert.equal(res.status, 1, res.out);
+    assert.match(res.out, /::error::.*conflicts with changes made in this copy/);
+    assert.equal(git(copy, "rev-parse", "HEAD"), head);
+    assert.equal(git(copy, "status", "--porcelain"), "");
+  });
+
+  test("the workflow can't be started by pull requests and takes no input", () => {
+    const workflow = readFileSync(".github/workflows/update-from-upstream.yml", "utf8");
+    const on = /^on:\n((?:  .*\n|\s*\n)+)/m.exec(workflow)?.[1] ?? "";
+    assert.deepEqual(on.match(/^  [a-z_]+:/gm), ["  schedule:", "  workflow_dispatch:"]);
+    assert.doesNotMatch(workflow, /pull_request|inputs:|github\.event\.|github\.head_ref/);
+    assert.match(workflow, /^permissions:\n  contents: write\n/m);
+    assert.doesNotMatch(workflow, /--force|push -f/);
+    assert.match(workflow, /uses: actions\/checkout@[0-9a-f]{40} /, "pinned to a commit");
   });
 });

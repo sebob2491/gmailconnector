@@ -3,7 +3,8 @@
  * on the internet can call:
  *
  * - Rate limits on client registration (each registration is a storage write; the free plan allows
- *   1,000 a day) and on the consent page. They are counted in memory, per isolate: Cloudflare runs a
+ *   1,000 a day), on the consent page, and on the setup page's check of the Google client (see
+ *   allowClientCheck). They are counted in memory, per isolate: Cloudflare runs a
  *   Worker in many isolates and restarts them freely, so this is best effort. It blunts a single
  *   source without being a quota.
  * - A token request whose client_id is a URL names a client ID metadata document, which the library
@@ -40,6 +41,8 @@ const MINUTE = 60_000;
 const registerPerAddress = new RateLimiter(5, MINUTE);
 const registerPerIsolate = new RateLimiter(20, MINUTE);
 const consentPerAddress = new RateLimiter(30, MINUTE);
+const clientCheckPerAddress = new RateLimiter(6, MINUTE);
+const clientCheckPerIsolate = new RateLimiter(20, MINUTE);
 
 /** The client's address as Cloudflare reports it (set by the edge; a client can't choose it). */
 const clientAddress = (request: Request) => request.headers.get("CF-Connecting-IP") ?? "unknown";
@@ -77,6 +80,14 @@ async function tokenClientId(request: Request): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether the setup page may ask Google about the OAuth client now (one subrequest; results are
+ * cached, so this only counts checks that would reach Google).
+ */
+export function allowClientCheck(request: Request): boolean {
+  return clientCheckPerAddress.allow(clientAddress(request)) && clientCheckPerIsolate.allow("all");
 }
 
 /** A response that ends the request before the OAuth library runs, or undefined to carry on. */
