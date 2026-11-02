@@ -1,0 +1,99 @@
+# Builds the Claude Desktop extension (gmail-multi-mcp.mcpb) and attaches it to a GitHub Release.
+#
+# The built-in Google sign-in client comes from two repository secrets (Settings → Secrets and
+# variables → Actions): GMAIL_MCP_DESKTOP_CLIENT_ID and GMAIL_MCP_DESKTOP_CLIENT_SECRET. Without
+# them the bundle is built without a built-in client, and the release notes say so.
+name: Release desktop extension
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (e.g. v0.2.0). Empty: v + the version in package.json."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Choose the release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          elif [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="v$(node -p 'require("./package.json").version')"
+          fi
+          case "$tag" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "::error::Tag \"$tag\" must look like v1.2.3"; exit 1 ;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and pack the extension
+        id: pack
+        env:
+          GMAIL_MCP_DESKTOP_CLIENT_ID: ${{ secrets.GMAIL_MCP_DESKTOP_CLIENT_ID }}
+          GMAIL_MCP_DESKTOP_CLIENT_SECRET: ${{ secrets.GMAIL_MCP_DESKTOP_CLIENT_SECRET }}
+          GMAIL_MCP_DESKTOP_VERSION: ${{ steps.tag.outputs.tag }}
+        run: |
+          if [ -n "$GMAIL_MCP_DESKTOP_CLIENT_ID" ] && [ -n "$GMAIL_MCP_DESKTOP_CLIENT_SECRET" ]; then
+            echo "builtin=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::GMAIL_MCP_DESKTOP_CLIENT_ID / GMAIL_MCP_DESKTOP_CLIENT_SECRET are not set: building without a built-in Google client."
+            echo "builtin=no" >> "$GITHUB_OUTPUT"
+            unset GMAIL_MCP_DESKTOP_CLIENT_ID GMAIL_MCP_DESKTOP_CLIENT_SECRET
+          fi
+          npm run pack:desktop
+
+      - name: Write the release notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          BUILTIN: ${{ steps.pack.outputs.builtin }}
+        run: |
+          {
+            echo "## Claude Desktop extension"
+            echo
+            echo "1. Download **gmail-multi-mcp.mcpb** below and double-click it (or drag it into Claude Desktop, or use Settings → Extensions → Advanced settings → Install Extension…)."
+            echo "2. In a chat, say **\"link my Gmail\"** and sign in with Google in the browser window that opens. Repeat for each account."
+            echo
+            if [ "$BUILTIN" = "yes" ]; then
+              echo "This build includes the maintainer's Google sign-in client. Google shows an \"unverified app\" warning for it (choose **Advanced → Go to … (unsafe)** to continue), and the client can serve at most 100 people in total, so please don't share this file widely. To use your own Google client instead, enter it in the extension's settings (see the README)."
+            else
+              echo "> **This build has no built-in Google sign-in client.** Before linking an account, create a Google OAuth client of type \"Desktop app\" (see the README) and enter its ID and secret in Claude Desktop → Settings → Extensions → Gmail (multiple accounts) → Configure."
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          file=dist-desktop/gmail-multi-mcp.mcpb
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$file" --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" "$file" --title "$TAG" --notes-file release-notes.md --target "$GITHUB_SHA"
+          fi
