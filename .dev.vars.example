@@ -1,0 +1,15 @@
+# The Worker's settings. The Deploy to Cloudflare button asks for each of these while deploying,
+# and stores them as secrets on the Worker (change them later under the Worker's Settings →
+# Variables and Secrets). For local development with `npx wrangler dev`, copy this file to
+# .dev.vars (not committed) and fill it in.
+
+# Your Gmail address. Only these Google accounts can sign in, and the first to sign in becomes the
+# owner. Several of your own addresses: separate them with commas. Required: the connector refuses
+# every sign-in until it is set.
+ALLOWED_EMAILS=
+
+# Your Google OAuth client. Leave both empty while deploying: once the Worker is deployed, open its
+# address, and the setup page walks you through creating the client in Google Cloud. Then set
+# these two under the Worker's Settings → Variables and Secrets.
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=

@@ -22,7 +22,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/src/index.js",
     "build:worker": "wrangler deploy --dry-run --outdir dist-worker",
-    "deploy": "wrangler deploy",
+    "deploy": "npm test && wrangler deploy",
     "test": "npm run build && tsc -p worker/tsconfig.json --noEmit && npm run build:worker && node --test \"dist/test/*.test.js\"",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p worker/tsconfig.json --noEmit"
   },
@@ -37,5 +37,21 @@
     "@types/node": "^26.6.3",
     "typescript": "^7.0.2",
     "wrangler": "^4.142.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "ALLOWED_EMAILS": {
+        "description": "Your Gmail address (several: separate them with commas). Only these Google accounts can sign in, and nobody can until this is set."
+      },
+      "GOOGLE_CLIENT_ID": {
+        "description": "Leave empty for now. After deploying, open your Worker's address: its setup page walks you through creating a Google OAuth client, then you add its Client ID here (Settings → Variables and Secrets)."
+      },
+      "GOOGLE_CLIENT_SECRET": {
+        "description": "Leave empty for now. You add the Client secret of the same Google OAuth client after deploying, as the setup page explains."
+      },
+      "OAUTH_KV": {
+        "description": "Storage for linked accounts and Claude's connections. Created for you."
+      }
+    }
   }
 }

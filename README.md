@@ -114,66 +114,92 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 
 ## Setup: hosted, for claude.ai on the web and phone
 
-The connector runs as a free Cloudflare Worker that deploys straight from this GitHub repo. You
-sign into it from claude.ai just like the built-in Gmail connector. Everything below works from a
-phone browser. It takes about 15 minutes, in three places: Cloudflare, Google Cloud, then Claude.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sebob2491/gmailconnector)
 
-### 1. Deploy to Cloudflare (about 5 minutes)
+The connector runs as a free Cloudflare Worker, your own copy, deployed from your own copy of this
+GitHub repository. You sign into it from claude.ai just like the built-in Gmail connector. Everything
+below works from a phone browser and takes about 15 minutes: Cloudflare, then Google Cloud (guided by
+the connector's own setup page), then Claude.
 
-1. Sign up at <https://dash.cloudflare.com/sign-up> (the free plan is enough).
-2. Go to **Workers & Pages → Create → Import a repository**. Connect GitHub and pick
-   `gmailconnector`. Setting up your own copy of someone else's? Click **Fork** on their GitHub page
-   first and pick your fork: each person runs their own connector, so nobody can see anyone else's mail.
-3. Fill in the form:
-   - **Project name:** `gmail-multi-mcp` (it must match `name` in `wrangler.jsonc`).
-   - **Build command:** `npm test`. Every deploy runs the tests first, and a failing test stops it.
-   - **Deploy command:** `npx wrangler deploy` (the default).
-4. Deploy. The first deploy creates the Worker's storage (a KV namespace) automatically.
-5. Open the Worker's URL, `https://gmail-multi-mcp.<your-subdomain>.workers.dev`. You'll see a
-   **setup page** that lists the exact URLs for the next steps, each with a Copy button.
+### 1. Deploy to Cloudflare (about 3 minutes)
 
-### 2. Create a Google OAuth client (about 8 minutes)
+1. You need a free Cloudflare account (<https://dash.cloudflare.com/sign-up>) and a GitHub account.
+2. Press **Deploy to Cloudflare** above, and connect your GitHub account when asked. On the form:
+   - **Name:** anything, e.g. `gmail-connector`. It names your GitHub repository and your Worker,
+     whose address will be `https://<name>.<your-subdomain>.workers.dev`.
+   - **ALLOWED_EMAILS:** your Gmail address (for several of your own addresses, separate them with
+     commas). Only these Google accounts can sign in, so nobody who comes across your Worker's
+     address can claim it before you do.
+   - **GOOGLE_CLIENT_ID** and **GOOGLE_CLIENT_SECRET:** leave them empty. You create them in step 2.
+   - Leave the build and deploy commands as they are (the deploy command runs the tests first; a
+     failing test stops the deploy).
+3. Press **Create and deploy**. Cloudflare copies this repository into your GitHub account, creates
+   the Worker's storage (a KV namespace), builds and deploys it.
+4. Open your Worker's address. You'll see the connector's **setup page**: a step-by-step guide with
+   live checks that tick themselves as you go.
 
-Every Gmail account you link uses this one client. Google doesn't let anyone else create it for you.
+### 2. Create a Google OAuth client, with the setup page (about 10 minutes)
 
-1. Go to <https://console.cloud.google.com/> and create a project (any name).
-2. Go to **APIs & Services → Library → Gmail API** and click **Enable**.
-3. Go to **Google Auth Platform** (also called *OAuth consent screen*):
-   - **Branding:** app name (e.g. "My Gmail connector") and your email. Under **App domain**, fill in
-     the **home page**, **privacy policy link** and **authorized domain** shown on your connector's
-     setup page (the connector serves its own privacy policy at `/privacy`). Google requires these
-     before you can publish.
-   - **Audience:** user type **External**, then **Publish app** so the status reads **In production**.
-     In *Testing*, Google expires logins every 7 days.
-   - **Data access:** add the scope `https://www.googleapis.com/auth/gmail.modify`.
-4. Go to **Clients → Create client**:
-   - Application type **Web application**.
-   - **Authorized redirect URIs:** paste the redirect URI from the setup page
-     (`https://gmail-multi-mcp.<your-subdomain>.workers.dev/google/callback`).
-   - Create, then copy the **Client ID** and **Client secret**.
-5. Back in Cloudflare, open your Worker → **Settings → Variables and Secrets → Add**. Add two
-   variables of type **Secret**: `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
-6. Add one more variable, of type **Text**: `ALLOWED_EMAILS`, with your Gmail address as its value
-   (for several of your own addresses, separate them with commas). **This step is required:** the
-   connector refuses every sign-in until it's set, so nobody who comes across your Worker's URL can
-   claim it before you do. Then **Deploy**.
+Every Gmail account you link uses this one client, and Google doesn't let anyone create it for you.
+Follow the setup page: each step links to the exact Google Cloud page and shows the values to paste
+beside it, with Copy buttons, and what you should see when it worked. In short:
 
-Reload the setup page: steps 1 and 2 should now show **✓ Done**.
+1. Create a Google Cloud project (any name).
+2. Enable the **Gmail API**.
+3. **Google Auth Platform → Branding:** app name and your email (the first time, **Get started**, with
+   audience **External**); under **App domain**, the home page, privacy policy link and authorized
+   domain from the setup page. The connector serves its own privacy policy at `/privacy`.
+4. **Data access:** add the scope `https://www.googleapis.com/auth/gmail.modify`.
+5. **Audience:** **Publish app**, so the status reads **In production**. In *Testing*, Google signs
+   every account out after 7 days, and anyone not listed as a test user sees "Access blocked".
+6. **Clients → Create client:** type **Web application**, with the setup page's redirect URI
+   (`https://<your Worker's address>/google/callback`) under **Authorized redirect URIs**. Copy the
+   **Client ID** and **Client secret** (Google shows the secret only once).
 
-### 3. Add it to Claude and sign in (about 2 minutes)
+### 3. Give the Worker the Google client (about 1 minute)
+
+In Cloudflare, open your Worker → **Settings → Variables and Secrets** (the setup page links straight
+there) and set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, type **Secret**, to the two values from
+Google. If you didn't set `ALLOWED_EMAILS` while deploying, add it now too (it's required: the
+connector refuses every sign-in until it's set). Variables you add in the dashboard are kept when the
+Worker redeploys.
+
+Reload the setup page: **Google client configured**, **Client ID and secret accepted by Google** and
+**ALLOWED_EMAILS set** should all show ✓. (The connector checks the client by asking Google's token
+endpoint about it; a wrong Client ID, a wrong secret or the wrong client type each get their own
+explanation.)
+
+### 4. Add it to Claude and sign in (about 2 minutes)
 
 1. In claude.ai, go to **Settings → Connectors → Add custom connector**. Name it (e.g.
-   "Gmail (all accounts)") and paste the connector URL from the setup page (`…workers.dev/mcp`).
+   "Gmail (all accounts)") and paste the connector URL from the setup page (`https://<your Worker's
+   address>/mcp`).
 2. Press **Connect**. You'll see a consent page. Press **Continue with Google** and sign in with
    the Gmail account you put in `ALLOWED_EMAILS`. Google will warn "Google hasn't verified this app"; that's expected for
    your own app. Tap **Advanced → Go to …** and allow Gmail access.
 3. On the account page, tap **＋ Link another Gmail account** for each extra inbox, then
    **Done — connect to Claude**.
 
-You can add or remove accounts later at `…workers.dev/accounts`. Claude sees the change within a
-minute, without reconnecting. Give each account a **nickname** there (e.g. `work`, `personal`: up to 32
-letters, digits, spaces, `-` or `_`), and Claude can use it instead of the address ("search my work
-inbox"). The same page has **Disconnect Claude**, which signs Claude out of the
+### Alternative: fork and import the repository yourself
+
+Instead of the button, you can set the Worker up by hand:
+
+1. On GitHub, press **Fork** on this repository.
+2. In Cloudflare, go to **Workers & Pages → Create → Import a repository**, connect GitHub and pick
+   your fork.
+3. **Project name:** anything (Cloudflare deploys under the name you pick, whatever `wrangler.jsonc`
+   says). **Build command:** `npm test` (every deploy runs the tests first, and a failing test stops
+   it). **Deploy command:** `npx wrangler deploy` (the default).
+4. Deploy. The first deploy creates the Worker's storage automatically. Then add `ALLOWED_EMAILS`
+   (type **Text** or **Secret**) under the Worker's **Settings → Variables and Secrets**, and continue
+   with step 2 above.
+
+### Managing it
+
+You can add or remove accounts later at `https://<your Worker's address>/accounts`. Claude sees the
+change within a minute, without reconnecting. Give each account a **nickname** there (e.g. `work`,
+`personal`: up to 32 letters, digits, spaces, `-` or `_`), and Claude can use it instead of the address
+("search my work inbox"). The same page has **Disconnect Claude**, which signs Claude out of the
 connector everywhere it's connected (your linked accounts stay linked).
 
 That page also checks each account's Google access every time you open it:
@@ -202,8 +228,9 @@ listed hosts, still works when `ALLOWED_REDIRECT_URIS` isn't set.) Client metada
 read from the same hosts (by default claude.ai and claude.com). Changing the list doesn't affect
 existing connections. Variables you add in the dashboard are kept when the Worker redeploys.
 
-Requests anyone can make without signing in (registering a Claude client, opening the consent page)
-are rate-limited per Worker instance (best effort: Cloudflare runs several instances), so someone who
+Requests anyone can make without signing in (registering a Claude client, opening the consent page,
+the setup page's check of the Google client, which Google answers once per 5 minutes at most) are
+rate-limited per Worker instance (best effort: Cloudflare runs several instances), so someone who
 finds the URL can't burn through the free plan's daily storage writes in one go.
 
 **Cloudflare's free plan** allows 50 outgoing calls and 10 ms of CPU per request. The connector
@@ -222,6 +249,41 @@ Variables and Secrets**. The local version always allows Gmail's 25 MB.
 **If the first deploy fails to create storage:** in Cloudflare, go to **Storage & Databases → KV →
 Create** and make a namespace. Then under your Worker's **Settings → Bindings → Add → KV
 namespace**, name the binding `OAUTH_KV`, pick that namespace, and redeploy.
+
+### Keeping it up to date
+
+The setup page and the accounts page show the version that's running, and say **An update is
+available** (with a link to what changed) when this repository has something newer. `/version` gives
+the same as JSON. To update:
+
+- **A Deploy-button copy** updates itself: its repository includes the **Update from upstream**
+  workflow (`.github/workflows/update-from-upstream.yml`), which runs once a day, brings in this
+  repository's changes, and pushes them; Cloudflare then builds and deploys the push. To update right
+  away: on GitHub, open your copy → **Actions → Update from upstream → Run workflow**.
+- **A fork** can use the same workflow, but GitHub keeps Actions off in forks until you turn them on
+  once: open your fork's **Actions** tab and press **I understand my workflows, go ahead and enable
+  them**. Or update by hand with **Sync fork → Update branch** on your fork's GitHub page.
+- **Turn the daily update off:** in your copy, **Settings → Secrets and variables → Actions →
+  Variables → New repository variable** `AUTO_UPDATE` with the value `false` (**Run workflow** still
+  works), or disable the workflow under **Actions**.
+
+If your copy has changes of its own that clash with an update, the workflow changes nothing and fails
+with a message saying which files clash (GitHub emails you about failed runs). It never force-pushes.
+An update that changes a workflow file can't be pushed with the workflow's built-in token: update
+that once by hand, or add a repository secret `UPDATE_TOKEN` holding a fine-grained personal access
+token for your copy with **Contents** and **Workflows** read and write. GitHub pauses scheduled
+workflows in public repositories after 60 days without activity; it emails you first, and **Enable
+workflow** under **Actions** turns it back on. Updates come from `sebob2491/gmailconnector` unless you
+set the repository variable (for the workflow) and Worker variable (for the notice) `UPSTREAM_REPO`
+to another `owner/repo`.
+
+### Setting up a copy for a friend
+
+Each person runs their own copy: their own Cloudflare Worker, their own Google client, their own
+`ALLOWED_EMAILS`. Don't add a friend's address to your `ALLOWED_EMAILS` instead: everyone who can sign
+in to a connector sees every Gmail account linked to it. Send them this page; they press **Deploy to
+Cloudflare** themselves and follow steps 1 to 4 with their own accounts. Their copy updates itself
+like yours (see above), and nothing about it depends on the name they pick.
 
 ## Setup: local, for Claude Desktop or Claude Code
 
@@ -332,6 +394,7 @@ npm test        # builds both versions, then runs unit tests, MCP tests against 
                 # and an end-to-end run of the Worker in workerd (Cloudflare's runtime) with Google faked
 npm run build   # Node CLI → dist/
 npm run build:worker   # Worker bundle → dist-worker/ (a dry-run deploy)
+npm run deploy  # tests, then deploys the Worker (what the Deploy to Cloudflare button runs)
 ```
 
 Code layout:
@@ -340,7 +403,10 @@ Code layout:
 |---|---|
 | `worker/index.ts` | Cloudflare Worker entry: OAuth provider in front of a stateless MCP endpoint at `/mcp` |
 | `worker/routes.ts`, `worker/pages.ts` | Setup page, consent page, Google sign-in, and the account linking page |
-| `worker/owner.ts` | Account storage in KV, and who may sign in |
+| `worker/owner.ts` | Account storage in KV, who may sign in, and where sign-in codes may go |
+| `worker/clientCheck.ts` | The setup page's check that Google accepts the configured OAuth client |
+| `worker/version.ts`, `worker/write-version.mjs` | The running version (recorded at build time) and the update check |
+| `.github/workflows/update-from-upstream.yml` | Keeps copies up to date with this repository |
 | `src/index.ts` | CLI: `accounts …` subcommands, or runs the stdio server |
 | `src/server.ts` | MCP tool definitions and account routing (`account` → mailbox, fan-out across accounts) |
 | `src/mailbox.ts` | Gmail operations for one account: search, read, send, reply, forward, drafts, labels |
