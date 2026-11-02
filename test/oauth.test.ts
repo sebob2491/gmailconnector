@@ -67,10 +67,12 @@ test("refuses tokens that don't include Gmail access", async () => {
 test("the browser is opened without a shell, with the sign-in URL as one argument", async () => {
   const { browserCommand, openInBrowser } = await import("../src/oauth.js");
   const url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=a&redirect_uri=http%3A%2F%2F127.0.0.1%3A5&state=x%26y";
-  assert.deepEqual(browserCommand(url, "darwin"), ["open", [url]]);
+  assert.deepEqual(browserCommand(url, "darwin"), ["/usr/bin/open", [url]]);
   assert.deepEqual(browserCommand(url, "linux"), ["xdg-open", [url]]);
   // Not `cmd /c start`, whose command-line parsing would cut the URL at the first "&".
-  assert.deepEqual(browserCommand(url, "win32"), ["rundll32", ["url.dll,FileProtocolHandler", url]]);
+  const [cmd, args] = browserCommand(url, "win32");
+  assert.match(cmd, /rundll32(\.exe)?$/);
+  assert.deepEqual(args, ["url.dll,FileProtocolHandler", url]);
   assert.equal(await openInBrowser("javascript:alert(1)"), false, "only web links are opened");
   assert.equal(await openInBrowser("file:///etc/passwd"), false);
 });

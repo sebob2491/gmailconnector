@@ -29,8 +29,6 @@ Usage:
 ACCOUNT is an email address or alias. Accounts are stored in ${new AccountStore().file}
 (override the folder with GMAIL_MCP_CONFIG_DIR).`;
 
-const RELINK_HINT = `${DESKTOP_RELINK_HINT} From a terminal, \`gmail-multi-mcp accounts add\` also works.`;
-const MANAGE_HINT = `${DESKTOP_MANAGE_HINT} From a terminal, \`gmail-multi-mcp accounts add\` also works.`;
 /** Written next to the bundled server by `npm run pack:desktop` when the build has a Google client. */
 const BUILTIN_CLIENT = new URL(`./${BUILTIN_CLIENT_FILE}`, import.meta.url);
 
@@ -154,8 +152,8 @@ async function main(): Promise<void> {
   const store = new AccountStore();
   const server = createServer({
     store,
-    tokens: new TokenProvider(loadClient, undefined, RELINK_HINT),
-    manageHint: MANAGE_HINT,
+    tokens: new TokenProvider(loadClient, undefined, DESKTOP_RELINK_HINT),
+    manageHint: DESKTOP_MANAGE_HINT,
   });
   registerAccountTools(server, { store, loadClient });
   await server.connect(new StdioServerTransport());

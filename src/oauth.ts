@@ -233,8 +233,13 @@ export async function runInteractiveAuth(
 export function browserCommand(url: string, platform: NodeJS.Platform = process.platform): [string, string[]] {
   // On Windows, `cmd /c start "" URL` would have cmd.exe parse the URL and split it at every "&"
   // (the consent URL has several); rundll32 hands it to the default browser verbatim.
-  if (platform === "darwin") return ["open", [url]];
-  if (platform === "win32") return ["rundll32", ["url.dll,FileProtocolHandler", url]];
+  // Full paths where they are fixed: an app may start the server with a minimal PATH.
+  if (platform === "darwin") return ["/usr/bin/open", [url]];
+  if (platform === "win32") {
+    const systemRoot = process.env.SystemRoot;
+    const rundll32 = systemRoot ? path.win32.join(systemRoot, "System32", "rundll32.exe") : "rundll32";
+    return [rundll32, ["url.dll,FileProtocolHandler", url]];
+  }
   return ["xdg-open", [url]];
 }
 
