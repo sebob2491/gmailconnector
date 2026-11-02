@@ -11,6 +11,7 @@ import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validatio
 import { TokenProvider } from "../src/gmailClient.js";
 import { AuthError, defaultFetch } from "../src/google.js";
 import { createServer } from "../src/server.js";
+import { historyStore } from "./historyStore.js";
 import { guard } from "./guard.js";
 import { connectionAllowed, googleClient, KvAccountSource, type Env, type GrantProps } from "./owner.js";
 import { handleBrowserRequest } from "./routes.js";
@@ -99,6 +100,7 @@ const mcpHandler = {
       jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
       selfOrigin: origin,
       ...forwardLimit(env),
+      history: historyStore(env),
     });
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

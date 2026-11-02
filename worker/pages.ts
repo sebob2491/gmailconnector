@@ -1,5 +1,6 @@
 /** Server-rendered HTML for the connector's setup, consent and account pages. */
 import type { ClientCheck } from "./clientCheck.js";
+import type { HistoryEntry } from "../src/history.js";
 import type { AccountHealth } from "./health.js";
 import type { UpdateAvailable } from "./version.js";
 
@@ -72,6 +73,11 @@ a.button.open{min-height:40px;padding:8px 14px;font-size:.95rem}
 .notice.update .how{display:block;margin-top:6px}
 .notice a{color:inherit}
 .version{text-align:center;font-size:.8rem}
+ul.activity{list-style:none;margin:8px 0 0;padding:0}
+ul.activity li{padding:8px 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
+ul.activity li:first-child{border-top:none}
+ul.activity .meta{display:block;font-size:.82rem;color:var(--muted)}
+ul.activity .failed{color:var(--bad)}
 `;
 
 const LOGO = `<svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 6l9 7 9-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>`;
@@ -363,6 +369,33 @@ function healthLine(health: AccountHealth | undefined): string {
   return `<div class="health warn">Couldn't check <span class="reason">${escapeHtml(health.reason)}</span></div>`;
 }
 
+/** "2026-11-02 14:05 UTC" for an ISO time (the page has no script to show the viewer's local time). */
+function utcTime(iso: string): string {
+  const time = new Date(iso);
+  return Number.isNaN(time.getTime()) ? iso : `${time.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
+/** The accounts page's "Recent activity" card: what Claude changed, newest first, and a button to clear it. */
+function activityCard(entries: HistoryEntry[], csrf: string): string {
+  const rows = entries
+    .map((e) => {
+      const status =
+        e.outcome === "error"
+          ? ` <span class="failed">Failed${e.error ? `: ${escapeHtml(e.error)}` : ""}</span>`
+          : e.outcome === "partial"
+            ? ` <span class="failed">Partly done${e.error ? `: ${escapeHtml(e.error)}` : ""}</span>`
+            : "";
+      const undone = e.undone ? `<span class="tag">undone</span>` : "";
+      const accounts = e.accounts.length ? ` · ${escapeHtml(e.accounts.join(", "))}` : "";
+      return `<li><span class="meta">${escapeHtml(utcTime(e.time))}${accounts}</span>${escapeHtml(e.summary)}${undone}${status}</li>`;
+    })
+    .join("");
+  return `<div class="card"><h2>Recent activity</h2>
+<p class="muted">What Claude changed through this connector, newest first. Archiving, labeling, trash and spam changes can be undone: ask Claude to undo one.</p>
+${entries.length ? `<ul class="activity">${rows}</ul>` : `<p class="muted">Nothing yet.</p>`}
+${entries.length ? `<form method="post" action="/accounts/clear-activity" class="actions">${csrf}<button>Clear activity</button></form>` : ""}</div>`;
+}
+
 export function accountsPage(opts: {
   accounts: { email: string; alias?: string; health?: AccountHealth }[];
   owner?: string;
@@ -373,6 +406,8 @@ export function accountsPage(opts: {
   update?: UpdateAvailable;
   /** This copy's GitHub repository, when the build knew it. */
   repo?: string;
+  /** The latest activity log entries, newest first (absent while connecting Claude, or when unreadable). */
+  activity?: HistoryEntry[];
 }): string {
   const csrf = `<input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">`;
   const rows = opts.accounts
@@ -424,6 +459,7 @@ ${
     : `<div class="card"><h2>Claude's access</h2>
 <p class="muted">Disconnecting signs Claude out of this connector everywhere it's connected (every Claude account and app). Your linked Gmail accounts stay linked; connect again from Claude's connector settings to use them.</p>
 <form method="post" action="/accounts/disconnect" class="actions">${csrf}<button>Disconnect Claude</button></form></div>
+${opts.activity ? activityCard(opts.activity, csrf) : ""}
 ${opts.update ? updateNotice(opts.update, opts.repo) : ""}`
 }${versionFooter(opts.version)}`;
   return layout("Gmail accounts", body);
