@@ -2,7 +2,15 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { AccountStore, describeAccount, normalizeAlias } from "./accountStore.js";
 import { TokenProvider } from "./gmailClient.js";
-import { fetchProfileEmail, loadOAuthClient, persistOAuthClient, revokeToken, runInteractiveAuth } from "./oauth.js";
+import {
+  BUILTIN_CLIENT_FILE,
+  DESKTOP_MANAGE_HINT,
+  DESKTOP_RELINK_HINT,
+  registerAccountTools,
+  resolveOAuthClient,
+  saveLinkedAccount,
+} from "./desktop.js";
+import { loadOAuthClient, persistOAuthClient, revokeToken, runInteractiveAuth } from "./oauth.js";
 import { createServer } from "./server.js";
 
 const HELP = `gmail-multi-mcp — a Gmail MCP connector that works with several Gmail accounts.
@@ -21,7 +29,10 @@ Usage:
 ACCOUNT is an email address or alias. Accounts are stored in ${new AccountStore().file}
 (override the folder with GMAIL_MCP_CONFIG_DIR).`;
 
-const RELINK_HINT = "Re-link it by running the `accounts add` command again (see README).";
+const RELINK_HINT = `${DESKTOP_RELINK_HINT} From a terminal, \`gmail-multi-mcp accounts add\` also works.`;
+const MANAGE_HINT = `${DESKTOP_MANAGE_HINT} From a terminal, \`gmail-multi-mcp accounts add\` also works.`;
+/** Written next to the bundled server by `npm run pack:desktop` when the build has a Google client. */
+const BUILTIN_CLIENT = new URL(`./${BUILTIN_CLIENT_FILE}`, import.meta.url);
 
 const log = (msg: string) => process.stderr.write(msg + "\n");
 
@@ -76,23 +87,7 @@ async function accountsCommand(args: string[]): Promise<void> {
       if (saved) log(`Saved the OAuth client to ${saved} so the server Claude launches can use it.`);
 
       const auth = await runInteractiveAuth(client, { openBrowser: !booleans.has("--no-browser"), log });
-      let email: string | undefined;
-      try {
-        email = await fetchProfileEmail(auth.accessToken);
-        await store.upsert({
-          email,
-          alias,
-          refreshToken: auth.refreshToken,
-          scopes: auth.scopes,
-          addedAt: new Date().toISOString(),
-        });
-      } catch (err) {
-        // Don't leave an unused grant active at Google, unless the account is already linked:
-        // revoking would also end the grant behind its saved refresh token.
-        const linked = (await store.list()).some((a) => email !== undefined && a.email.toLowerCase() === email.toLowerCase());
-        if (!linked) await revokeToken(auth.refreshToken);
-        throw err;
-      }
+      const { email } = await saveLinkedAccount(store, auth, alias);
       const all = await store.list();
       log(`Linked ${email}${alias ? ` as "${alias}"` : ""}. ${all.length} account(s) linked.`);
       if (all.length > 1) log(`Tip: run "accounts add" again to link another, or "accounts default" to pick a default.`);
@@ -154,10 +149,15 @@ async function main(): Promise<void> {
   }
   if (cmd && cmd !== "serve") throw new Error(`Unknown command "${cmd}".\n\n${HELP}`);
 
+  // The OAuth client: the extension's settings, then credentials.json, then the built-in one.
+  const loadClient = () => resolveOAuthClient({ builtinFile: BUILTIN_CLIENT });
+  const store = new AccountStore();
   const server = createServer({
-    store: new AccountStore(),
-    tokens: new TokenProvider(() => loadOAuthClient(), undefined, RELINK_HINT),
+    store,
+    tokens: new TokenProvider(loadClient, undefined, RELINK_HINT),
+    manageHint: MANAGE_HINT,
   });
+  registerAccountTools(server, { store, loadClient });
   await server.connect(new StdioServerTransport());
   log("gmail-multi-mcp running on stdio");
 }

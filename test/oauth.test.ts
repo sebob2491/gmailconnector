@@ -63,3 +63,21 @@ test("refuses tokens that don't include Gmail access", async () => {
   await fetch(`${params.get("redirect_uri")}/?state=${params.get("state")}&code=c`);
   await rejected;
 });
+
+test("the browser is opened without a shell, with the sign-in URL as one argument", async () => {
+  const { browserCommand, openInBrowser } = await import("../src/oauth.js");
+  const url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=a&redirect_uri=http%3A%2F%2F127.0.0.1%3A5&state=x%26y";
+  assert.deepEqual(browserCommand(url, "darwin"), ["open", [url]]);
+  assert.deepEqual(browserCommand(url, "linux"), ["xdg-open", [url]]);
+  // Not `cmd /c start`, whose command-line parsing would cut the URL at the first "&".
+  assert.deepEqual(browserCommand(url, "win32"), ["rundll32", ["url.dll,FileProtocolHandler", url]]);
+  assert.equal(await openInBrowser("javascript:alert(1)"), false, "only web links are opened");
+  assert.equal(await openInBrowser("file:///etc/passwd"), false);
+});
+
+test("a sign-in with a time limit gives up and stops listening", async () => {
+  const { startLoopbackAuth } = await import("../src/oauth.js");
+  const flow = await startLoopbackAuth(client, { timeoutMs: 50 });
+  await assert.rejects(flow.result, /within 50 ms/);
+  await assert.rejects(fetch(flow.redirectUri));
+});

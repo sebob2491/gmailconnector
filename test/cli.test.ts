@@ -68,3 +68,39 @@ test("an OAuth client given with --credentials is saved for the server Claude la
     delete process.env.GMAIL_MCP_CONFIG_DIR;
   }
 });
+
+test("the stdio server starts with no accounts and offers the account tools", async () => {
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "gmail-cli-"));
+  dirs.push(dir);
+  const { GOOGLE_CLIENT_ID: _a, GOOGLE_CLIENT_SECRET: _b, GMAIL_MCP_CREDENTIALS: _c, ...base } = process.env;
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [CLI],
+    // As the extension's manifest passes them when the optional client settings are left empty.
+    env: {
+      ...(base as Record<string, string>),
+      GMAIL_MCP_CONFIG_DIR: dir,
+      GMAIL_MCP_USER_CLIENT_ID: "${user_config.google_client_id}",
+      GMAIL_MCP_USER_CLIENT_SECRET: "${user_config.google_client_secret}",
+    },
+    stderr: "ignore",
+  });
+  const client = new Client({ name: "test", version: "0" });
+  await client.connect(transport);
+  try {
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    for (const name of ["list_accounts", "link_account", "unlink_account", "set_account_nickname"]) assert.ok(names.includes(name), name);
+
+    const list = (await client.callTool({ name: "list_accounts", arguments: {} })) as { content: { text: string }[] };
+    assert.match(JSON.parse(list.content[0].text).manageAccounts, /Ask Claude to link your Gmail \(link_account\)/);
+
+    // This build has no built-in client (dist/src has no google-client.json), and none is configured.
+    const link = (await client.callTool({ name: "link_account", arguments: {} })) as { isError?: boolean; content: { text: string }[] };
+    assert.equal(link.isError, true);
+    assert.match(link.content[0].text, /no built-in Google sign-in client/);
+  } finally {
+    await client.close();
+  }
+});
