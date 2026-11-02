@@ -87,6 +87,10 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
   changed. Lists give one `viewUrlTemplate` instead of a Gmail link per item; single items (an email, a
   draft, sent mail) keep their own `viewUrl`. On sample data with two accounts, a 50-thread search of
   both went from 129,000 to 77,000 characters and a list of 20 drafts from 6,100 to 2,700.
+- The tool list Claude loads at the start of every session is about 37% smaller (about 32,700 instead of
+  51,900 characters): rules shared by many tools (the `account` argument, recipient formats, plain-text
+  bodies, `messageFormat`) are stated once in the server instructions instead of in every tool, and the
+  arguments' descriptions are short. Label colors are plain names (`colorPreset: "blue"`).
 - `search_threads` shows each thread's **3 most recent** emails (not the oldest), the thread's `total`
   and flags, and the subject its first email had. One-email threads are shown flat, previews are cleaned
   of the invisible padding and HTML codes that marketing emails contain and cut to 140 characters, and

@@ -209,6 +209,26 @@ describe("tool catalogue", () => {
     assert.deepEqual(labelThread.inputSchema.required?.sort(), ["labelIds", "threadId"]);
   });
 
+  test("the tool list is compact: shared rules are stated once in the instructions", async () => {
+    const { client } = await setup();
+    const listed = await client.listTools();
+    const size = JSON.stringify(listed).length;
+    assert.ok(size < 34_000, `tools/list is ${size} characters`);
+    for (const tool of listed.tools) {
+      assert.equal((tool.inputSchema as Record<string, unknown>).$schema, undefined, tool.name);
+      assert.equal(tool.execution, undefined, `${tool.name}: no execution field for the default`);
+    }
+    const accountHelp = new Set(
+      listed.tools.flatMap((t) => [(t.inputSchema.properties as any)?.account?.description]).filter((d): d is string => typeof d === "string"),
+    );
+    assert.ok([...accountHelp].every((d) => d.length <= 140), "account descriptions are short");
+    const instructions = client.getInstructions() ?? "";
+    assert.match(instructions, /`account` takes a linked account's email or alias/);
+    assert.match(instructions, /Recipient lists \(to, cc, bcc\) take addresses, plain or with a name/);
+    assert.match(instructions, /don't format it with Markdown/);
+    assert.match(instructions, /messageFormat .*PLAIN_TEXT \(default\).*MINIMAL.*FULL_CONTENT.*METADATA_ONLY.*RAW/);
+  });
+
   test("the instructions and tool descriptions say that email content is untrusted and when to confirm", async () => {
     const { client } = await setup();
     const instructions = client.getInstructions() ?? "";
@@ -675,7 +695,7 @@ describe("labels, trash and spam", () => {
     const res = await call("create_label", {
       account: "work",
       displayName: "Clients/Acme/2026",
-      colorPreset: "LABEL_COLOR_PRESET_BLUE",
+      colorPreset: "blue",
     });
     assert.equal(res.isError, false, res.text);
     assert.deepEqual(res.json.createdParentLabels, ["Clients", "Clients/Acme"]);
