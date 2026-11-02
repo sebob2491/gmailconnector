@@ -2703,6 +2703,8 @@ class PdfTextWriter {
   private readonly rects: number[] = [];
   /** Whether a recorded run came from an annotation. */
   private annotated = false;
+  /** Runs placed so far. */
+  placed = 0;
 
   constructor(readonly limit: number) {}
 
@@ -2734,6 +2736,7 @@ class PdfTextWriter {
    */
   place(text: string, x0: number, y0: number, x1: number, y1: number, dx: number, dy: number, size: number, exact: boolean, moved: boolean) {
     if (!text) return;
+    this.placed++;
     const along = x0 * dx + y0 * dy;
     const texts = this.runTexts;
     if (!texts) {
@@ -3493,26 +3496,82 @@ function readAnnotations(file: PdfFile, page: PdfPage, ctx: ContentContext) {
     const annotation = file.dict(ref);
     const flags = annotation?.get("F");
     if (!annotation || (typeof flags === "number" && flags & (2 | 32))) continue; // Hidden or NoView
+    const rect = file.array(annotation.get("Rect"));
+    if (!rect || rect.length !== 4 || !rect.every((v) => typeof v === "number")) continue;
+    const [r0, r1, r2, r3] = rect as number[];
+    const [x0, y0, x1, y1] = [Math.min(r0, r2), Math.min(r1, r3), Math.max(r0, r2), Math.max(r1, r3)];
+    const before = ctx.writer.placed;
     // Only a single appearance; per-state ones (check boxes, radio buttons) show no text.
     const appearanceRef = file.dict(annotation.get("AP"))?.get("N");
     const appearance = file.stream(appearanceRef);
-    const rect = file.array(annotation.get("Rect"));
-    if (!appearance || !rect || rect.length !== 4 || !rect.every((v) => typeof v === "number")) continue;
     const num = appearanceRef instanceof PdfRef ? appearanceRef.num : undefined;
-    if (num !== undefined && ctx.formsOnPage.has(num)) continue;
-    if (num !== undefined) ctx.formsOnPage.add(num);
-    const content = file.decode(appearance, num);
-    if (!content) continue;
-    const [r0, r1, r2, r3] = rect as number[];
-    const [x0, y0, x1, y1] = [Math.min(r0, r2), Math.min(r1, r3), Math.max(r0, r2), Math.max(r1, r3)];
-    const matrix = toMatrix(file.get(appearance.dict.get("Matrix"))) ?? IDENTITY;
-    ctx.writer.newline();
-    ctx.writer.beginAnnotation(x0, y0, x1, y1);
-    runContent(content, ctx, file.dict(appearance.dict.get("Resources")) ?? page.resources, {
-      ...initialState(),
-      ctm: multiply(matrix, fitToRect(file.array(appearance.dict.get("BBox")), matrix, x0, y0, x1, y1)),
-    });
+    if (appearance && (num === undefined || !ctx.formsOnPage.has(num))) {
+      if (num !== undefined) ctx.formsOnPage.add(num);
+      const content = file.decode(appearance, num);
+      if (content) {
+        const matrix = toMatrix(file.get(appearance.dict.get("Matrix"))) ?? IDENTITY;
+        ctx.writer.newline();
+        ctx.writer.beginAnnotation(x0, y0, x1, y1);
+        runContent(content, ctx, file.dict(appearance.dict.get("Resources")) ?? page.resources, {
+          ...initialState(),
+          ctm: multiply(matrix, fitToRect(file.array(appearance.dict.get("BBox")), matrix, x0, y0, x1, y1)),
+        });
+      }
+    }
+    if (ctx.writer.placed === before && !ctx.writer.full) placeFieldValue(file, annotation, ctx.writer, x0, y0, x1, y1);
   }
+}
+
+/** Field flags (/Ff) of text fields: several lines, a password. */
+const FIELD_MULTILINE = 1 << 12;
+const FIELD_PASSWORD = 1 << 13;
+/** The font size in a field's default appearance (/DA), e.g. "/Helv 10 Tf 0 g". */
+const DA_SIZE = /(\d*\.?\d+)\s+Tf/;
+
+/**
+ * The value (/V) of a text field whose appearance shows nothing (LibreOffice, for one, leaves
+ * drawing it to the viewer, with /NeedAppearances), placed as a viewer draws it into the rect: from
+ * its left edge, one line about the rect's vertical centre, or the lines of a multi-line field from
+ * its top, at the font size its /DA names (12, or less in a low rect, when it says 0: "auto").
+ * The field's entries may be on the widget or inherited from its parent fields. Passwords are left out.
+ */
+function placeFieldValue(file: PdfFile, widget: PdfDict, writer: PdfTextWriter, x0: number, y0: number, x1: number, y1: number) {
+  let type: string | undefined;
+  let value: PdfValue | PdfStream | undefined;
+  let fieldFlags: number | undefined;
+  let appearance: PdfValue | PdfStream | undefined;
+  let node: PdfDict | undefined = widget;
+  for (let depth = 0; node && depth < MAX_NESTING; depth++) {
+    type ??= nameOf(file.get(node.get("FT")));
+    value ??= file.get(node.get("V"));
+    const ff = file.get(node.get("Ff"));
+    if (fieldFlags === undefined && typeof ff === "number") fieldFlags = ff;
+    appearance ??= file.get(node.get("DA"));
+    node = file.dict(node.get("Parent"));
+  }
+  if (type !== "Tx" || !(value instanceof PdfString) || (fieldFlags ?? 0) & FIELD_PASSWORD) return;
+  const text = pdfTextString(value.bytes);
+  if (!text.trim()) return;
+  const multiline = ((fieldFlags ?? 0) & FIELD_MULTILINE) !== 0;
+  // Only the start of /DA is searched (a long run of digits would make the expression slow).
+  const named = appearance instanceof PdfString ? Number(DA_SIZE.exec(appearance.bytes.slice(0, 256))?.[1]) : NaN;
+  const size = named > 0 && named < 1000 ? named : multiline ? 12 : Math.max(1, Math.min(12, 0.7 * (y1 - y0)));
+  let y = multiline ? y1 - 2 - 0.9 * size : (y0 + y1) / 2 - 0.3 * size;
+  writer.newline();
+  writer.beginAnnotation(x0, y0, x1, y1);
+  for (const line of text.split(/\r\n?|\n/)) {
+    if (writer.full) break;
+    // Widths are guessed (half the font size a character): the run is placed, not measured.
+    writer.place(line, x0 + 2, y, x0 + 2 + 0.5 * size * line.length, y, 1, 0, size, false, true);
+    y -= 1.15 * size;
+  }
+}
+
+/** A PDF text string: UTF-16BE or UTF-8 after a byte order mark, else PDFDocEncoding (read as Windows-1252, which it nearly is). */
+function pdfTextString(bytes: string): string {
+  const utf16 = bytes.startsWith("\xfe\xff");
+  if (!utf16 && !bytes.startsWith("\xef\xbb\xbf")) return win1252(bytes);
+  return new TextDecoder(utf16 ? "utf-16be" : "utf-8").decode(Buffer.from(bytes.slice(utf16 ? 2 : 3), "latin1"));
 }
 
 /**

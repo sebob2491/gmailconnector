@@ -580,6 +580,32 @@ test("form fields between lines, over several lines, and on turned pages", async
   }
 });
 
+test("text fields whose appearance shows nothing are read from their values (/V), as LibreOffice writes them", async () => {
+  const b = new PdfBuilder();
+  // LibreOffice's appearances are empty (it sets /NeedAppearances, so viewers draw the values); its boxes sit on the text line.
+  const empty = () => b.add("/Type /XObject /Subtype /Form /BBox [0 0 180 13.8]", Buffer.from("/Tx BMC\nEMC\n"));
+  const field = (y: number, entries: string, appearance = refs(empty())) =>
+    b.add(`<< /Type /Annot /Subtype /Widget /Rect [110 ${y + 2.5} 290 ${y + 16.3}] ${entries}${appearance ? ` /AP << /N ${appearance} >>` : ""} >>`);
+  const utf16 = (text: string) => `<FEFF${hexString([...text].map((c) => c.charCodeAt(0))).slice(1, -1)}>`;
+  // A field's entries can come from its parent field (the widget is then one of the field's kids).
+  const parent = b.add(`<< /FT /Tx /T (date) /V ${utf16("2024-01-05")} /DA (/Helv 10 Tf 0 g) >>`);
+  const shown = b.add("/Type /XObject /Subtype /Form /BBox [0 0 180 13.8]", Buffer.from("BT /Helv 10 Tf 2 4 Td (Shown value) Tj ET"));
+  const annots = [
+    field(700, `/FT /Tx /T (name) /V ${utf16("Sebastian")} /DA (0 0 0 rg /He 10 Tf)`),
+    field(680, `/Parent ${refs(parent)}`),
+    field(660, "/FT /Tx /T (pin) /Ff 8192 /V (1234)"), // a password field: left out
+    field(640, "/FT /Tx /T (city) /V (Caf\\351) /DA (/Helv 0 Tf)", ""), // no appearance at all; PDFDocEncoding; "auto" size
+    field(620, "/FT /Tx /T (shown) /V (stale value)", refs(shown)), // the appearance wins
+    b.add(`<< /Type /Annot /Subtype /Widget /Rect [110 562.5 400 606] /FT /Tx /Ff 4096 /V (First line of the comment\\rthe second line) /DA (/Helv 10 Tf) /AP << /N ${refs(empty())} >> >>`),
+  ];
+  const content = [["Name:", 700], ["Date:", 680], ["PIN:", 660], ["City:", 640], ["Shown:", 620], ["Comments:", 560]].map(([label, y]) => `BT /F1 12 Tf 72 ${y} Td (${label}) Tj ET`);
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content(content.join("\n")))} /Annots [${refs(annots)}] >>`);
+  assert.equal(
+    (await readPdf(b.build(pageTree(b, [page]))))!.text,
+    "Name: Sebastian\nDate: 2024-01-05\nPIN:\nCity: Café\nShown: Shown value\n\nComments: First line of the comment\nthe second line",
+  );
+});
+
 test("pages whose annotations draw no text keep their drawing order", async () => {
   // Lines drawn bottom first, with a link and a check box: as before, in drawing order (not sorted by position).
   const b = new PdfBuilder();
