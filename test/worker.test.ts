@@ -126,6 +126,15 @@ let failRevoke = false;
  */
 let refreshFailure: "unreachable" | 503 | undefined;
 
+/** Google's answers for OAuth clients it doesn't accept (by client ID). */
+const REFUSED_CLIENTS: Record<string, { error: string; error_description: string }> = {
+  "unknown-client-id": { error: "invalid_client", error_description: "The OAuth client was not found." },
+  "wrong-secret-client-id": { error: "invalid_client", error_description: "Unauthorized" },
+  "desktop-client-id": { error: "unauthorized_client", error_description: "Unauthorized" },
+};
+/** The setup page's checks of the Google client, as Google received them. */
+const clientChecks: URLSearchParams[] = [];
+
 /** The commit the Worker under test was built from (read from GET /version). */
 let runningCommit = "";
 /** Every request the Worker made to GitHub. */
@@ -170,6 +179,12 @@ async function startWorker(fakeGoogle: FakeGmail, bindings: Record<string, strin
               return new MfResponse(JSON.stringify(cimdDocs.get(req.url) ?? attackerDoc(req.url)), {
                 headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
               });
+            }
+            if (req.url === "https://oauth2.googleapis.com/token" && req.method === "POST") {
+              const form = new URLSearchParams(await req.clone().text());
+              if (form.get("code") === "connector-setup-check") clientChecks.push(form);
+              const refusal = REFUSED_CLIENTS[form.get("client_id") ?? ""];
+              if (refusal) return new MfResponse(JSON.stringify(refusal), { status: 401, headers: { "Content-Type": "application/json" } });
             }
             if (failRevoke && req.url === "https://oauth2.googleapis.com/revoke") return new MfResponse("unavailable", { status: 503 });
             const body = req.method === "GET" ? undefined : await req.text();
@@ -418,6 +433,25 @@ describe("hosted connector (Cloudflare Worker)", () => {
     // What Google's Branding page needs before the app can be published.
     assert.match(res.text, new RegExp(`${ORIGIN}/privacy`));
     assert.match(res.text, /<code>tester\.workers\.dev<\/code>/);
+    // Each step links to the exact Google Cloud page, with the values to paste beside it.
+    for (const page of ["projectcreate", "apis/library/gmail.googleapis.com", "auth/branding", "auth/scopes", "auth/audience", "auth/clients/create"]) {
+      assert.ok(res.text.includes(`href="https://console.cloud.google.com/${page}" target="_blank"`), page);
+    }
+    assert.match(res.text, /data-copy="https:\/\/www\.googleapis\.com\/auth\/gmail\.modify"/, "the scope, from the connector's own list");
+    assert.match(res.text, /Access blocked/);
+    assert.match(res.text, /7 days/);
+    // Live checks: the client is set, Google accepts it, ALLOWED_EMAILS is set, nobody signed in yet.
+    assert.match(res.text, /class="check ok">[^]*?<b>Google client configured</);
+    assert.match(res.text, /class="check ok">[^]*?<b>Client ID and secret accepted by Google</);
+    assert.match(res.text, /class="check ok">[^]*?<b>ALLOWED_EMAILS set</);
+    assert.match(res.text, /class="check todo">[^]*?<b>Owner signed in</);
+    const asked = clientChecks.at(-1)!;
+    assert.equal(asked.get("client_id"), "google-client-id");
+    assert.equal(asked.get("grant_type"), "authorization_code");
+    assert.equal(asked.get("redirect_uri"), `${ORIGIN}/google/callback`);
+    assert.match(res.text, /href="https:\/\/github\.com\/tester\/newer#setting-up-a-copy-for-a-friend"/);
+    // The Worker's own settings in Cloudflare, found from its address.
+    assert.ok(res.text.includes(`href="https://dash.cloudflare.com/?to=/:account/workers/services/view/gmail-multi-mcp/production/settings"`));
     const privacy = await new Browser(mf).fetch("/privacy");
     assert.equal(privacy.status, 200);
     assert.match(privacy.text, /Privacy policy/);
@@ -1201,10 +1235,27 @@ describe("rate limits (per Worker instance)", () => {
   before(async () => {
     const fake3 = new FakeGmail();
     fake3.addMailbox(PERSONAL, "rt-personal");
-    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL, UPSTREAM_REPO: "tester/same" });
+    // Deployed with the Google values left empty (as the Deploy button allows).
+    mf3 = await startWorker(fake3, { ALLOWED_EMAILS: PERSONAL, UPSTREAM_REPO: "tester/same", GOOGLE_CLIENT_ID: "", GOOGLE_CLIENT_SECRET: "" });
   });
   after(async () => {
     await mf3?.dispose();
+  });
+
+  test("a Worker deployed without the Google values starts, and its setup page says what's missing", async () => {
+    const before = clientChecks.length;
+    const page = await new Browser(mf3).fetch("https://my-mail.friend.workers.dev/");
+    assert.equal(page.status, 200);
+    assert.match(page.text, /class="check todo">[^]*?<b>Google client configured<\/b><span class="detail">GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET aren(&#39;|')t set yet/);
+    assert.match(page.text, /class="check todo">[^]*?<b>Client ID and secret accepted by Google/);
+    assert.equal(clientChecks.length, before, "nothing to ask Google about");
+    // Nothing depends on the Worker's name: the page uses the address it was opened at.
+    assert.ok(page.text.includes("https://my-mail.friend.workers.dev/google/callback"));
+    assert.ok(page.text.includes("<code>friend.workers.dev</code>"));
+    assert.ok(page.text.includes("workers/services/view/my-mail/production/settings"));
+    const signIn = await new Browser(mf3).fetch("https://my-mail.friend.workers.dev/accounts");
+    assert.equal(signIn.status, 503);
+    assert.match(signIn.text, /Open setup page/);
   });
 
   test("no update notice when the running commit is the newest", async () => {
@@ -1245,6 +1296,7 @@ describe("a connector with its settings changed", () => {
     fake4.addMailbox(PERSONAL, "rt-personal");
     mf4 = await startWorker(fake4, {
       ALLOWED_EMAILS: PERSONAL,
+      GOOGLE_CLIENT_ID: "unknown-client-id",
       ALLOWED_REDIRECT_URIS: "https://claude.ai/api/*, https://app.example/cb ,http://localhost/oauth/*, https://bad.example*, not a url",
       UPSTREAM_REPO: "tester/limited",
     });
@@ -1253,10 +1305,23 @@ describe("a connector with its settings changed", () => {
     await mf4?.dispose();
   });
 
-  test("when GitHub's API is rate-limited, the commit feed is used instead", async () => {
-    githubHits.length = 0;
+  test("the setup page says when Google rejects the client, and asks Google at most every 5 minutes", async () => {
+    const before = clientChecks.length;
     const page = await new Browser(mf4).fetch("/");
-    assert.deepEqual(githubHits, ["https://api.github.com/repos/tester/limited/commits/main", "https://github.com/tester/limited/commits/main.atom"]);
+    assert.match(page.text, /class="check ok">[^]*?<b>Google client configured</);
+    assert.match(page.text, /class="check bad">[^]*?<b>Client ID and secret accepted by Google<\/b><span class="detail">Google doesn(&#39;|')t know this Client ID\. Check GOOGLE_CLIENT_ID[^<]*\(Google said invalid_client\.\)/);
+    assert.match(page.text, /<span class="status bad">✗ Rejected by Google<\/span>/);
+    for (let i = 0; i < 3; i++) await new Browser(mf4).fetch("/");
+    assert.equal(clientChecks.length, before + 1, "one call to Google, then the cached answer");
+    // Other pages never ask.
+    await new Browser(mf4).fetch("/privacy");
+    await new Browser(mf4).fetch("/version");
+    assert.equal(clientChecks.length, before + 1);
+  });
+
+  test("when GitHub's API is rate-limited, the commit feed is used instead", async () => {
+    const page = await new Browser(mf4).fetch("/");
+    assert.deepEqual(githubHits.filter((u) => u.includes("tester/limited")), ["https://api.github.com/repos/tester/limited/commits/main", "https://github.com/tester/limited/commits/main.atom"]);
     if (runningCommit !== "unknown") assert.match(page.text, /An update is available/);
   });
 

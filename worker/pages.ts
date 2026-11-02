@@ -1,4 +1,5 @@
 /** Server-rendered HTML for the connector's setup, consent and account pages. */
+import type { ClientCheck } from "./clientCheck.js";
 import type { AccountHealth } from "./health.js";
 import type { UpdateAvailable } from "./version.js";
 
@@ -48,10 +49,26 @@ button.small{min-height:36px;padding:6px 12px;font-size:.9rem}
 .copy code{flex:1;min-width:0;overflow-wrap:anywhere;background:var(--code);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
 .copy button{min-height:auto;padding:6px 12px;font-size:.9rem}
 ol.steps{margin:0;padding-left:22px}
-ol.steps li{margin:14px 0}
-.status{font-weight:600}
+ol.steps>li{margin:18px 0}
+ol.steps>li::marker{font-weight:700}
+.status{font-weight:600;font-size:.9rem;white-space:nowrap}
 .status.ok{color:var(--ok)}
-.status.todo{color:var(--warn)}
+.status.todo,.status.unknown{color:var(--warn)}
+.status.bad{color:var(--bad)}
+h2.part{font-size:1.15rem}
+ul.checks{list-style:none;margin:12px 0 0;padding:0}
+.check{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)}
+.check:first-child{border-top:none}
+.check .mark{flex:none;width:1.6em;height:1.6em;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:.9rem;border:2px solid currentColor}
+.check.ok .mark{color:var(--ok)}
+.check.todo .mark,.check.unknown .mark{color:var(--warn)}
+.check.bad .mark{color:var(--bad)}
+.check .detail{display:block;color:var(--muted);font-size:.9rem;overflow-wrap:anywhere}
+.check.bad .detail{color:var(--bad)}
+a.button.open{min-height:40px;padding:8px 14px;font-size:.95rem}
+.label{margin:10px 0 0}
+.expect{font-size:.93rem;margin-top:10px}
+.unchecked{font-size:.9rem;border-left:3px solid var(--warn);padding:4px 0 4px 10px;color:var(--muted)}
 .notice.update .how{display:block;margin-top:6px}
 .notice a{color:inherit}
 .version{text-align:center;font-size:.8rem}
@@ -133,12 +150,66 @@ export function authorizedDomain(origin: string): string {
   return labels.length > 2 ? labels.slice(1).join(".") : labels.join(".");
 }
 
+/** Google Cloud console pages, one per setup step. Google may add ?project=… or ask which project to use. */
+export const GOOGLE_CONSOLE = {
+  createProject: "https://console.cloud.google.com/projectcreate",
+  gmailApi: "https://console.cloud.google.com/apis/library/gmail.googleapis.com",
+  branding: "https://console.cloud.google.com/auth/branding",
+  scopes: "https://console.cloud.google.com/auth/scopes",
+  audience: "https://console.cloud.google.com/auth/audience",
+  createClient: "https://console.cloud.google.com/auth/clients/create",
+};
+
+/**
+ * The Cloudflare dashboard page with this Worker's variables, when the address shows the Worker's
+ * name (name.subdomain.workers.dev); otherwise the list of Workers.
+ */
+export function cloudflareSettingsUrl(origin: string): string {
+  const labels = new URL(origin).hostname.split(".");
+  if (labels.length === 4 && labels.slice(-2).join(".") === "workers.dev" && /^[a-z0-9-]+$/.test(labels[0])) {
+    return `https://dash.cloudflare.com/?to=/:account/workers/services/view/${labels[0]}/production/settings`;
+  }
+  return "https://dash.cloudflare.com/?to=/:account/workers-and-pages";
+}
+
+type CheckState = "ok" | "todo" | "bad" | "unknown";
+
+const CHECK_MARK: Record<CheckState, string> = { ok: "✓", todo: "○", bad: "✗", unknown: "?" };
+
+/** One live check: a mark, a label, and (unless it passed) what to do. */
+function checkItem(state: CheckState, label: string, detail = ""): string {
+  return `<li class="check ${state}"><span class="mark" aria-hidden="true">${CHECK_MARK[state]}</span><span><b>${escapeHtml(label)}</b>${
+    detail ? `<span class="detail">${escapeHtml(detail)}</span>` : ""
+  }</span></li>`;
+}
+
+/** A step's status chip, beside its heading. */
+const chip = (state: CheckState, text: string) => `<span class="status ${state}">${CHECK_MARK[state]} ${escapeHtml(text)}</span>`;
+
+/** "Open …" link to the exact page a step happens on. */
+const openLink = (href: string, label: string) =>
+  `<p><a class="button open" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)} ↗</a></p>`;
+
+const labelled = (label: string, value: string) => `<p class="muted label">${escapeHtml(label)}</p>${copyRow(value)}`;
+
+/** What the person should see once a step worked. */
+const expect = (text: string) => `<p class="expect"><b>You should see:</b> ${text}</p>`;
+
+/** For steps this page can't check: what goes wrong when they're skipped. */
+const unchecked = (text: string) => `<p class="unchecked">This page can't check this step. ${text}</p>`;
+
 export function statusPage(opts: {
   origin: string;
   googleConfigured: boolean;
+  /** Google's answer about the configured client (absent when none is configured). */
+  clientCheck?: ClientCheck;
   /** Whether ALLOWED_EMAILS is set (its addresses aren't shown: this page is public). */
   allowedEmailsSet: boolean;
   claimed: boolean;
+  /** The scopes the connector asks Google for. */
+  scopes: readonly string[];
+  /** "owner/repo" of the repository with the setup instructions. */
+  upstream: string;
   /** This response's script nonce (the page has copy buttons). */
   nonce: string;
   version: string;
@@ -146,29 +217,100 @@ export function statusPage(opts: {
 }): string {
   const mcpUrl = `${opts.origin}/mcp`;
   const callback = `${opts.origin}/google/callback`;
-  const check = (done: boolean, doneText = "Done", todoText = "To do") =>
-    `<span class="status ${done ? "ok" : "todo"}">${done ? `✓ ${doneText}` : `○ ${todoText}`}</span>`;
-  const body = `${opts.update ? updateNotice(opts.update) : ""}<div class="card"><h1>Your Gmail connector is running</h1>
-<p class="muted">Finish these steps to use it in Claude. This page updates as you go.</p>
+  const check = opts.clientCheck;
+  const accepted: CheckState = !opts.googleConfigured ? "todo" : check?.state === "ok" ? "ok" : check?.state === "bad" ? "bad" : "unknown";
+  const acceptedDetail = !opts.googleConfigured
+    ? "Checked once the client is added (step 7)."
+    : check?.state === "bad"
+      ? `${check.problem} (Google said ${check.code}.)`
+      : check?.state === "unknown"
+        ? `Couldn't check: ${check.reason}`
+        : "";
+  const owner: CheckState = opts.allowedEmailsSet || opts.claimed ? "ok" : "todo";
+  const allDone = opts.googleConfigured && accepted === "ok" && owner === "ok" && opts.claimed;
+  const readme = `https://github.com/${opts.upstream}#setting-up-a-copy-for-a-friend`;
+
+  const body = `${opts.update ? updateNotice(opts.update) : ""}<div class="card"><h1>${allDone ? "Your Gmail connector is ready" : "Your Gmail connector is running"}</h1>
+<p class="muted">${
+    allDone
+      ? "Everything below is done. Manage your linked accounts at any time from the accounts page."
+      : "Finish setting it up from this page: each step links to the exact page in Google Cloud or Cloudflare, with the values to paste beside it. It takes about 15 minutes and works on a phone."
+  }</p>
+<ul class="checks" aria-label="Live checks">
+${checkItem(opts.googleConfigured ? "ok" : "todo", "Google client configured", opts.googleConfigured ? "" : "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET aren't set yet (step 7).")}
+${checkItem(accepted, "Client ID and secret accepted by Google", acceptedDetail)}
+${checkItem(owner, "ALLOWED_EMAILS set", owner === "ok" ? "" : "Required before anyone can sign in (step 8).")}
+${checkItem(opts.claimed ? "ok" : "todo", "Owner signed in", opts.claimed ? "" : "Happens when you connect from Claude (step 9).")}
+</ul>
+<div class="actions"><a class="button" href="/">Check again</a>${opts.claimed ? `<a class="button" href="/accounts">Manage accounts</a>` : ""}</div>
+</div>
+
+<div class="card"><h2 class="part">Part 1 · Google Cloud</h2>
+<p class="muted">Sign in to Google Cloud with any Google account (it doesn't have to be the Gmail you'll link). If a page asks you to select a project, pick the one from step 1.</p>
 <ol class="steps">
-<li><h2>Connect Google ${check(opts.googleConfigured)}</h2>
-<p>First: enable the Gmail API, add the scope <code>https://www.googleapis.com/auth/gmail.modify</code> under <b>Data access</b>, and <b>Publish</b> the app (Audience). See README step 2.</p>
-<p>In Google Cloud's <b>Branding</b> page, under <b>App domain</b>, use these. Google needs them before you can publish the app.</p>
-<p class="muted">Application home page</p>${copyRow(`${opts.origin}/`)}
-<p class="muted">Application privacy policy link</p>${copyRow(`${opts.origin}/privacy`)}
-<p class="muted">Authorized domain</p>${copyRow(authorizedDomain(opts.origin))}
-<p>Then create an OAuth client of type <b>Web application</b> and add this <b>Authorized redirect URI</b>:</p>${copyRow(callback)}
-<p class="muted">Then add its Client ID and Client secret to this Worker as the secrets <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code>.</p></li>
-<li><h2>Say who owns it ${check(opts.allowedEmailsSet || opts.claimed)}</h2>
-<p>In Cloudflare, open this Worker's <b>Settings → Variables and Secrets → Add</b>. Add a variable named</p>${copyRow("ALLOWED_EMAILS")}
+<li><h2>Create a project</h2>
+${openLink(GOOGLE_CONSOLE.createProject, "Open: New project")}
+<p>Give it any name (e.g. <i>Gmail connector</i>) and press <b>Create</b>.</p>
+${expect("a notification that the project was created, and its name in the project picker at the top.")}</li>
+<li><h2>Turn on the Gmail API</h2>
+${openLink(GOOGLE_CONSOLE.gmailApi, "Open: Gmail API")}
+<p>Press <b>Enable</b>.</p>
+${expect("<b>API Enabled</b> on the Gmail API page, and a <b>Manage</b> button where Enable was.")}</li>
+<li><h2>Describe the app (Branding)</h2>
+${openLink(GOOGLE_CONSOLE.branding, "Open: Branding")}
+<p>The first time, press <b>Get started</b>: any app name, your email as support email, Audience <b>External</b>, your email as contact, agree, <b>Create</b>. Then, on the Branding page under <b>App domain</b>, paste these and press <b>Save</b>. Google needs them before you can publish the app (step 5).</p>
+${labelled("Application home page", `${opts.origin}/`)}
+${labelled("Application privacy policy link", `${opts.origin}/privacy`)}
+${labelled("Authorized domains → Add domain", authorizedDomain(opts.origin))}
+${expect("your app name on the Branding page, and these three values after reloading it.")}</li>
+<li><h2>Allow Gmail access (Data access)</h2>
+${openLink(GOOGLE_CONSOLE.scopes, "Open: Data access")}
+<p>Press <b>Add or remove scopes</b>, paste ${opts.scopes.length === 1 ? "this scope" : "these scopes, one at a time,"} under <b>Manually add scopes</b>, press <b>Add to table</b>, then <b>Update</b> and <b>Save</b>.</p>
+${opts.scopes.map((scope) => copyRow(scope)).join("\n")}
+${expect("the Gmail scope under <b>Your restricted scopes</b>.")}
+${unchecked("If the scope is missing, Google can block the sign-in (\"Access blocked\") or leave Gmail access out, and the connector then says Gmail access wasn't granted.")}</li>
+<li><h2>Publish the app (Audience)</h2>
+${openLink(GOOGLE_CONSOLE.audience, "Open: Audience")}
+<p>Press <b>Publish app</b>, then <b>Confirm</b>. You don't need Google's verification for your own use: when you sign in, Google warns that it hasn't verified the app; tap <b>Advanced → Go to …</b>.</p>
+${expect("Publishing status <b>In production</b>.")}
+${unchecked("If the app stays in <b>Testing</b>, Google signs every account out after 7 days (Claude loses access each week until you re-link), and only addresses listed as test users can sign in; everyone else sees \"Access blocked\".")}</li>
+<li><h2>Create the OAuth client</h2>
+${openLink(GOOGLE_CONSOLE.createClient, "Open: Create client")}
+<p>Application type <b>Web application</b>, any name. Under <b>Authorized redirect URIs</b>, press <b>Add URI</b> and paste:</p>
+${copyRow(callback)}
+<p>Press <b>Create</b>.</p>
+${expect("a window with the <b>Client ID</b> and <b>Client secret</b>. Copy both now (or <b>Download JSON</b>): Google shows the secret only once.")}</li>
+</ol></div>
+
+<div class="card"><h2 class="part">Part 2 · Cloudflare</h2>
+<ol class="steps" start="7">
+<li><h2>Give this connector the client ${chip(accepted === "ok" ? "ok" : accepted === "bad" ? "bad" : "todo", accepted === "ok" ? "Accepted by Google" : accepted === "bad" ? "Rejected by Google" : opts.googleConfigured ? "Added" : "To do")}</h2>
+${openLink(cloudflareSettingsUrl(opts.origin), "Open: this Worker's settings")}
+<p>Under <b>Variables and Secrets</b>, press <b>Add</b> (or edit the empty ones the Deploy button made). Type <b>Secret</b>, name:</p>
+${copyRow("GOOGLE_CLIENT_ID")}
+<p>value: the Client ID. Then again, name:</p>
+${copyRow("GOOGLE_CLIENT_SECRET")}
+<p>value: the Client secret. Press <b>Deploy</b> if Cloudflare asks.</p>
+${expect("the first two checks at the top turn ✓ when you reload this page (allow a minute).")}</li>
+<li><h2>Say who owns it ${chip(owner, owner === "ok" ? "Done" : "To do")}</h2>
+<p>If you entered your Gmail address when deploying, this is done. Otherwise add one more variable, named</p>${copyRow("ALLOWED_EMAILS")}
 <p>with your Gmail address as its value (several addresses: separate them with commas), then deploy.</p>
 <p class="muted">Only these Google accounts can sign in. The connector refuses every sign-in until this is set, so nobody else who finds this page can claim it.</p></li>
-<li><h2>Add it to Claude ${check(opts.claimed, "Signed in", "Not signed in yet")}</h2>
-<p>In Claude, open <b>Settings → Connectors → Add custom connector</b> and paste this URL:</p>${copyRow(mcpUrl)}
+</ol></div>
+
+<div class="card"><h2 class="part">Part 3 · Claude</h2>
+<ol class="steps" start="9">
+<li><h2>Add it to Claude ${chip(opts.claimed ? "ok" : "todo", opts.claimed ? "Signed in" : "Not signed in yet")}</h2>
+${openLink("https://claude.ai/settings/connectors", "Open: Claude's connector settings")}
+<p>Press <b>Add custom connector</b>, name it (e.g. <i>Gmail (all accounts)</i>) and paste this URL:</p>${copyRow(mcpUrl)}
 <p class="muted">Then press <b>Connect</b> and sign in with Google, using an address from <code>ALLOWED_EMAILS</code>. The first one to sign in becomes this connector's owner.</p></li>
 <li><h2>Link more Gmail accounts</h2>
-<p>While connecting, tap <b>Link another Gmail account</b> for each extra inbox. You can also manage them any time at:</p>${copyRow(`${opts.origin}/accounts`)}</li>
-</ol></div>${versionFooter(opts.version)}`;
+<p>While connecting, tap <b>Link another Gmail account</b> for each extra inbox. You can also manage them, and give them nicknames like <i>work</i>, at any time at:</p>${copyRow(`${opts.origin}/accounts`)}</li>
+</ol></div>
+
+<div class="card"><h2>Setting up a copy for a friend</h2>
+<p class="muted">Each person runs their own copy, on their own Cloudflare account with their own Google client, so nobody can see anyone else's mail. Send them the instructions: ${link(readme, "Setting up a copy for a friend")}.</p></div>
+${versionFooter(opts.version)}`;
   return layout("Gmail connector setup", body, { nonce: opts.nonce });
 }
 

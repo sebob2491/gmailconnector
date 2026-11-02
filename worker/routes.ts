@@ -19,6 +19,7 @@ import {
   buildAuthUrl,
   exchangeCode,
   fetchProfileEmail,
+  GMAIL_SCOPES,
   pkceChallenge,
   randomToken,
   revokeToken,
@@ -41,7 +42,9 @@ import {
   type Env,
   type GrantProps,
 } from "./owner.js";
-import { build, checkForUpdate, versionJson, versionLabel } from "./version.js";
+import { checkGoogleClient } from "./clientCheck.js";
+import { allowClientCheck } from "./guard.js";
+import { build, checkForUpdate, upstreamRepo, versionJson, versionLabel } from "./version.js";
 import { accountsPage, consentPage, htmlResponse, messagePage, privacyPage, statusPage } from "./pages.js";
 
 const SESSION_COOKIE = "__Host-gmail-connector";
@@ -619,15 +622,24 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
     case "GET /": {
       // The copy buttons' script is the only script on any page; the nonce lets just that one run.
       const nonce = randomToken(16);
+      const client = googleClient(env);
+      const [clientCheck, claimed, update] = await Promise.all([
+        client ? checkGoogleClient(client, `${origin}/google/callback`, () => allowClientCheck(request)) : undefined,
+        isClaimed(env),
+        checkForUpdate(env),
+      ]);
       return htmlResponse(
         statusPage({
           origin,
-          googleConfigured: Boolean(googleClient(env)),
+          googleConfigured: Boolean(client),
+          clientCheck,
           allowedEmailsSet: allowedEmails(env).length > 0,
-          claimed: await isClaimed(env),
+          claimed,
+          scopes: GMAIL_SCOPES,
+          upstream: upstreamRepo(env),
           nonce,
           version: versionLabel(),
-          update: await checkForUpdate(env),
+          update,
         }),
         { nonce },
       );
