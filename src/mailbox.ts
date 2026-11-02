@@ -2035,6 +2035,9 @@ export class Mailbox {
     }
     const addLabelIds = add.map((l) => l.id);
     const removeLabelIds = remove.map((l) => l.id);
+    // Which labels each email had, so the result can say exactly what changed (for undo).
+    const before = await this.labelsBefore(selection, addLabelIds, removeLabelIds);
+    const changes = (count: number) => ({ [LABEL_CHANGES]: this.labelChanges(ids.slice(0, count), addLabelIds, removeLabelIds, before) });
     let changed = 0;
     for (let i = 0; i < ids.length; i += 1000) {
       const chunk = ids.slice(i, i + 1000);
@@ -2054,11 +2057,12 @@ export class Mailbox {
           error: `Stopped after changing ${changed} of ${ids.length} emails: ${(err as Error).message} ${wrongId ? `${WRONG_ACCOUNT_HINT} ` : ""}${finish}`,
           ...extra,
           ...rest.fields,
+          ...changes(changed),
         };
       }
       changed += chunk.length;
     }
-    return { changed, ...extra };
+    return { changed, ...extra, ...changes(changed) };
   }
 
   async trash(kind: "messages" | "threads", id: string, untrash = false) {
@@ -2072,6 +2076,118 @@ export class Mailbox {
     // Listing every message's labels would repeat the same few IDs a hundred times for a long thread.
     const messages = (res.messages ?? []) as ApiMessage[];
     return { id: res.id, messagesChanged: messages.length, labelIds: [...new Set(messages.flatMap((m) => m.labelIds ?? []))] };
+  }
+
+  // ---------- activity log & undo ----------
+
+  /**
+   * What the emails of a bulk change had before it, for labelChanges: "all" when every one of them
+   * is known to need the whole change (a search or thread selection, which only holds emails that
+   * need it, of a one-label change), else their labels read in one batch per 50 emails (up to
+   * LABELS_BEFORE_MAX emails), else undefined (unknown).
+   */
+  private async labelsBefore(selection: Selection, add: string[], remove: string[]): Promise<Map<string, string[]> | "all" | undefined> {
+    const filtered = selection.kind === "threads" || (selection.kind === "query" && selection.resumable);
+    if (filtered && add.length + remove.length === 1) return "all";
+    if (!selection.ids.length || selection.ids.length > LABELS_BEFORE_MAX) return undefined;
+    try {
+      return (await this.labelSnapshot({ messageIds: selection.ids })).labels;
+    } catch {
+      return undefined; // the change itself still runs
+    }
+  }
+
+  /**
+   * The label changes made to `ids`, grouped by what each email actually gained and lost, given what
+   * they had before (see labelsBefore). Emails whose labels weren't known get the whole change,
+   * marked `approximate`.
+   */
+  private labelChanges(ids: string[], add: string[], remove: string[], before: Map<string, string[]> | "all" | undefined): LabelChange[] {
+    const groups = new Map<string, LabelChange>();
+    for (const id of ids) {
+      const had = before instanceof Map ? before.get(id) : undefined;
+      const approximate = before !== "all" && had === undefined;
+      const added = had ? add.filter((l) => !had.includes(l)) : add;
+      const removed = had ? remove.filter((l) => had.includes(l)) : remove;
+      if (!added.length && !removed.length) continue;
+      const key = JSON.stringify([added, removed, approximate]);
+      let group = groups.get(key);
+      if (!group) {
+        group = { account: this.email, messageIds: [], added, removed, ...(approximate ? { approximate } : {}) };
+        groups.set(key, group);
+      }
+      group.messageIds.push(id);
+    }
+    return [...groups.values()];
+  }
+
+  /**
+   * The labels of the given messages and of every message in the given threads (one batch call per
+   * 50 IDs), keyed by message ID, with up to three subjects (`subjects`). IDs that can't be read are
+   * left out.
+   */
+  async labelSnapshot(targets: { messageIds?: string[]; threadIds?: string[] }, opts: { subjects?: boolean } = {}) {
+    const query = opts.subjects ? { format: "metadata", metadataHeaders: ["Subject"] } : { format: "minimal" };
+    const fetched = await this.client.batchGet<ApiMessage & { messages?: ApiMessage[] }>([
+      ...(targets.messageIds ?? []).map((id) => ({ path: `messages/${checkId(id, "message")}`, query })),
+      ...(targets.threadIds ?? []).map((id) => ({ path: `threads/${checkId(id, "thread")}`, query })),
+    ]);
+    const labels = new Map<string, string[]>();
+    const subjects: string[] = [];
+    for (const r of fetched) {
+      if (!r.ok) continue;
+      const messages = r.value.messages ?? [r.value];
+      for (const m of messages) labels.set(m.id, m.labelIds ?? []);
+      const subject = header(messages[0]?.payload, "Subject")?.trim();
+      if (subject && subjects.length < 3 && !subjects.includes(subject)) subjects.push(subject);
+    }
+    return { labels, subjects };
+  }
+
+  /**
+   * Reverses a label change: takes `added` off the emails and puts `removed` back, 1,000 per call.
+   * Gmail refuses a whole call when one email no longer exists (e.g. deleted for good from Trash),
+   * so those are found, left out and listed under `missing`.
+   */
+  async revertLabelChange(change: { messageIds: string[]; added: string[]; removed: string[] }): Promise<{
+    restored: number;
+    missing: string[];
+    notRestored?: number;
+    error?: string;
+  }> {
+    const ids = change.messageIds;
+    const missing: string[] = [];
+    let restored = 0;
+    const modify = (chunk: string[]) =>
+      this.client.request("POST", "messages/batchModify", { json: { ids: chunk, addLabelIds: change.removed, removeLabelIds: change.added } });
+    for (let i = 0; i < ids.length; i += 1000) {
+      let chunk = ids.slice(i, i + 1000);
+      try {
+        await modify(chunk);
+      } catch (err) {
+        const stop = (e: unknown) => ({ restored, missing, notRestored: ids.length - restored - missing.length, error: (e as Error).message });
+        if (!(err instanceof GmailApiError && (err.status === 400 || err.status === 404))) return stop(err);
+        let present: Map<string, string[]>;
+        try {
+          present = (await this.labelSnapshot({ messageIds: chunk })).labels;
+        } catch {
+          return stop(err);
+        }
+        const gone = chunk.filter((id) => !present.has(id));
+        if (!gone.length) return stop(err);
+        missing.push(...gone);
+        chunk = chunk.filter((id) => present.has(id));
+        if (chunk.length) {
+          try {
+            await modify(chunk);
+          } catch (again) {
+            return stop(again);
+          }
+        }
+      }
+      restored += chunk.length;
+    }
+    return { restored, missing };
   }
 }
 
@@ -2116,3 +2232,19 @@ function fitBudget(messages: FormattedMessage[], budget: number): string[] {
   }
   return messages.filter((m) => cut.has(m.id)).map((m) => m.id);
 }
+
+/** Set on bulkModify's result: the label changes it made, per group of emails (not shown to Claude; for undo). */
+export const LABEL_CHANGES = Symbol("labelChanges");
+
+/** Labels added to and removed from some emails of one account, as changed (IDs, not names). */
+export interface LabelChange {
+  account: string;
+  messageIds: string[];
+  added: string[];
+  removed: string[];
+  /** The emails' labels before weren't known: some may have had a label added here, or lacked one removed. */
+  approximate?: boolean;
+}
+
+/** Most emails whose labels a bulk change reads first (one batch call per 50), to record exactly what it changed. */
+const LABELS_BEFORE_MAX = 300;
