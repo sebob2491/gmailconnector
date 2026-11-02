@@ -581,7 +581,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
     });
     assert.equal(init.result.serverInfo.name, "gmail-multi");
     const tools = await mcp("tools/list");
-    assert.equal(tools.result.tools.length, 26);
+    // The catalogue, plus recent_activity and undo_last_change (the hosted connector keeps an activity log).
+    assert.equal(tools.result.tools.length, 28);
 
     const accounts = await callTool("list_accounts");
     assert.deepEqual(accounts.json.accounts.map((a: any) => a.email), [PERSONAL, WORK]);
@@ -654,6 +655,54 @@ describe("hosted connector (Cloudflare Worker)", () => {
     await save(PERSONAL, "");
     assert.equal((await callTool("list_accounts")).json.accounts[0].alias, undefined);
     await save(WORK, "");
+  });
+
+  test("a change Claude makes is one KV write, shown escaped on the accounts page, which can clear it", async () => {
+    const { browser, csrf } = await ownerBrowser();
+    const kv = await mf.getKVNamespace("OAUTH_KV");
+    const logged = async () => JSON.parse(((await kv.get("gmail:history", "text")) as string | null) ?? "[]") as any[];
+    const entriesBefore = (await logged()).length;
+
+    // A read changes nothing and logs nothing.
+    let before = await kvSnapshot(mf);
+    assert.equal((await callTool("search_threads", { account: PERSONAL })).isError, false);
+    assert.deepEqual(await kvSnapshot(mf), before);
+
+    // A change: exactly one write, to the log's one key.
+    const name = `<img src=x onerror="alert(1)">Promos & "deals"`;
+    before = await kvSnapshot(mf);
+    const created = await callTool("create_label", { account: PERSONAL, displayName: name });
+    assert.equal(created.isError, false, created.text);
+    const after = await kvSnapshot(mf);
+    const changed = [...new Set([...before.keys(), ...after.keys()])].filter((k) => before.get(k) !== after.get(k));
+    assert.deepEqual(changed, ["gmail:history"]);
+    const entries = await logged();
+    assert.equal(entries.length, entriesBefore + 1);
+    assert.equal(entries.at(-1).summary, `Created label '${name}'`);
+    assert.deepEqual(entries.at(-1).accounts, [PERSONAL]);
+
+    // Claude can read it back.
+    const recent = await callTool("recent_activity", { limit: 5 });
+    assert.equal(recent.json.entries[0].summary, `Created label '${name}'`);
+
+    // The accounts page shows it, escaped, with the time in UTC.
+    const page = await browser.fetch("/accounts");
+    assert.match(page.text, /<h2>Recent activity<\/h2>/);
+    assert.ok(page.text.includes("Created label &#39;&#60;img src=x onerror=&#34;alert(1)&#34;&#62;Promos &#38; &#34;deals&#34;&#39;"), "escaped");
+    assert.doesNotMatch(page.text, /<img src=x/);
+    assert.match(page.text, /\d{4}-\d\d-\d\d \d\d:\d\d UTC · me\.personal@gmail\.com/);
+    assert.doesNotMatch(page.headers.get("Content-Security-Policy") ?? "", /script-src/, "still no scripts on this page");
+
+    // Clearing needs the session's CSRF token.
+    assert.match((await browser.fetch("/accounts/clear-activity", { form: { csrf: "wrong" } })).text, /Session expired/);
+    assert.equal((await logged()).length, entriesBefore + 1);
+    const cleared = await browser.fetch("/accounts/clear-activity", { form: { csrf } });
+    assert.equal(cleared.status, 303);
+    assert.equal(await kv.get("gmail:history", "text"), null);
+    const empty = await browser.fetch(cleared.location);
+    assert.match(empty.text, /Cleared the activity log/);
+    assert.match(empty.text, /Recent activity<\/h2>[\s\S]*Nothing yet/);
+    assert.doesNotMatch(empty.text, /clear-activity/, "nothing to clear");
   });
 
   test("the accounts page shows the version, and the update notice when not connecting Claude", async () => {
@@ -799,8 +848,8 @@ describe("hosted connector (Cloudflare Worker)", () => {
   test("connecting again doesn't disconnect an earlier connection", async () => {
     const second = await connectAsOwner(firstClientId);
     assert.notEqual(second, accessToken);
-    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 26, "first connection still works");
-    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 26);
+    assert.equal((await mcp("tools/list", {}, accessToken)).result.tools.length, 28, "first connection still works");
+    assert.equal((await mcp("tools/list", {}, second)).result.tools.length, 28);
   });
 
   test("searching five linked accounts stays under Cloudflare's 50-call limit", async () => {

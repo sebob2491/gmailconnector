@@ -26,6 +26,7 @@ import {
 } from "../src/google.js";
 import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal } from "./cookies.js";
 import { checkAccounts } from "./health.js";
+import { historyStore, RECENT_ON_PAGE } from "./historyStore.js";
 import {
   allowedEmails,
   checkNickname,
@@ -478,6 +479,7 @@ function accountsNotice(url: URL) {
     };
   }
   if (q.get("error") === "none") return { kind: "bad" as const, text: "Link at least one Gmail account first." };
+  if (q.get("activity") === "cleared") return { kind: "ok" as const, text: "Cleared the activity log." };
   return undefined;
 }
 
@@ -487,9 +489,11 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
   const rec = await loadOwner(env.OAUTH_KV);
   // One token refresh per account, in parallel, so the page shows which ones need re-linking.
   // Not while connecting Claude: that page is about choosing accounts.
-  const [health, update] = await Promise.all([
+  const [health, update, activity] = await Promise.all([
     checkAccounts(googleClient(env), rec.accounts),
     session.data.request ? undefined : checkForUpdate(env),
+    // One storage read; a log that can't be read just isn't shown.
+    session.data.request ? undefined : historyStore(env).recent(RECENT_ON_PAGE).catch(() => undefined),
   ]);
   return htmlResponse(
     accountsPage({
@@ -503,6 +507,7 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
       version: versionLabel(),
       update,
       repo: build.repo || undefined,
+      activity,
     }),
   );
 }
@@ -571,6 +576,10 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
         await saveOwner(env.OAUTH_KV, rec);
       }
       return redirect(back, undefined, 303);
+    }
+    case "clear-activity": {
+      await historyStore(env).clear();
+      return redirect(`${origin}/accounts?activity=cleared`, undefined, 303);
     }
     case "disconnect": {
       const count = await disconnectClaude(env);
@@ -662,6 +671,7 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
     case "POST /accounts/remove":
     case "POST /accounts/nickname":
     case "POST /accounts/disconnect":
+    case "POST /accounts/clear-activity":
     case "POST /accounts/cancel":
     case "POST /accounts/done":
       return accountsPost(request, env, origin, url.pathname.split("/")[2]);
