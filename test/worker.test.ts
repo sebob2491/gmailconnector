@@ -5,7 +5,10 @@
  */
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { convertV4MiniflareOptions, Miniflare, Request as MfRequest, Response as MfResponse } from "miniflare";
 import { FakeGmail } from "./fakeGmail.js";
@@ -1399,5 +1402,170 @@ describe("a new connector without ALLOWED_EMAILS", () => {
     const refused = await stranger.googleSignIn((await stranger.fetch("/accounts")).location, fake2, STRANGER);
     assert.equal(refused.status, 403);
     assert.match(refused.text, /belongs to someone else/);
+  });
+});
+
+describe("the update-from-upstream workflow's script", () => {
+  const script = resolve(".github/scripts/update-from-upstream.sh");
+  const hasTools = process.platform !== "win32" && spawnSync("git", ["--version"]).status === 0 && spawnSync("bash", ["--version"]).status === 0;
+  let dir = "";
+  let clock = Date.parse("2026-01-01T00:00:00Z");
+  // Each commit a minute after the last, and no settings from this machine.
+  const gitEnv = () => {
+    clock += 60_000;
+    const date = new Date(clock).toISOString();
+    return {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+      GIT_AUTHOR_DATE: date,
+      GIT_COMMITTER_DATE: date,
+    };
+  };
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env: gitEnv(), encoding: "utf8" }).trim();
+  const write = (repo: string, files: Record<string, string>) => {
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(repo, name), text);
+  };
+  const commit = (repo: string, message: string, files: Record<string, string>) => {
+    write(repo, files);
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", message);
+    return git(repo, "rev-parse", "HEAD");
+  };
+  const update = (repo: string, repository: string) => {
+    const res = spawnSync("bash", [script], {
+      cwd: repo,
+      env: { ...gitEnv(), GITHUB_REPOSITORY: repository, UPSTREAM_REPO: "sebob2491/gmailconnector", UPSTREAM_URL: join(dir, "upstream") },
+      encoding: "utf8",
+    });
+    return { status: res.status, out: `${res.stdout}${res.stderr}` };
+  };
+  /** A wrangler config long enough that a change at its end doesn't touch the name line. */
+  const wrangler = (name: string, extra = "") =>
+    ["{", `  "name": "${name}",`, '  "main": "worker/index.ts",', '  "compatibility_date": "2026-09-01",', '  "minify": true,', '  "keep_vars": true,', `  "workers_dev": true${extra}`, "}", ""].join("\n");
+  /** A copy's main branch, as pushed to GitHub. */
+  const pushed = (repo: string) => git(repo, "rev-parse", "origin/main");
+
+  before(() => {
+    if (!hasTools) return;
+    dir = mkdtempSync(join(tmpdir(), "update-from-upstream-"));
+    const upstream = join(dir, "upstream");
+    git(dir, "init", "-q", "-b", "main", upstream);
+    commit(upstream, "First", { "a.txt": "one\ntwo\nthree\n", "wrangler.jsonc": wrangler("gmail-multi-mcp") });
+  });
+  after(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does nothing in the upstream repository itself", { skip: !hasTools }, () => {
+    const res = update(join(dir, "upstream"), "SebOb2491/GmailConnector");
+    assert.equal(res.status, 0, res.out);
+    assert.match(res.out, /This is the upstream repository itself/);
+  });
+
+  test("a fork is fast-forwarded, and pushed without force", { skip: !hasTools }, () => {
+    const upstream = join(dir, "upstream");
+    git(dir, "clone", "-q", "--bare", upstream, "fork.git");
+    git(dir, "clone", "-q", "fork.git", "fork");
+    const fork = join(dir, "fork");
+    assert.match(update(fork, "friend/gmailconnector").out, /Already up to date/);
+    const latest = commit(upstream, "Second", { "a.txt": "one\ntwo\nthree\nfour\n" });
+    const res = update(fork, "friend/gmailconnector");
+    assert.equal(res.status, 0, res.out);
+    git(fork, "fetch", "-q");
+    assert.equal(pushed(fork), latest);
+  });
+
+  test("a fork with its own changes gets a merge; a conflict changes nothing and says why", { skip: !hasTools }, () => {
+    const upstream = join(dir, "upstream");
+    const fork = join(dir, "fork");
+    commit(fork, "My README", { "mine.txt": "my notes\n" });
+    git(fork, "push", "-q", "origin", "HEAD:main");
+    const latest = commit(upstream, "Third", { "b.txt": "new file\n" });
+    let res = update(fork, "friend/gmailconnector");
+    assert.equal(res.status, 0, res.out);
+    git(fork, "fetch", "-q");
+    assert.equal(git(fork, "merge-base", "--is-ancestor", latest, "origin/main"), "");
+    assert.equal(readFileSync(join(fork, "mine.txt"), "utf8"), "my notes\n");
+
+    // Both change the same line.
+    commit(fork, "Mine", { "a.txt": "one\nTWO (mine)\nthree\nfour\n" });
+    git(fork, "push", "-q", "origin", "HEAD:main");
+    const head = git(fork, "rev-parse", "HEAD");
+    commit(upstream, "Theirs", { "a.txt": "one\nTWO (theirs)\nthree\nfour\n" });
+    res = update(fork, "friend/gmailconnector");
+    assert.equal(res.status, 1);
+    assert.match(res.out, /::error::The update from sebob2491\/gmailconnector conflicts with changes made in this copy \(a\.txt\)/);
+    assert.equal(git(fork, "rev-parse", "HEAD"), head);
+    assert.equal(git(fork, "status", "--porcelain"), "", "the working tree is left clean");
+    git(fork, "fetch", "-q");
+    assert.equal(pushed(fork), head, "nothing was pushed");
+  });
+
+  test("a Deploy-button copy (unrelated history) gets the changes as one commit, keeping its own wrangler name", { skip: !hasTools }, () => {
+    const upstream = join(dir, "upstream");
+    const base = git(upstream, "rev-parse", "HEAD");
+    // Cloudflare's copy: the same files in a new repository, with the name the user picked.
+    git(dir, "init", "-q", "--bare", "-b", "main", "copy.git");
+    git(dir, "init", "-q", "-b", "main", "copy");
+    const copy = join(dir, "copy");
+    git(copy, "remote", "add", "origin", join(dir, "copy.git"));
+    for (const name of ["a.txt", "b.txt", "mine.txt"]) {
+      try {
+        writeFileSync(join(copy, name), git(upstream, "show", `${base}:${name}`) + "\n");
+      } catch {
+        // not in upstream
+      }
+    }
+    commit(copy, "Initial commit", { "wrangler.jsonc": wrangler("my-mail") });
+    git(copy, "push", "-q", "origin", "HEAD:main");
+    assert.match(update(copy, "friend/my-mail").out, /Already up to date/, "made from upstream's newest commit");
+
+    const latest = commit(upstream, "Config change", {
+      "wrangler.jsonc": wrangler("gmail-multi-mcp", ',\n  "observability": { "enabled": true }'),
+      "c.txt": "c\n",
+    });
+    let res = update(copy, "friend/my-mail");
+    assert.equal(res.status, 0, res.out);
+    git(copy, "fetch", "-q");
+    assert.equal(pushed(copy), git(copy, "rev-parse", "HEAD"));
+    assert.match(git(copy, "log", "-1", "--format=%B"), new RegExp(`Upstream-Commit: ${latest}`));
+    const config = readFileSync(join(copy, "wrangler.jsonc"), "utf8");
+    assert.match(config, /"name": "my-mail"/);
+    assert.match(config, /"observability"/);
+    assert.equal(readFileSync(join(copy, "c.txt"), "utf8"), "c\n");
+
+    // The next run starts from the recorded commit.
+    assert.match(update(copy, "friend/my-mail").out, /Already up to date/);
+    commit(upstream, "More", { "c.txt": "c2\n" });
+    res = update(copy, "friend/my-mail");
+    assert.equal(res.status, 0, res.out);
+    assert.match(res.out, new RegExp(`Applying the changes from ${latest.slice(0, 7)}`));
+    assert.equal(readFileSync(join(copy, "c.txt"), "utf8"), "c2\n");
+
+    // A conflicting local change: nothing is committed or pushed.
+    commit(copy, "Local", { "c.txt": "mine\n" });
+    git(copy, "push", "-q", "origin", "HEAD:main");
+    const head = git(copy, "rev-parse", "HEAD");
+    commit(upstream, "Clash", { "c.txt": "theirs\n" });
+    res = update(copy, "friend/my-mail");
+    assert.equal(res.status, 1, res.out);
+    assert.match(res.out, /::error::.*conflicts with changes made in this copy/);
+    assert.equal(git(copy, "rev-parse", "HEAD"), head);
+    assert.equal(git(copy, "status", "--porcelain"), "");
+  });
+
+  test("the workflow can't be started by pull requests and takes no input", () => {
+    const workflow = readFileSync(".github/workflows/update-from-upstream.yml", "utf8");
+    const on = /^on:\n((?:  .*\n|\s*\n)+)/m.exec(workflow)?.[1] ?? "";
+    assert.deepEqual(on.match(/^  [a-z_]+:/gm), ["  schedule:", "  workflow_dispatch:"]);
+    assert.doesNotMatch(workflow, /pull_request|inputs:|github\.event\.|github\.head_ref/);
+    assert.match(workflow, /^permissions:\n  contents: write\n/m);
+    assert.doesNotMatch(workflow, /--force|push -f/);
+    assert.match(workflow, /uses: actions\/checkout@[0-9a-f]{40} /, "pinned to a commit");
   });
 });

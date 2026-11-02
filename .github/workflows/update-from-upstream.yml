@@ -1,0 +1,46 @@
+# Keeps a copy of this connector (a fork, or a copy made with the Deploy to Cloudflare button) up to
+# date with the original repository: once a day, or when you press "Run workflow" under Actions.
+# The push it makes is what Cloudflare builds and deploys, so updates go live by themselves.
+#
+# - Does nothing in the original repository itself.
+# - Turn the daily run off: Settings → Secrets and variables → Actions → Variables → New repository
+#   variable AUTO_UPDATE = false (Run workflow still works), or disable the workflow under Actions.
+# - Get updates from somewhere else: repository variable UPSTREAM_REPO = owner/repo.
+#
+# It only runs on a schedule or by hand, never for pull requests, and takes no input.
+name: Update from upstream
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-from-upstream
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # String comparisons in expressions ignore case.
+    if: >-
+      github.repository != (vars.UPSTREAM_REPO || 'sebob2491/gmailconnector') &&
+      (github.event_name == 'workflow_dispatch' || vars.AUTO_UPDATE != 'false')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          fetch-depth: 0
+          # The built-in token can't push changes to workflow files; UPDATE_TOKEN (optional) can.
+          token: ${{ secrets.UPDATE_TOKEN || github.token }}
+      - name: Update main from the original repository
+        # Run from a copy: the update may change the script itself while bash is reading it.
+        run: |
+          cp .github/scripts/update-from-upstream.sh "$RUNNER_TEMP/update-from-upstream.sh"
+          bash "$RUNNER_TEMP/update-from-upstream.sh"
+        env:
+          UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'sebob2491/gmailconnector' }}
