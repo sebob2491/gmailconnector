@@ -512,6 +512,60 @@ describe("hosted connector (Cloudflare Worker)", () => {
     assert.match(refused.text, /`account` is required when sending/);
   });
 
+  test("nicknames set on the accounts page work as the account argument", async () => {
+    const { browser, csrf } = await ownerBrowser();
+    const kv = await mf.getKVNamespace("OAUTH_KV");
+    const save = (email: string, nickname: string, token = csrf) => browser.fetch("/accounts/nickname", { form: { csrf: token, email, nickname } });
+
+    // Like every form on the page, it needs the session's CSRF token.
+    assert.match((await save(WORK, "work", "wrong")).text, /Session expired/);
+    let res = await save(WORK, "  work ");
+    assert.equal(res.status, 303);
+    let page = await browser.fetch(res.location);
+    assert.match(page.text, /class="notice ok">Saved the nickname for me@work\.example/);
+    assert.match(accountRow(page.text, WORK), /name="nickname" value="work"/);
+    assert.match(accountRow(page.text, PERSONAL), /name="nickname" value=""/);
+
+    // Refused: an address, too long, odd characters, "all", or another account's nickname.
+    for (const [nickname, reason] of [
+      ["me@work.example", /letters, digits/],
+      ["x".repeat(33), /letters, digits/],
+      ["<b>", /letters, digits/],
+      ["ALL", /means every account/],
+      ["Work", /already has that nickname/],
+    ] as const) {
+      const before = await kv.get("gmail:owner", "text");
+      res = await save(PERSONAL, nickname);
+      page = await browser.fetch(res.location);
+      assert.match(page.text, /class="notice bad">Nickname not saved for me\.personal@gmail\.com\./, nickname);
+      assert.match(page.text, reason, nickname);
+      assert.equal(await kv.get("gmail:owner", "text"), before, `${nickname}: nothing is written`);
+    }
+    // A made-up error code in the address shows the general rule, not the text of the link.
+    page = await browser.fetch(`/accounts?nickname=x&nickname_error=${encodeURIComponent("Call 555")}`);
+    assert.doesNotMatch(page.text, /Call 555/);
+    assert.equal((await save(PERSONAL, "Personal mail_1")).status, 303);
+
+    // Claude sees them, and can use them instead of the address.
+    const accounts = await callTool("list_accounts");
+    assert.deepEqual(
+      accounts.json.accounts.map((a: any) => [a.email, a.alias]),
+      [[PERSONAL, "Personal mail_1"], [WORK, "work"]],
+    );
+    const search = await callTool("search_threads", { account: "work" });
+    assert.equal(search.isError, false, search.text);
+    assert.deepEqual(search.json.threads.map((t: any) => t.subject), ["Q3 report"]);
+    assert.equal((await callTool("get_thread", { account: "personal mail_1", threadId: "pt1" })).isError, false);
+
+    // Saving the same nickname again writes nothing; an empty one clears it.
+    const before = await kv.get("gmail:owner", "text");
+    assert.equal((await save(WORK, "work")).status, 303);
+    assert.equal(await kv.get("gmail:owner", "text"), before);
+    await save(PERSONAL, "");
+    assert.equal((await callTool("list_accounts")).json.accounts[0].alias, undefined);
+    await save(WORK, "");
+  });
+
   test("attachments are read inside the Worker runtime (PDF and Word)", async () => {
     const personal = fake.mailboxes.find((m) => m.email === PERSONAL)!;
     const attachment = (name: string, type: string, data: Buffer) => [

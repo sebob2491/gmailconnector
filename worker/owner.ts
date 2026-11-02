@@ -273,3 +273,28 @@ export async function recordSignIn(
   if (link || claimed) await saveOwner(env.OAUTH_KV, rec);
   return { ok: true, rec, claimed, linked: link };
 }
+
+/** What a nickname may look like: 1–32 letters, digits, spaces, hyphens or underscores. */
+const NICKNAME_PATTERN = /^[\p{L}\p{N} _-]{1,32}$/u;
+
+export const NICKNAME_ERRORS = {
+  invalid: "A nickname is 1 to 32 letters, digits, spaces, hyphens (-) or underscores (_).",
+  reserved: `"all" means every account, so it can't be a nickname.`,
+  taken: "Another linked account already has that nickname.",
+} as const;
+
+export type NicknameResult = { ok: true; alias?: string } | { ok: false; error: keyof typeof NICKNAME_ERRORS };
+
+/**
+ * Checks a nickname typed on the accounts page for `email`. Empty clears it. A nickname works as
+ * the `account` argument of every tool, so it must not look like an email address, be "all" (which
+ * means every account), or be another account's nickname.
+ */
+export function checkNickname(rec: OwnerRecord, email: string, raw: string): NicknameResult {
+  const alias = raw.trim().replace(/\s+/g, " ");
+  if (!alias) return { ok: true };
+  if (!NICKNAME_PATTERN.test(alias)) return { ok: false, error: "invalid" };
+  if (alias.toLowerCase() === "all") return { ok: false, error: "reserved" };
+  const taken = rec.accounts.some((a) => !sameEmail(a.email, email) && a.alias?.toLowerCase() === alias.toLowerCase());
+  return taken ? { ok: false, error: "taken" } : { ok: true, alias };
+}

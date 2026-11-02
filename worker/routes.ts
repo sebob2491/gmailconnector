@@ -27,7 +27,9 @@ import { clearCookie, cookieNamesWithPrefix, readCookie, seal, setCookie, unseal
 import { checkAccounts } from "./health.js";
 import {
   allowedEmails,
+  checkNickname,
   clientIdAllowed,
+  NICKNAME_ERRORS,
   emailAllowed,
   googleClient,
   GRANT_USER,
@@ -453,6 +455,15 @@ function accountsNotice(url: URL) {
     };
   }
   if (removed) return { kind: "ok" as const, text: `Removed ${removed}.` };
+  const nickname = q.get("nickname");
+  if (nickname) {
+    const error = q.get("nickname_error");
+    if (error !== null) {
+      const reason = Object.hasOwn(NICKNAME_ERRORS, error) ? NICKNAME_ERRORS[error as keyof typeof NICKNAME_ERRORS] : NICKNAME_ERRORS.invalid;
+      return { kind: "bad" as const, text: `Nickname not saved for ${nickname}. ${reason}` };
+    }
+    return { kind: "ok" as const, text: `Saved the nickname for ${nickname}.` };
+  }
   if (disconnected !== null) {
     const n = Number(disconnected) || 0;
     return {
@@ -474,7 +485,7 @@ async function accountsGet(request: Request, env: Env, origin: string): Promise<
   const health = await checkAccounts(googleClient(env), rec.accounts);
   return htmlResponse(
     accountsPage({
-      accounts: rec.accounts.map((a, i) => ({ email: a.email, health: health[i] })),
+      accounts: rec.accounts.map((a, i) => ({ email: a.email, alias: a.alias, health: health[i] })),
       owner: rec.owner,
       csrf: await csrfToken(session.handle),
       notice: accountsNotice(new URL(request.url)),
@@ -533,6 +544,22 @@ async function accountsPost(request: Request, env: Env, origin: string, action: 
         revoked = await revokeToken(account.refreshToken);
       }
       return redirect(`${origin}/accounts?removed=${encodeURIComponent(email)}${revoked ? "" : "&revoked=0"}`, undefined, 303);
+    }
+    case "nickname": {
+      const email = String(form.get("email") ?? "");
+      const rec = await loadOwner(env.OAUTH_KV);
+      const account = rec.accounts.find((a) => sameEmail(a.email, email));
+      if (!account) return redirect(`${origin}/accounts`, undefined, 303);
+      const result = checkNickname(rec, account.email, String(form.get("nickname") ?? "").slice(0, 200));
+      const back = `${origin}/accounts?nickname=${encodeURIComponent(account.email)}`;
+      if (!result.ok) return redirect(`${back}&nickname_error=${result.error}`, undefined, 303);
+      // One storage write per change; saving the same nickname again writes nothing.
+      if ((account.alias ?? "") !== (result.alias ?? "")) {
+        if (result.alias) account.alias = result.alias;
+        else delete account.alias;
+        await saveOwner(env.OAUTH_KV, rec);
+      }
+      return redirect(back, undefined, 303);
     }
     case "disconnect": {
       const count = await disconnectClaude(env);
@@ -607,6 +634,7 @@ export async function handleBrowserRequest(request: Request, env: Env): Promise<
       return accountsGet(request, env, origin);
     case "POST /accounts/link":
     case "POST /accounts/remove":
+    case "POST /accounts/nickname":
     case "POST /accounts/disconnect":
     case "POST /accounts/cancel":
     case "POST /accounts/done":

@@ -21,7 +21,7 @@ Claude: reply          { account: "personal", messageId: "…", body: "Tuesday w
 | Any other tool with no `account` | Uses the only account if just one is linked, or the default (local version: `accounts default …`). Otherwise the tool asks Claude to pick one. |
 | `send_message`, `reply`, `forward` | Always need an explicit `account` when more than one is linked, even if a default is set, so mail is never sent from the wrong address. |
 | IDs (message, thread, draft, label) | Belong to one account. Every result includes its `account`, and a wrong-account lookup returns an error that says so. |
-| `account` values | The account's email address. The local version also accepts an alias you pick (`work`, `personal`, …). |
+| `account` values | The account's email address, or a nickname you pick (`work`, `personal`, …): on the hosted connector's accounts page, or with `accounts alias` in the local version. |
 | Label arguments | Take label IDs **or** display names (e.g. `"Receipts"`), resolved per account. |
 
 ### Differences from the built-in Gmail connector
@@ -171,7 +171,9 @@ Reload the setup page: steps 1 and 2 should now show **✓ Done**.
    **Done — connect to Claude**.
 
 You can add or remove accounts later at `…workers.dev/accounts`. Claude sees the change within a
-minute, without reconnecting. The same page has **Disconnect Claude**, which signs Claude out of the
+minute, without reconnecting. Give each account a **nickname** there (e.g. `work`, `personal`: up to 32
+letters, digits, spaces, `-` or `_`), and Claude can use it instead of the address ("search my work
+inbox"). The same page has **Disconnect Claude**, which signs Claude out of the
 connector everywhere it's connected (your linked accounts stay linked).
 
 That page also checks each account's Google access every time you open it:

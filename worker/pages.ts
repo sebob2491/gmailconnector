@@ -32,6 +32,9 @@ ul.accounts li:first-child{border-top:none}
 .health.bad{color:var(--bad)}
 .health.warn{color:var(--warn)}
 .health .reason{font-weight:400;color:var(--muted)}
+.nickname{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px;font-size:.88rem;color:var(--muted)}
+.nickname label{display:flex;align-items:center;gap:6px}
+.nickname input{width:9.5em;min-height:36px;padding:4px 8px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--text);font:inherit;font-size:.95rem}
 .row-actions{display:flex;align-items:center;gap:4px;flex:none}
 .row-actions form{margin:0}
 button.small{min-height:36px;padding:6px 12px;font-size:.9rem}
@@ -198,7 +201,7 @@ function healthLine(health: AccountHealth | undefined): string {
 }
 
 export function accountsPage(opts: {
-  accounts: { email: string; health?: AccountHealth }[];
+  accounts: { email: string; alias?: string; health?: AccountHealth }[];
   owner?: string;
   csrf: string;
   connecting?: { clientName: string; redirectHost: string };
@@ -206,7 +209,7 @@ export function accountsPage(opts: {
 }): string {
   const csrf = `<input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}">`;
   const rows = opts.accounts
-    .map(({ email, health }) => {
+    .map(({ email, alias, health }) => {
       const owner = opts.owner && email.toLowerCase() === opts.owner.toLowerCase() ? `<span class="tag">owner</span>` : "";
       const emailField = `<input type="hidden" name="email" value="${escapeHtml(email)}">`;
       // Re-linking is the usual link flow, with this address preselected at Google.
@@ -214,7 +217,11 @@ export function accountsPage(opts: {
         health?.state === "relink"
           ? `<form method="post" action="/accounts/link">${csrf}${emailField}<button class="primary small" aria-label="Re-link ${escapeHtml(email)}">Re-link</button></form>`
           : "";
-      return `<li><div class="account"><span class="email">${escapeHtml(email)}${owner}</span>${healthLine(health)}</div>
+      // A nickname ("work", "personal") can be used instead of the address when talking to Claude.
+      const nickname = `<form class="nickname" method="post" action="/accounts/nickname">${csrf}${emailField}
+<label>Nickname <input name="nickname" value="${escapeHtml(alias ?? "")}" maxlength="32" placeholder="e.g. work" autocomplete="off" aria-label="Nickname for ${escapeHtml(email)}"></label>
+<button class="small" aria-label="Save the nickname for ${escapeHtml(email)}">Save</button></form>`;
+      return `<li><div class="account"><span class="email">${escapeHtml(email)}${owner}</span>${healthLine(health)}${nickname}</div>
 <div class="row-actions">${relink}<form method="post" action="/accounts/remove">${csrf}${emailField}
 <button class="link" aria-label="Remove ${escapeHtml(email)}">Remove</button></form></div></li>`;
     })
@@ -241,7 +248,7 @@ ${
   opts.connecting
     ? `<p class="muted">Access goes to <b>${escapeHtml(opts.connecting.redirectHost)}</b>. Every account listed here will be available to Claude.</p>
 <form method="post" action="/accounts/cancel">${csrf}<button class="link">Cancel</button></form>`
-    : `<p class="muted">Changes apply to Claude right away (allow up to a minute).</p>`
+    : `<p class="muted">Changes apply to Claude right away (allow up to a minute). A nickname lets you say "my work account" to Claude instead of the address.</p>`
 }
 </div>
 ${
