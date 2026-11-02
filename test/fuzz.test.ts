@@ -29,11 +29,16 @@ import {
 import { parseBatchResponse } from "../src/gmailClient.js";
 import { unsubscribeOptions } from "../src/mailbox.js";
 import { decodeEntities, escapeHtml, htmlToText, HtmlTextReader, isValidAddress } from "../src/mime.js";
+import { cpuBest, cpuOnce } from "./files.js";
 import { addressInput, batchInput, charsetBytes, CHARSETS, entityInput, htmlInput, messageInput, rng, textInput, unsubscribeInput, type Rng } from "./fuzzGen.js";
 
 /** Cases per target. */
 const CASES = 300;
-/** CPU per case, generously: every case takes a few milliseconds at most. */
+/**
+ * CPU per case, generously: most cases take well under a millisecond, the slowest about 45 ms (the
+ * best of three runs). A case over it is measured again (a warm-up, then the best of three) before
+ * it fails, since a single run on a loaded machine can take many times its usual CPU time.
+ */
 const MAX_MS = 500;
 
 /** C0 control characters that should never reach a result (all but tab and line feed). */
@@ -46,15 +51,12 @@ const CONTROLS = /[\x00-\x08\x0b-\x1f\x7f]/;
 async function fuzz<T>(target: string, gen: (r: Rng) => T, check: (input: T) => unknown, allowed: (new (...args: never[]) => Error)[] = []) {
   for (let seed = 1; seed <= CASES; seed++) {
     const input = gen(rng(seed * 7919 + target.length));
-    const start = process.cpuUsage();
-    try {
-      await check(input);
-    } catch (err) {
-      if (allowed.some((type) => err instanceof type)) continue;
-      throw new Error(`${target}, seed ${seed}: ${(err as Error)?.stack ?? err}`);
+    const r = await cpuOnce(() => check(input));
+    if (r.error !== undefined) {
+      if (allowed.some((type) => r.error instanceof type)) continue;
+      throw new Error(`${target}, seed ${seed}: ${(r.error as Error)?.stack ?? r.error}`);
     }
-    const used = process.cpuUsage(start);
-    const ms = (used.user + used.system) / 1000;
+    const ms = r.ms < MAX_MS ? r.ms : (await cpuBest(() => check(input))).ms;
     assert.ok(ms < MAX_MS, `${target}, seed ${seed}: ${ms.toFixed(0)} ms of CPU`);
   }
 }

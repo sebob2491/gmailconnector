@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { attachmentCharset, attachmentText } from "../src/format.js";
 import { attachmentResult, decodeTextFile, FileTooLargeError, kindOf, officeText, pdfText, readOffice, readPdf, readTextFile, sniffType } from "../src/attachments.js";
-import { cmapOf, docx, docxOf, fontResources, hex4, hexString, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, ttf, xlsx, xlsxOf, zip, zipOf } from "./files.js";
+import { assertCpu, assertLinear, cmapOf, docx, docxOf, fontResources, hex4, hexString, pdf, PdfBuilder, pdfOf, pdfUpdate, png, pptx, refs, ttf, xlsx, xlsxOf, zip, zipOf } from "./files.js";
 
 test("PDF text comes out with line breaks and word spacing", async () => {
   const file = pdf([
@@ -59,54 +59,55 @@ test("text files: UTF-16, BOMs and HTML", () => {
 
 // ---------- size limits and budgets ----------
 
-/** Runs an async call; returns its result (or error) and the CPU milliseconds it used (wall time varies with load). */
-async function timed<T>(fn: () => Promise<T>): Promise<{ value?: T; error?: unknown; ms: number }> {
-  const start = process.cpuUsage();
-  const ms = () => {
-    const used = process.cpuUsage(start);
-    return (used.user + used.system) / 1000;
-  };
-  try {
-    const value = await fn();
-    return { value, ms: ms() };
-  } catch (error) {
-    return { error, ms: ms() };
-  }
-}
+// CPU bounds: assertLinear checks that doubling the input at most about doubles the cost (with a
+// ratio of 1.5: that the cost doesn't grow at all), assertCpu that a call stays under a ceiling at
+// least 10 times its usual cost; both take the best of three runs (see test/files.ts).
 
 /** `count` Word paragraphs, each different so the XML compresses like a real document. */
 const paragraphs = (count: number) =>
   Array.from({ length: count }, (_, i) => `<w:p><w:r><w:t>Paragraph ${i}: the quick brown fox ${i * 7919} jumps.</w:t></w:r></w:p>`).join("");
 
 test("decompression bombs fail fast with a clear error instead of exhausting memory", async () => {
-  const bomb = Buffer.alloc(64 * 1024 * 1024, "a");
+  // Bombs of 32 and 64 MB cost the same: nothing past the limits is unpacked.
+  const MB = 1024 * 1024;
   // Honest sizes: refused from the compression ratio alone, without inflating anything.
-  const honest = await timed(() => readOffice(zipOf([{ name: "word/document.xml", data: bomb }])));
+  const { large: honest } = await assertLinear("honest ZIP bomb", (n) => {
+    const file = zipOf([{ name: "word/document.xml", data: Buffer.alloc(n, "a") }]);
+    return () => readOffice(file);
+  }, 32 * MB, 50, 1.5);
   assert.ok(honest.error instanceof FileTooLargeError, String(honest.error));
   assert.match((honest.error as Error).message, /decompression bomb/);
   // A header that lies about the size: inflating stops at the part limit.
-  const lying = await timed(() => readOffice(zipOf([{ name: "word/document.xml", data: bomb, declaredSize: 2000 }])));
+  const { large: lying } = await assertLinear("lying ZIP bomb", (n) => {
+    const file = zipOf([{ name: "word/document.xml", data: Buffer.alloc(n, "a"), declaredSize: 2000 }]);
+    return () => readOffice(file);
+  }, 32 * MB, 100, 1.5);
   assert.ok(lying.error instanceof FileTooLargeError, String(lying.error));
   // A PDF stream that unpacks to 64 MB is skipped; the rest of the PDF is still read.
-  const b = new PdfBuilder();
-  const text = b.content("BT 72 700 Td (Readable statement text for the account holder.) Tj ET");
-  const huge = b.add("/Filter /FlateDecode", deflateSync(Buffer.alloc(64 * 1024 * 1024, " ")));
-  const page = b.add(`<< /Type /Page /Contents [${refs(text, huge)}] >>`);
-  const pdfBomb = b.build(b.add(`<< /Type /Catalog /Pages ${refs(b.add(`<< /Type /Pages /Kids [${refs(page)}] /Count 1 >>`))} >>`));
-  const read = await timed(() => readPdf(pdfBomb));
+  const { large: read } = await assertLinear("PDF stream bomb", (n) => {
+    const b = new PdfBuilder();
+    const text = b.content("BT 72 700 Td (Readable statement text for the account holder.) Tj ET");
+    const huge = b.add("/Filter /FlateDecode", deflateSync(Buffer.alloc(n, " ")));
+    const page = b.add(`<< /Type /Page /Contents [${refs(text, huge)}] >>`);
+    const file = b.build(b.add(`<< /Type /Catalog /Pages ${refs(b.add(`<< /Type /Pages /Kids [${refs(page)}] /Count 1 >>`))} >>`));
+    return () => readPdf(file);
+  }, 32 * MB, 100, 1.5);
   assert.equal(read.value?.text, "Readable statement text for the account holder.");
   assert.match(read.value?.incomplete ?? "", /too large/);
-  for (const r of [honest, lying, read]) assert.ok(r.ms < 200, `took ${r.ms.toFixed(0)} ms`);
 });
 
 test("readers stop once they have maxChars of text", async () => {
-  // A 13 MB document.xml: only the first part is unpacked for 20,000 characters.
-  const big = docxOf(paragraphs(200_000));
-  const some = await timed(() => readOffice(big, { maxChars: 20_000 }));
+  // A 13 MB document.xml: only the first part is unpacked for 20,000 characters (half the file costs the same).
+  const files = new Map<number, Buffer>();
+  const { large: some } = await assertLinear("docx cut at maxChars", (n) => {
+    const file = docxOf(paragraphs(n));
+    files.set(n, file);
+    return () => readOffice(file, { maxChars: 20_000 });
+  }, 100_000, 50, 1.5);
+  const big = files.get(200_000)!;
   assert.ok(some.value!.text.length >= 20_000);
   assert.equal(some.value!.more, true);
   assert.equal(some.value!.incomplete, undefined);
-  assert.ok(some.ms < 200, `took ${some.ms.toFixed(0)} ms`);
   // Asking for everything still stops at the size limits, and says so.
   const all = await readOffice(big, { maxChars: 0 });
   assert.match(all.incomplete ?? "", /only (its|the) beginning is shown/);
@@ -147,13 +148,16 @@ test("embedded font programs are not read as page text", async () => {
 });
 
 test("hostile PDFs are read in linear time", async () => {
-  const cases = {
-    "a million spaces in one string": pdf([`BT (${"word ".repeat(10)}) Tj (${" ".repeat(1_000_000)}) Tj (end of the line here) Tj ET`]),
-    "20,000 streams without objects": Buffer.from(`%PDF-1.4\n${"stream\nx\nendstream\n".repeat(20_000)}`, "latin1"),
+  // [the file at size n, n, the CPU ceiling in ms for 2n]
+  const cases: Record<string, [(n: number) => Buffer, number, number]> = {
+    "a million spaces in one string": [(n) => pdf([`BT (${"word ".repeat(10)}) Tj (${" ".repeat(n)}) Tj (end of the line here) Tj ET`]), 500_000, 200],
+    "20,000 streams without objects": [(n) => Buffer.from(`%PDF-1.4\n${"stream\nx\nendstream\n".repeat(n)}`, "latin1"), 10_000, 600],
   };
-  for (const [name, file] of Object.entries(cases)) {
-    const r = await timed(() => readPdf(file));
-    assert.ok(r.ms < 200, `${name}: ${r.ms.toFixed(0)} ms`);
+  for (const [name, [build, n, ceiling]] of Object.entries(cases)) {
+    await assertLinear(name, (size) => {
+      const file = build(size);
+      return () => readPdf(file);
+    }, n, ceiling);
   }
 });
 
@@ -231,12 +235,13 @@ test("spreadsheet sheets are named through the workbook's relationships", async 
 });
 
 test("big spreadsheets stop after maxChars, mid-sheet", async () => {
-  const rows = Array.from({ length: 50_000 }, (_, r) => `<row r="${r + 1}"><c r="A${r + 1}" t="inlineStr"><is><t>Customer ${r}</t></is></c><c r="B${r + 1}"><v>${r * 7.25}</v></c></row>`);
-  const file = xlsxOf({ sheets: [{ name: "Big", data: rows.join("") }, { name: "Next", data: "" }] });
-  const r = await timed(() => readOffice(file, { maxChars: 20_000 }));
+  const { large: r } = await assertLinear("xlsx cut at maxChars", (n) => {
+    const rows = Array.from({ length: n }, (_, r) => `<row r="${r + 1}"><c r="A${r + 1}" t="inlineStr"><is><t>Customer ${r}</t></is></c><c r="B${r + 1}"><v>${r * 7.25}</v></c></row>`);
+    const file = xlsxOf({ sheets: [{ name: "Big", data: rows.join("") }, { name: "Next", data: "" }] });
+    return () => readOffice(file, { maxChars: 20_000 });
+  }, 25_000, 50);
   assert.equal(r.value!.more, true);
   assert.ok(r.value!.text.length >= 20_000 && r.value!.text.length < 21_000, String(r.value!.text.length));
-  assert.ok(r.ms < 200, `took ${r.ms.toFixed(0)} ms`);
 });
 
 // ---------- Word and PowerPoint ----------
@@ -476,14 +481,165 @@ test("PDF lines are rebuilt from text positions (Word writes one text object per
   assert.equal((await readPdf(pdf(["BT /F1 12 Tf 72 700 Td (Hello) Tj 28.3 0 Td (World,) Tj 36 0 Td (again and again.) Tj ET"])))!.text, "Hello World, again and again.");
 });
 
-test("filled-in form fields (annotation appearances) are read after the page", async () => {
+test("filled-in form fields (annotation appearances) are read next to their labels", async () => {
   const b = new PdfBuilder();
   const appearance = b.add("/Type /XObject /Subtype /Form /BBox [0 0 200 20] /Filter /FlateDecode", deflateSync(Buffer.from("/Tx BMC BT /Helv 10 Tf 2 5 Td (Jane Q. Applicant) Tj ET EMC")));
   const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
   const field = b.add(`<< /Type /Annot /Subtype /Widget /Rect [150 690 350 710] /AP << /N ${refs(appearance)} >> >>`);
   const box = b.add(`<< /Type /Annot /Subtype /Widget /Rect [150 670 160 680] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`);
   const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (Applicant name:) Tj ET"))} /Annots [${refs(field, box)}] >>`);
-  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Applicant name:\nJane Q. Applicant");
+  // The value's baseline (695) is 5 below the label's, but the label's baseline is the only one inside the field's rect.
+  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Applicant name: Jane Q. Applicant");
+});
+
+/**
+ * A form: labels drawn by the page at the given baselines, each with a text field right after it
+ * (a rect 18 high, from 5 below the baseline; the value 1 below it), plus a check box; the
+ * annotations listed in another order than the page draws its labels.
+ */
+function formFile(rows: { label: string; x?: number; y: number; value?: string; width?: number }[], extra = "") {
+  const b = new PdfBuilder();
+  const content = [`BT /F1 16 Tf 72 740 Td (Application form) Tj ET`];
+  const fields: number[] = [];
+  for (const { label, x = 72, y, value, width = 150 } of rows) {
+    content.push(`BT /F1 12 Tf ${x} ${y} Td (${label}) Tj ET`);
+    // The default font's guessed widths: 6 points per character at 12 points.
+    const left = x + label.length * 6 + 4;
+    if (value !== undefined) fields.push(b.widget([left, y - 5, left + width, y + 13], `BT /Helv 10 Tf 2 4 Td (${value}) Tj ET`));
+  }
+  const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
+  fields.push(b.add(`<< /Type /Annot /Subtype /Widget /FT /Btn /Rect [200 618 210 628] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`));
+  const page = b.add(`<< /Type /Page /MediaBox [0 0 612 792] /Contents ${refs(b.content(content.join("\n")))} /Annots [${refs(fields.reverse())}]${extra} >>`);
+  return b.build(pageTree(b, [page]));
+}
+
+const FORM = [
+  { label: "Name:", y: 700, value: "Sebastian" },
+  { label: "Date:", y: 680, value: "2024-01-05" },
+  { label: "City:", y: 660, value: "Springfield", width: 120 },
+  { label: "Zip:", x: 300, y: 660, value: "12345", width: 60 },
+  { label: "Subscribe to updates", y: 620 },
+  { label: "Amount due:", y: 600, value: "$120.00" },
+];
+
+test("form field values land on their labels' lines, after the label, in reading order", async () => {
+  // Before, the values followed the page's text, in the order the annotations were listed:
+  // "Application form\n\nName:\nDate:\nCity:\tZip:\n\nSubscribe to updates\nAmount due:\n$120.00\n12345\nSpringfield\n2024-01-05\nSebastian".
+  assert.equal(
+    (await readPdf(formFile(FORM)))!.text,
+    "Application form\n\nName: Sebastian\nDate: 2024-01-05\nCity: Springfield\tZip: 12345\n\nSubscribe to updates\nAmount due: $120.00",
+  );
+  // A field without a label of its own (its own line, at its height), and an empty one.
+  const rows = [...FORM.slice(0, 2), { label: "", y: 660, value: "Second address line" }, { label: "Phone:", y: 580, value: "" }];
+  assert.equal((await readPdf(formFile(rows)))!.text, "Application form\n\nName: Sebastian\nDate: 2024-01-05\nSecond address line\n\nPhone:");
+});
+
+test("form fields between lines, over several lines, and on turned pages", async () => {
+  // A field whose rect lies between two lines (crossing neither baseline) is a line of its own between them.
+  {
+    const b = new PdfBuilder();
+    const field = b.widget([150, 674, 400, 690], "BT /Helv 10 Tf 2 5 Td (In between) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (The line above) Tj 0 -40 Td (The line below) Tj ET"))} /Annots [${refs(field)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "The line above\nIn between\nThe line below");
+  }
+  // Boxes that sit on the label's line (their rect starts just above its baseline, as LibreOffice draws them): the values
+  // are 6.5 points above the labels' baselines, which still lie within the font size of the rects.
+  {
+    const b = new PdfBuilder();
+    const name = b.widget([110, 702.5, 300, 716.3], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET");
+    const date = b.widget([110, 682.5, 300, 696.3], "BT /Helv 10 Tf 2 4 Td (2024-01-05) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 700 Td (Name:) Tj 0 -20 Td (Date:) Tj ET"))} /Annots [${refs(name, date)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Name: Sebastian\nDate: 2024-01-05");
+  }
+  // A multi-line text field: its first line joins the label's, the others follow that line, before the next label, wherever
+  // they are; here a tall box whose label sits on its bottom line.
+  {
+    const b = new PdfBuilder();
+    const field = b.widget([140, 602.5, 400, 660], "BT /Helv 10 Tf 12 TL 2 47 Td (First line of the comment) Tj T* (the second line) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 680 Td (Notes) Tj 0 -80 Td (Comments:) Tj 0 -30 Td (Signature:) Tj ET"))} /Annots [${refs(field)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Notes\n\nComments: First line of the comment\nthe second line\n\nSignature:");
+  }
+  // A multi-line text field: its first line joins the label's, the others follow, before the next label.
+  {
+    const b = new PdfBuilder();
+    const field = b.widget([140, 450, 400, 510], "BT /Helv 10 Tf 12 TL 2 49 Td (First line of the comment) Tj T* (the second line) Tj T* (and the third.) Tj ET");
+    const page = b.add(`<< /Type /Page /Contents ${refs(b.content("BT /F1 12 Tf 72 500 Td (Comments:) Tj 0 -70 Td (Signature:) Tj ET"))} /Annots [${refs(field)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Comments: First line of the comment\nthe second line\nand the third.\n\nSignature:");
+  }
+  // A page turned with /Rotate 90 whose text runs up the page (drawn rotated), and fields whose appearances are rotated
+  // by their /Matrix: read as the upright page.
+  {
+    const b = new PdfBuilder();
+    // Text space (x, y) is page space (612 - y, x).
+    const content = "q 0 1 -1 0 612 0 cm BT /F1 12 Tf 72 500 Td (Name:) Tj 0 -20 Td (Date:) Tj ET Q";
+    const rotated = { bbox: [0, 0, 150, 18], matrix: [0, 1, -1, 0, 0, 0] };
+    const name = b.widget([612 - 513, 106, 612 - 495, 256], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET", rotated);
+    const date = b.widget([612 - 493, 106, 612 - 475, 256], "BT /Helv 10 Tf 2 4 Td (2024-01-05) Tj ET", rotated);
+    const page = b.add(`<< /Type /Page /MediaBox [0 0 612 792] /Rotate 90 /Contents ${refs(b.content(content))} /Annots [${refs(date, name)}] >>`);
+    assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, "Name: Sebastian\nDate: 2024-01-05");
+  }
+});
+
+test("text fields whose appearance shows nothing are read from their values (/V), as LibreOffice writes them", async () => {
+  const b = new PdfBuilder();
+  // LibreOffice's appearances are empty (it sets /NeedAppearances, so viewers draw the values); its boxes sit on the text line.
+  const empty = () => b.add("/Type /XObject /Subtype /Form /BBox [0 0 180 13.8]", Buffer.from("/Tx BMC\nEMC\n"));
+  const field = (y: number, entries: string, appearance = refs(empty())) =>
+    b.add(`<< /Type /Annot /Subtype /Widget /Rect [110 ${y + 2.5} 290 ${y + 16.3}] ${entries}${appearance ? ` /AP << /N ${appearance} >>` : ""} >>`);
+  const utf16 = (text: string) => `<FEFF${hexString([...text].map((c) => c.charCodeAt(0))).slice(1, -1)}>`;
+  // A field's entries can come from its parent field (the widget is then one of the field's kids).
+  const parent = b.add(`<< /FT /Tx /T (date) /V ${utf16("2024-01-05")} /DA (/Helv 10 Tf 0 g) >>`);
+  const shown = b.add("/Type /XObject /Subtype /Form /BBox [0 0 180 13.8]", Buffer.from("BT /Helv 10 Tf 2 4 Td (Shown value) Tj ET"));
+  const annots = [
+    field(700, `/FT /Tx /T (name) /V ${utf16("Sebastian")} /DA (0 0 0 rg /He 10 Tf)`),
+    field(680, `/Parent ${refs(parent)}`),
+    field(660, "/FT /Tx /T (pin) /Ff 8192 /V (1234)"), // a password field: left out
+    field(640, "/FT /Tx /T (city) /V (Caf\\351) /DA (/Helv 0 Tf)", ""), // no appearance at all; PDFDocEncoding; "auto" size
+    field(620, "/FT /Tx /T (shown) /V (stale value)", refs(shown)), // the appearance wins
+    b.add(`<< /Type /Annot /Subtype /Widget /Rect [110 562.5 400 606] /FT /Tx /Ff 4096 /V (First line of the comment\\rthe second line) /DA (/Helv 10 Tf) /AP << /N ${refs(empty())} >> >>`),
+  ];
+  const content = [["Name:", 700], ["Date:", 680], ["PIN:", 660], ["City:", 640], ["Shown:", 620], ["Comments:", 560]].map(([label, y]) => `BT /F1 12 Tf 72 ${y} Td (${label}) Tj ET`);
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content(content.join("\n")))} /Annots [${refs(annots)}] >>`);
+  assert.equal(
+    (await readPdf(b.build(pageTree(b, [page]))))!.text,
+    "Name: Sebastian\nDate: 2024-01-05\nPIN:\nCity: Café\nShown: Shown value\n\nComments: First line of the comment\nthe second line",
+  );
+});
+
+test("pages whose annotations draw no text keep their drawing order", async () => {
+  // Lines drawn bottom first, with a link and a check box: as before, in drawing order (not sorted by position).
+  const b = new PdfBuilder();
+  const content = "BT /F1 12 Tf 72 600 Td (Drawn first, at the bottom.) Tj 0 100 Td (Drawn second, at the top.) Tj ET";
+  const link = b.add("<< /Type /Annot /Subtype /Link /Rect [72 595 300 615] /A << /S /URI /URI (https://example.com) >> >>");
+  const checkbox = b.add("/Type /XObject /Subtype /Form /BBox [0 0 10 10]", Buffer.from("BT /ZaDb 8 Tf (4) Tj ET"));
+  const box = b.add(`<< /Type /Annot /Subtype /Widget /Rect [50 600 60 610] /AS /Yes /AP << /N << /Yes ${refs(checkbox)} >> >> >>`);
+  const page = b.add(`<< /Type /Page /Contents ${refs(b.content(content))} /Annots [${refs(link, box)}] >>`);
+  const expected = "Drawn first, at the bottom.\n\nDrawn second, at the top.";
+  assert.equal((await readPdf(b.build(pageTree(b, [page]))))!.text, expected);
+  assert.equal((await readPdf(pdf([content])))!.text, expected);
+  // Past 20,000 pieces to place (runs, or runs that follow each other), a page with a filled-in field is read in drawing order:
+  // the value after the page.
+  const c = new PdfBuilder();
+  const field = c.widget([150, 695, 350, 713], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET");
+  const many = c.add(`<< /Type /Page /Contents ${refs(c.content(`BT /F1 12 Tf 72 700 Td (Name:) Tj ET BT /F1 12 Tf 72 500 Td ${"(x) Tj 40 0 Td ".repeat(20_000)}ET`))} /Annots [${refs(field)}] >>`);
+  assert.equal((await readPdf(c.build(pageTree(c, [many])), { maxChars: 0 }))!.text, `Name:\n\n${Array(20_000).fill("x").join("\t")}\nSebastian`);
+});
+
+test("placing form fields by position stays cheap: 480 fields, and the most runs sorted", async () => {
+  // 480 fields in columns of 60, and a check box (of the 500 annotations read per page): the count is bounded, so is the cost.
+  const file = formFile(Array.from({ length: 480 }, (_, i) => ({ label: `F${i}:`, y: 710 - (i % 60) * 11, x: 20 + Math.floor(i / 60) * 72, value: `v${i}`, width: 30 })));
+  const r = await assertCpu("480 form fields", () => readPdf(file, { maxChars: 0 }), 1000);
+  assert.match(r.value!.text, /^Application form\n\nF0: v0\tF60: v60\t[^\n]* F420: v420\nF1: v1\tF61: v61\t/);
+  // About 10,000 and 20,000 runs far apart (each a piece of its own: 20,000 is the most placed by position) on a page with a field.
+  const { large: runs } = await assertLinear("runs with a field", (n) => {
+    const c = new PdfBuilder();
+    const field = c.widget([150, 695, 350, 713], "BT /Helv 10 Tf 2 4 Td (Sebastian) Tj ET");
+    const lines = Array.from({ length: n / 10 }, (_, i) => `1 0 0 1 72 ${690 - (i % 60) * 10} Tm ${"(ab) Tj 40 0 Td ".repeat(10)}`).join("\n");
+    const page = c.add(`<< /Type /Page /Contents ${refs(c.content(`BT /F1 12 Tf 72 700 Td (Name:) Tj ${lines} ET`))} /Annots [${refs(field)}] >>`);
+    const file = c.build(pageTree(c, [page]));
+    return () => readPdf(file, { maxChars: 0 });
+  }, 9_990, 300);
+  assert.match(runs.value!.text, /^Name:\tSebastian\n(ab)+\t(ab)+\t/);
 });
 
 test("PDFs whose page tree can't be used are read in file order", async () => {
@@ -511,57 +667,87 @@ test("forms with underscore lines count as readable", async () => {
 });
 
 test("crafted page trees and object streams stay fast", async () => {
-  const cases: Record<string, Buffer> = {};
-  // A page tree nested 5,000 levels deep.
-  {
-    const b = new PdfBuilder();
-    let node = textPage(b, "Deep inside a very deep page tree, still readable.");
-    for (let i = 0; i < 5000; i++) node = b.add(`<< /Type /Pages /Kids [${refs(node)}] /Count 1 >>`);
-    cases["deep tree"] = b.build(b.add(`<< /Type /Catalog /Pages ${refs(node)} >>`));
-  }
-  // A tree whose nodes list themselves and each other as kids.
-  {
-    const b = new PdfBuilder();
-    const page = textPage(b, "The only real page in a cyclic page tree.");
-    const a = b.reserve();
-    const c = b.reserve();
-    b.set(a, `<< /Type /Pages /Kids [${refs(a, c, page, a)}] /Count 1 >>`);
-    b.set(c, `<< /Type /Pages /Kids [${refs(a, c)}] /Count 1 >>`);
-    cases["cyclic tree"] = b.build(b.add(`<< /Type /Catalog /Pages ${refs(a)} >>`));
-  }
-  // Kids arrays with 200,000 entries: the same page over and over, and pages that don't exist.
-  {
-    const b = new PdfBuilder();
-    const page = textPage(b, "One page listed two hundred thousand times.");
-    cases["huge Kids, one page"] = b.build(pageTree(b, Array(200_000).fill(page)));
-    const m = new PdfBuilder();
-    const real = textPage(m, "A real page before many missing ones, in the file.");
-    cases["huge Kids, missing pages"] = m.build(pageTree(m, [real].concat(Array.from({ length: 200_000 }, (_, i) => 10_000 + i))));
-  }
-  // 20,000 pages, all but the first without text (they are listed as one line).
-  {
-    const b = new PdfBuilder();
-    const pages = [textPage(b, "First of twenty thousand mostly empty pages.")];
-    for (let i = 1; i < 20_000; i++) pages.push(b.add("<< /Type /Page >>"));
-    cases["20,000 pages"] = b.build(pageTree(b, pages));
-  }
-  // 3,000 object streams (more than are indexed: read in file order) and 1,500 (indexed).
-  for (const count of [3000, 1500]) {
-    const b = new PdfBuilder();
-    const page = textPage(b, "A page whose file has very many object streams.");
-    const parts = [b.build(pageTree(b, [page]))];
-    for (let i = 0; i < count; i++) {
-      const data = deflateSync(Buffer.from(`${50_000 + i} 0 << /Junk ${i} >>`));
-      parts.push(Buffer.from(`${20_000 + i} 0 obj\n<< /Type /ObjStm /N 1 /First 8 /Filter /FlateDecode /Length ${data.length} >>\nstream\n`, "latin1"), data, Buffer.from("\nendstream\nendobj\n"));
-    }
-    cases[`${count} object streams`] = Buffer.concat(parts);
-  }
-  for (const [name, file] of Object.entries(cases)) {
-    const r = await timed(() => readPdf(file));
-    assert.ok(r.ms < 200, `${name}: ${r.ms.toFixed(0)} ms`);
-    assert.ok(r.value?.text, `${name}: no text`);
+  // [the file at size n, n, the CPU ceiling in ms for 2n]
+  const cases: Record<string, [(n: number) => Buffer, number, number]> = {
+    // A page tree nested 5,000 levels deep.
+    "deep tree": [
+      (n) => {
+        const b = new PdfBuilder();
+        let node = textPage(b, "Deep inside a very deep page tree, still readable.");
+        for (let i = 0; i < n; i++) node = b.add(`<< /Type /Pages /Kids [${refs(node)}] /Count 1 >>`);
+        return b.build(b.add(`<< /Type /Catalog /Pages ${refs(node)} >>`));
+      },
+      2500,
+      150,
+    ],
+    // A tree whose nodes list themselves and each other as kids, n times.
+    "cyclic tree": [
+      (n) => {
+        const b = new PdfBuilder();
+        const page = textPage(b, "The only real page in a cyclic page tree.");
+        const a = b.reserve();
+        const c = b.reserve();
+        b.set(a, `<< /Type /Pages /Kids [${refs(a, c, page, a)}${` ${refs(a, c)}`.repeat(n)}] /Count 1 >>`);
+        b.set(c, `<< /Type /Pages /Kids [${refs(a, c)}] /Count 1 >>`);
+        return b.build(b.add(`<< /Type /Catalog /Pages ${refs(a)} >>`));
+      },
+      50_000,
+      1200,
+    ],
+    // Kids arrays with 200,000 entries: the same page over and over, and pages that don't exist.
+    "huge Kids, one page": [
+      (n) => {
+        const b = new PdfBuilder();
+        const page = textPage(b, "One page listed two hundred thousand times.");
+        return b.build(pageTree(b, Array(n).fill(page)));
+      },
+      100_000,
+      1200,
+    ],
+    "huge Kids, missing pages": [
+      (n) => {
+        const m = new PdfBuilder();
+        const real = textPage(m, "A real page before many missing ones, in the file.");
+        return m.build(pageTree(m, [real].concat(Array.from({ length: n }, (_, i) => 10_000 + i))));
+      },
+      100_000,
+      2000,
+    ],
+    // 20,000 pages, all but the first without text (they are listed as one line).
+    "20,000 pages": [
+      (n) => {
+        const b = new PdfBuilder();
+        const pages = [textPage(b, "First of twenty thousand mostly empty pages.")];
+        for (let i = 1; i < n; i++) pages.push(b.add("<< /Type /Page >>"));
+        return b.build(pageTree(b, pages));
+      },
+      10_000,
+      1400,
+    ],
+    // 1,000 and 2,000 object streams (indexed); 3,000 and 6,000 (more than are indexed: read in file order).
+    "object streams, indexed": [(n) => objectStreams(n), 1000, 600],
+    "object streams, past the index": [(n) => objectStreams(n), 3000, 600],
+  };
+  for (const [name, [build, n, ceiling]] of Object.entries(cases)) {
+    const { small, large } = await assertLinear(name, (size) => {
+      const file = build(size);
+      return () => readPdf(file);
+    }, n, ceiling);
+    assert.ok(small.value?.text && large.value?.text, `${name}: no text`);
   }
 });
+
+/** A file with one text page and `count` object streams. */
+function objectStreams(count: number): Buffer {
+  const b = new PdfBuilder();
+  const page = textPage(b, "A page whose file has very many object streams.");
+  const parts = [b.build(pageTree(b, [page]))];
+  for (let i = 0; i < count; i++) {
+    const data = deflateSync(Buffer.from(`${50_000 + i} 0 << /Junk ${i} >>`));
+    parts.push(Buffer.from(`${20_000 + i} 0 obj\n<< /Type /ObjStm /N 1 /First 8 /Filter /FlateDecode /Length ${data.length} >>\nstream\n`, "latin1"), data, Buffer.from("\nendstream\nendobj\n"));
+  }
+  return Buffer.concat(parts);
+}
 
 // ---------- PDF fonts ----------
 
@@ -704,50 +890,57 @@ test("hostile ToUnicode CMaps stay fast and bounded", async () => {
   const letters = Array.from({ length: 26 }, (_, i) => [hex4(0x161 + i), hex4(0x61 + i)] as [string, string]);
   letters.push([hex4(0x120), "0020"]);
   const sentence = (offset: number) => hexString([..."the quick brown fox jumps over the lazy dog"].map((ch) => ch.charCodeAt(0) + offset));
-  const cases: Record<string, { cmap: string; codes: string }> = {
+  // Each CMap is built with n and 2n of its entries (the first read, which warms up the parser, isn't counted).
+  const cases: Record<string, { cmap: (n: number) => string; n: number; ceiling: number; codes: string }> = {
     "100,000 bfchar entries": {
-      cmap: cmapOf({ bfchar: [...letters, ...Array.from({ length: 100_000 }, (_, i) => [hex4(0x1000 + (i % 0xe000)), "0041"] as [string, string])] }),
+      cmap: (n) => cmapOf({ bfchar: [...letters, ...Array.from({ length: n }, (_, i) => [hex4(0x1000 + (i % 0xe000)), "0041"] as [string, string])] }),
+      n: 50_000,
+      ceiling: 300,
       codes: sentence(0x100),
     },
     // Each range maps every code c to U+0001 + c (so the letters still come out right); the mappings kept are capped.
     "a bfrange over every code, 1,000 times": {
-      cmap: cmapOf({ bfchar: letters, bfrange: Array.from({ length: 1000 }, () => ["0000", "FFFF", "0001"] as [string, string, string]) }),
+      cmap: (n) => cmapOf({ bfchar: letters, bfrange: Array.from({ length: n }, () => ["0000", "FFFF", "0001"] as [string, string, string]) }),
+      n: 500,
+      ceiling: 200,
       codes: sentence(-1),
     },
     "ranges with lo > hi and over 65,536 codes": {
-      cmap: cmapOf({
-        bfchar: letters,
-        bfrange: [
-          ["FFFF", "0000", "0041"],
-          ["00000000", "7FFFFFFF", "0041"],
-          ["0100", "0010", "0042"],
-        ],
-      }),
+      cmap: (n) =>
+        cmapOf({
+          bfchar: letters,
+          bfrange: Array.from({ length: n }, () => [
+            ["FFFF", "0000", "0041"],
+            ["00000000", "7FFFFFFF", "0041"],
+            ["0100", "0010", "0042"],
+          ] as [string, string, string][]).flat(),
+        }),
+      n: 10_000,
+      ceiling: 100,
       codes: sentence(0x100),
     },
     "damaged syntax": {
-      cmap: cmapOf({ bfchar: letters, junk: "beginbfrange <01> [ <02> endbfrange <<< ]] /x (stray) 42 ] [ >> <0102> <01> /uni0041 beginbfchar" }),
+      cmap: (n) => cmapOf({ bfchar: letters, junk: "beginbfrange <01> [ <02> endbfrange <<< ]] /x (stray) 42 ] [ >> <0102> <01> /uni0041 beginbfchar ".repeat(n) }),
+      n: 5000,
+      ceiling: 150,
       codes: sentence(0x100),
     },
   };
-  for (const [name, { cmap, codes }] of Object.entries(cases)) {
-    const file = pdf([`BT /F1 12 Tf 72 700 Td ${codes} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap) }) }));
-    // The first read includes warming up the parser (about 30 ms here for 100,000 entries); the best of the next few is what it costs.
-    const cold = await timed(() => readPdf(file));
-    let warm = Infinity;
-    for (let i = 0; i < 3; i++) warm = Math.min(warm, (await timed(() => readPdf(file))).ms);
-    assert.equal(cold.value?.text, "the quick brown fox jumps over the lazy dog", name);
-    assert.ok(cold.ms < 200, `${name}: ${cold.ms.toFixed(0)} ms`);
-    assert.ok(warm < 50, `${name}: ${warm.toFixed(0)} ms warm`);
+  for (const [name, { cmap, n, ceiling, codes }] of Object.entries(cases)) {
+    const { small, large } = await assertLinear(name, (size) => {
+      const file = pdf([`BT /F1 12 Tf 72 700 Td ${codes} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap(size)) }) }));
+      return () => readPdf(file);
+    }, n, ceiling);
+    assert.equal(small.value?.text, "the quick brown fox jumps over the lazy dog", name);
+    assert.equal(large.value?.text, "the quick brown fox jumps over the lazy dog", name);
   }
   // A CMap that inflates to 3 MB is past the limit: its font is unreadable, the page (and the rest) is still read, with no note.
   const huge = cmapOf({ bfchar: letters, junk: "% ".padEnd(3 * 1024 * 1024, "x") });
   const file = pdf([`q BT /F1 12 Tf ET Q BT 72 700 Td (Readable text in the default font.) Tj ET BT /F1 12 Tf 72 680 Td ${sentence(0x100)} Tj ET`], [], (b) => ({
     F1: b.type0Font({ toUnicode: b.cmap(huge) }),
   }));
-  const r = await timed(() => readPdf(file));
+  const r = await assertCpu("3 MB CMap", () => readPdf(file), 50);
   assert.equal(r.value, undefined);
-  assert.ok(r.ms < 100, `3 MB CMap: ${r.ms.toFixed(0)} ms`);
   const unused = pdf(["q BT /F1 12 Tf ET Q BT 72 700 Td (Readable text in the default font.) Tj ET"], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(huge) }) }));
   assert.deepEqual(await readPdf(unused), { text: "Readable text in the default font." });
 });
@@ -809,10 +1002,9 @@ test("damaged or oversized font programs never fail a page", async () => {
   };
   for (const [name, fontFile] of Object.entries(programs)) {
     const file = pdf([`BT /F1 12 Tf 72 700 Td ${text} Tj ET`], [], (b) => ({ F1: b.type0Font({ toUnicode: b.cmap(cmap), fontFile }) }));
-    const r = await timed(() => readPdf(file));
+    const r = await assertCpu(name, () => readPdf(file), 50);
     assert.equal(r.error, undefined, name);
     assert.equal(r.value?.text, "AC".repeat(12), name);
-    assert.ok(r.ms < 100, `${name}: ${r.ms.toFixed(0)} ms`);
   }
 });
 
@@ -831,48 +1023,58 @@ test("text after a form XObject keeps its place, whatever the form's length", as
 
 test("a content stream shared by many pages is decoded once, and reading stops within the budgets", async () => {
   // 3,000 pages share one stream that unpacks to 8 MB: it is inflated once, read a few times (the byte budget), then the file is cut.
-  const b = new PdfBuilder();
-  const stream = b.add("/Filter /FlateDecode", deflateSync(Buffer.from(`BT /F1 12 Tf 72 720 Td (shared content stream text) Tj ET\n${"% padding comment line\n".repeat(350_000)}`)));
-  const pages = Array.from({ length: 3000 }, () => b.add(`<< /Type /Page /Contents ${refs(stream)} >>`));
-  const shared = await timed(() => readPdf(b.build(pageTree(b, pages))));
+  const stream = deflateSync(Buffer.from(`BT /F1 12 Tf 72 720 Td (shared content stream text) Tj ET\n${"% padding comment line\n".repeat(350_000)}`));
+  const { large: shared } = await assertLinear("shared stream", (n) => {
+    const b = new PdfBuilder();
+    const contents = b.add("/Filter /FlateDecode", stream);
+    const pages = Array.from({ length: n }, () => b.add(`<< /Type /Page /Contents ${refs(contents)} >>`));
+    const file = b.build(pageTree(b, pages));
+    return () => readPdf(file);
+  }, 1500, 1000);
   assert.match(shared.value!.text, /^--- Page 1 ---\nshared content stream text/);
   assert.match(shared.value!.incomplete ?? "", /too large/);
-  assert.ok(shared.ms < 400, `shared stream: ${shared.ms.toFixed(0)} ms`);
   // One page whose /Contents array names the same small stream 20,000 times.
-  const c = new PdfBuilder();
-  const small = c.content("BT /F1 12 Tf 72 720 Td (again) Tj ET");
-  const page = c.add(`<< /Type /Page /Contents [${refs(Array(20_000).fill(small))}] >>`);
-  const repeated = await timed(() => readPdf(c.build(pageTree(c, [page])), { maxChars: 20_000 }));
+  const { large: repeated } = await assertLinear("repeated stream", (n) => {
+    const c = new PdfBuilder();
+    const small = c.content("BT /F1 12 Tf 72 720 Td (again) Tj ET");
+    const page = c.add(`<< /Type /Page /Contents [${refs(Array(n).fill(small))}] >>`);
+    const file = c.build(pageTree(c, [page]));
+    return () => readPdf(file, { maxChars: 20_000 });
+  }, 10_000, 200);
   assert.match(repeated.value!.text, /^(again){100}/);
-  assert.ok(repeated.ms < 200, `repeated stream: ${repeated.ms.toFixed(0)} ms`);
 });
 
 test("PDFs missing their endobj keywords are indexed in linear time", async () => {
-  const b = new PdfBuilder();
-  const pages = Array.from({ length: 5000 }, (_, i) => textPage(b, `Page ${i} of a file whose endobj keywords are gone.`));
-  const file = Buffer.from(b.build(pageTree(b, pages)).toString("latin1").replaceAll("endobj", "      "), "latin1");
-  const r = await timed(() => readPdf(file, { maxChars: 20_000 }));
+  const { large: r } = await assertLinear("no endobj", (n) => {
+    const b = new PdfBuilder();
+    const pages = Array.from({ length: n }, (_, i) => textPage(b, `Page ${i} of a file whose endobj keywords are gone.`));
+    const file = Buffer.from(b.build(pageTree(b, pages)).toString("latin1").replaceAll("endobj", "      "), "latin1");
+    return () => readPdf(file, { maxChars: 20_000 });
+  }, 2500, 500);
   assert.match(r.value!.text, /Page 0 of a file/);
-  assert.ok(r.ms < 300, `no endobj: ${r.ms.toFixed(0)} ms`);
   // A million headers (no bodies) are given up on quickly: the file is read in file order instead (no text).
-  const headers = await timed(() => readPdf(Buffer.from(`%PDF-1.4\n${"1 0 obj\n".repeat(1_000_000)}`)));
+  const { large: headers } = await assertLinear("headers", (n) => {
+    const file = Buffer.from(`%PDF-1.4\n${"1 0 obj\n".repeat(n)}`);
+    return () => readPdf(file);
+  }, 500_000, 4000);
   assert.equal(headers.value, undefined);
-  assert.ok(headers.ms < 300, `headers: ${headers.ms.toFixed(0)} ms`);
 });
 
 test("content streams built to amplify (nested parentheses, escapes, hex starts, huge TJ arrays) stay cheap", async () => {
-  const cases: Record<string, string> = {
-    "4 MB of '('": `BT (${"(".repeat(4_000_000)}) Tj ET`,
-    "4 MB of escapes": `BT (${"\\n".repeat(2_000_000)}) Tj ET`,
-    "1M hex starts": `BT ${"<4".repeat(1_000_000)} ET`,
-    "a TJ array of 1M elements": `BT /F1 12 Tf 72 720 Td [${"(a)-1".repeat(500_000)}] TJ ET`,
+  // Each is built at half and at full size: [the content at size n, n, the CPU ceiling in ms for 2n]
+  const cases: Record<string, [(n: number) => string, number, number]> = {
+    "4 MB of '('": [(n) => `BT (${"(".repeat(n)}) Tj ET`, 2_000_000, 500],
+    "4 MB of escapes": [(n) => `BT (${"\\n".repeat(n)}) Tj ET`, 1_000_000, 1500],
+    "1M hex starts": [(n) => `BT ${"<4".repeat(n)} ET`, 500_000, 200],
+    "a TJ array of 1M elements": [(n) => `BT /F1 12 Tf 72 720 Td [${"(a)-1".repeat(n)}] TJ ET`, 250_000, 400],
   };
-  for (const [name, content] of Object.entries(cases)) {
-    const file = pdf([`BT /F1 12 Tf 72 700 Td (Readable text before the trap in this file.) Tj ET\n${content}`]);
-    const r = await timed(() => readPdf(file));
+  for (const [name, [content, n, ceiling]] of Object.entries(cases)) {
+    const { large: r } = await assertLinear(name, (size) => {
+      const file = pdf([`BT /F1 12 Tf 72 700 Td (Readable text before the trap in this file.) Tj ET\n${content(size)}`]);
+      return () => readPdf(file);
+    }, n, ceiling);
     assert.equal(r.error, undefined, name);
     assert.match(r.value?.text ?? "", /^Readable text before the trap/, name);
-    assert.ok(r.ms < 400, `${name}: ${r.ms.toFixed(0)} ms`);
   }
   // Past the token budget, a file is cut with a note rather than read on.
   const b = new PdfBuilder();
@@ -885,26 +1087,34 @@ test("content streams built to amplify (nested parentheses, escapes, hex starts,
 
 test("spreadsheets with huge runs of empty rows or cells are read in linear time", async () => {
   // 100,000 empty rows, then text: one line says so (as for missing rows).
-  const rows = await timed(() => readOffice(xlsxOf({ sheets: [{ name: "S", data: `${'<row r="1"/>'.repeat(1).replace('r="1"', 'r="1"')}${Array.from({ length: 100_000 }, (_, i) => `<row r="${i + 1}"/>`).join("")}<row r="100001"><c t="inlineStr"><is><t>text</t></is></c></row>` }] })));
+  const { large: rows } = await assertLinear("empty rows", (n) => {
+    const file = xlsxOf({ sheets: [{ name: "S", data: `${Array.from({ length: n }, (_, i) => `<row r="${i + 1}"/>`).join("")}<row r="${n + 1}"><c t="inlineStr"><is><t>text</t></is></c></row>` }] });
+    return () => readOffice(file);
+  }, 50_000, 500);
   assert.equal(rows.value!.text, "--- Sheet: S ---\n(rows 1–100000 are empty)\ntext");
-  assert.ok(rows.ms < 150, `empty rows: ${rows.ms.toFixed(0)} ms`);
   // 40,000 empty cells, then text: the text lands in Excel's last column.
-  const cells = await timed(() => readOffice(xlsxOf({ sheets: [{ name: "S", data: `<row r="1">${"<c/>".repeat(40_000)}<c t="inlineStr"><is><t>text</t></is></c></row>` }] })));
+  const { large: cells } = await assertLinear("empty cells", (n) => {
+    const file = xlsxOf({ sheets: [{ name: "S", data: `<row r="1">${"<c/>".repeat(n)}<c t="inlineStr"><is><t>text</t></is></c></row>` }] });
+    return () => readOffice(file);
+  }, 100_000, 200);
   assert.equal(cells.value!.text, `--- Sheet: S ---\n${"\t".repeat(16_383)}text`);
-  assert.ok(cells.ms < 150, `empty cells: ${cells.ms.toFixed(0)} ms`);
-  // A Word table row of 625 cells spanning 64 columns each, then text.
-  const row = `<w:tbl><w:tr>${'<w:tc><w:tcPr><w:gridSpan w:val="64"/></w:tcPr></w:tc>'.repeat(625)}<w:tc><w:p><w:r><w:t>text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`;
-  const table = await timed(() => readOffice(docxOf(row)));
+  // A Word table row of 2,000 cells spanning 64 columns each, then text.
+  const { large: table } = await assertLinear("table row", (n) => {
+    const file = docxOf(`<w:tbl><w:tr>${'<w:tc><w:tcPr><w:gridSpan w:val="64"/></w:tcPr></w:tc>'.repeat(n)}<w:tc><w:p><w:r><w:t>text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`);
+    return () => readOffice(file);
+  }, 1000, 100);
   assert.equal(table.value!.text, "text"); // the row's leading tabs are leading white space of the document
-  assert.ok(table.ms < 150, `table row: ${table.ms.toFixed(0)} ms`);
 });
 
 test("number format codes are read in linear time, and only so far", async () => {
-  for (const [code, shown] of [["[".repeat(100_000), "45000"], ["[h".repeat(50_000), "00:00"], ['"'.repeat(1_000_000), "45000"]]) {
-    const file = xlsxOf({ sheets: [{ name: "S", data: '<row r="1"><c s="1"><v>45000</v></c></row>' }], styles: `<numFmts><numFmt numFmtId="164" formatCode="${code.replace(/"/g, "&quot;")}"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs>` });
-    const r = await timed(() => readOffice(file));
-    assert.equal(r.value!.text, `--- Sheet: S ---\n${shown}`);
-    assert.ok(r.ms < 100, `${code.slice(0, 2)}…: ${r.ms.toFixed(0)} ms`);
+  for (const [unit, n, shown, ceiling] of [["[", 500_000, "45000", 50], ["[h", 250_000, "00:00", 50], ['"', 500_000, "45000", 500]] as const) {
+    const { small, large } = await assertLinear(`format code ${unit}…`, (size) => {
+      const code = unit.repeat(size);
+      const file = xlsxOf({ sheets: [{ name: "S", data: '<row r="1"><c s="1"><v>45000</v></c></row>' }], styles: `<numFmts><numFmt numFmtId="164" formatCode="${code.replace(/"/g, "&quot;")}"/></numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs>` });
+      return () => readOffice(file);
+    }, n, ceiling);
+    assert.equal(small.value!.text, `--- Sheet: S ---\n${shown}`);
+    assert.equal(large.value!.text, `--- Sheet: S ---\n${shown}`);
   }
 });
 
@@ -947,9 +1157,11 @@ test("a stray closing tag in Word markup doesn't hide the text after it", async 
 });
 
 test("a million character references in a Word document are decoded cheaply", async () => {
-  const r = await timed(() => readOffice(docxOf(`<w:p><w:r><w:t>${"&#x41;".repeat(1_000_000)}&#x1F600;&amp;&#65;&bogus;&#xZZ;</w:t></w:r></w:p>`)));
+  const { large: r } = await assertLinear("entities", (n) => {
+    const file = docxOf(`<w:p><w:r><w:t>${"&#x41;".repeat(n)}&#x1F600;&amp;&#65;&bogus;&#xZZ;</w:t></w:r></w:p>`);
+    return () => readOffice(file);
+  }, 500_000, 700);
   assert.equal(r.value!.text, `${"A".repeat(1_000_000)}😀&A&bogus;&#xZZ;`);
-  assert.ok(r.ms < 300, `entities: ${r.ms.toFixed(0)} ms`);
 });
 
 test("HTML attachments are converted only up to 4 MB, whatever maxChars asks", () => {

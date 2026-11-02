@@ -22,6 +22,7 @@ import {
 import { Base64UrlData, buildMime, decodeBase64, decodeEntities, encodeHeaderValue, htmlToText, HtmlTextReader } from "../src/mime.js";
 import { attachmentDataOf } from "../src/mailbox.js";
 import { parseHeaders, parseMime } from "./fakeGmail.js";
+import { assertLinear } from "./files.js";
 
 test("ASCII headers pass through; non-ASCII becomes short encoded-words that round-trip", () => {
   assert.equal(encodeHeaderValue("Hello there"), "Hello there");
@@ -225,7 +226,7 @@ function referenceEntities(text: string): string {
   });
 }
 
-test("decodeEntities finds references exactly as the regex it replaces did, without allocating per unknown name", () => {
+test("decodeEntities finds references exactly as the regex it replaces did, without allocating per unknown name", async () => {
   let seed = 7;
   const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
   const tokens = ["&", "#", "x", "X", ";", "=", " ", "0", "1", "9", "a", "f", "F", "z", "amp", "lt", "gt", "quot", "nbsp", "copy", "reg", "AMP", "eacute", "Eacute", "hearts", "bogus", "constructor", "1F600", "128512", "99999999", "123456789", "a".repeat(33), "é", "&amp;", "&#x41;"];
@@ -239,11 +240,11 @@ test("decodeEntities finds references exactly as the regex it replaces did, with
     assert.equal(decodeEntities(text), referenceEntities(text), text);
   }
   // 2 MB of unknown names: the same text back, quickly (the regex version ran out of memory at the Worker's limit).
-  const unknown = "&a".repeat(1024 * 1024);
-  const start = process.cpuUsage();
-  assert.equal(decodeEntities(unknown), unknown);
-  const used = process.cpuUsage(start);
-  assert.ok((used.user + used.system) / 1000 < 200);
+  const { large } = await assertLinear("unknown entity names", (n) => {
+    const unknown = "&a".repeat(n);
+    return () => decodeEntities(unknown);
+  }, 512 * 1024, 1000);
+  assert.equal(large.value, "&a".repeat(1024 * 1024));
 });
 
 test("htmlToText keeps link addresses, including unusual ones", () => {
@@ -270,35 +271,36 @@ test("malformed %-escapes and unpaired surrogates never make link or filename ha
   assert.match(raw, /filename\*=UTF-8''report%EF%BF%BD\.pdf/);
 });
 
-test("htmlToText stays fast on hostile HTML", () => {
-  const inputs = {
-    "unclosed attributes": '<a href="x" '.repeat(20_000),
-    "unclosed links": '<a href="x">'.repeat(20_000),
-    "unterminated comments": "<!--".repeat(50_000),
-    "unterminated styles": "<style>".repeat(50_000),
-    "stray brackets": "<x ".repeat(50_000),
-    "long space run": `a${" ".repeat(200_000)}b`,
-    "no-break space run": `a${"&nbsp;".repeat(50_000)}b`,
-    "unclosed quotes": '<x a="'.repeat(50_000),
+test("htmlToText stays fast on hostile HTML", async () => {
+  // [the HTML at size n, n, the CPU ceiling in ms for 2n]
+  const inputs: Record<string, [(n: number) => string, number, number]> = {
+    "unclosed attributes": [(n) => '<a href="x" '.repeat(n), 100_000, 400],
+    "unclosed links": [(n) => '<a href="x">'.repeat(n), 10_000, 150],
+    "unterminated comments": [(n) => "<!--".repeat(n), 250_000, 100],
+    "unterminated styles": [(n) => "<style>".repeat(n), 250_000, 50],
+    "stray brackets": [(n) => "<x ".repeat(n), 100_000, 100],
+    "long space run": [(n) => `a${" ".repeat(n)}b`, 2_000_000, 150],
+    "no-break space run": [(n) => `a${"&nbsp;".repeat(n)}b`, 100_000, 400],
+    "unclosed quotes": [(n) => '<x a="'.repeat(n), 100_000, 200],
   };
-  for (const [name, html] of Object.entries(inputs)) {
-    const start = process.cpuUsage();
-    htmlToText(html);
-    const used = process.cpuUsage(start);
-    const ms = (used.user + used.system) / 1000;
-    assert.ok(ms < 200, `${name}: ${ms.toFixed(0)} ms of CPU`);
+  for (const [name, [html, n, ceiling]] of Object.entries(inputs)) {
+    await assertLinear(name, (size) => {
+      const input = html(size);
+      return () => htmlToText(input);
+    }, n, ceiling);
   }
 });
 
-test("runs of '<' that start no tag are text, converted in one piece", () => {
+test("runs of '<' that start no tag are text, converted in one piece", async () => {
   assert.equal(htmlToText("<p>if a < b and 1<2 << 3 <= 4</p><pre>x <1\n< y</pre>"), "if a < b and 1<2 << 3 <= 4\n\nx <1\n< y");
   const stray = "<".repeat(4 * 1024 * 1024);
   const heap = process.memoryUsage().heapUsed;
-  const start = process.cpuUsage();
   assert.equal(htmlToText(stray).length, stray.length);
-  const used = process.cpuUsage(start);
-  assert.ok((used.user + used.system) / 1000 < 250, "CPU");
   assert.ok(process.memoryUsage().heapUsed - heap < 48 * 1024 * 1024, "one part per run, not one per '<'");
+  await assertLinear("runs of '<'", (n) => {
+    const input = "<".repeat(n);
+    return () => htmlToText(input);
+  }, 2 * 1024 * 1024, 1300);
 });
 
 test("attachment content given as a data: URL is accepted", () => {
@@ -463,7 +465,7 @@ function referenceMailboxes(value: string): { name?: string; address: string }[]
   return out;
 }
 
-test("address headers parse as before, in linear time, up to 64 KB", () => {
+test("address headers parse as before, in linear time, up to 64 KB", async () => {
   let seed = 11;
   const random = () => ((seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32);
   const tokens = ["a@b.c", "x", " ", "<", ">", "(", ")", '"', "\\", ",", ";", ":", "@", "Doe, J", "<j@x.y>", "(c)", '"q\\"q"', "é", "\r\n "];
@@ -474,13 +476,28 @@ test("address headers parse as before, in linear time, up to 64 KB", () => {
     assert.deepEqual(parseAddressList(header), referenceAddressList(header), JSON.stringify(header));
     assert.deepEqual(parseMailboxes(header), referenceMailboxes(header), JSON.stringify(header));
   }
-  for (const header of ["<".repeat(1024 * 1024) + ">", "(".repeat(1024 * 1024) + "a@b.c", '"'.repeat(1024 * 1024), "x ".repeat(512 * 1024) + "<a@b.c>", "a@b.c, ".repeat(150_000)]) {
-    const start = process.cpuUsage();
-    parseMailboxes(header);
-    parseAddressList(header);
-    recipientsFrom(header);
-    const used = process.cpuUsage(start);
-    assert.ok((used.user + used.system) / 1000 < 50, `${JSON.stringify(header.slice(0, 6))}: ${(used.user + used.system) / 1000} ms`);
+  // Built with about n characters, parsed ten times (to measure more than a millisecond): linear within the 64 KB
+  // that are read, and at 512 KB and 1 MB.
+  const headers: Record<string, (n: number) => string> = {
+    "<<<": (n) => "<".repeat(n) + ">",
+    "(((": (n) => "(".repeat(n) + "a@b.c",
+    '"""': (n) => '"'.repeat(n),
+    "x x x": (n) => "x ".repeat(n / 2) + "<a@b.c>",
+    "a@b.c, ": (n) => "a@b.c, ".repeat(Math.round(n / 7)),
+  };
+  for (const [name, header] of Object.entries(headers)) {
+    const parse = (n: number) => {
+      const input = header(n);
+      return () => {
+        for (let i = 0; i < 10; i++) {
+          parseMailboxes(input);
+          parseAddressList(input);
+          recipientsFrom(input);
+        }
+      };
+    };
+    await assertLinear(`${name} within 64 KB`, parse, 30_000, 1000);
+    await assertLinear(`${name} past 64 KB`, parse, 512 * 1024, 1000);
   }
   // Only the first 64 KB is read, and no address is cut in two there.
   const list = Array.from({ length: 5000 }, (_, i) => `person${i}@example.com`).join(", ");
@@ -502,11 +519,11 @@ test("cleanBody keeps the spaces that indent a line, and collapses other runs", 
   assert.equal(cleanBody("    \n  \n  code\n"), "code");
 });
 
-test("cleanBody stays fast on long runs of tabs and spaces", () => {
-  const start = process.cpuUsage();
-  cleanBody(`a${"\t".repeat(200_000)}b\n${" \t".repeat(100_000)}c`);
-  const used = process.cpuUsage(start);
-  assert.ok((used.user + used.system) / 1000 < 200);
+test("cleanBody stays fast on long runs of tabs and spaces", async () => {
+  await assertLinear("tabs and spaces", (n) => {
+    const input = `a${"\t".repeat(2 * n)}b\n${" \t".repeat(n)}c`;
+    return () => cleanBody(input);
+  }, 500_000, 400);
 });
 
 /** The decoded body of each leaf part, by Content-Type, from a message built by buildMime. */
@@ -566,29 +583,39 @@ test("long filenames use RFC 2231 continuations and long subjects stay within li
   assert.equal(headers.find((h) => h.name === "Subject")!.value, `https://example.com/${"a".repeat(980)}`);
 });
 
-test("huge file names, subjects and attached emails from a forwarded email cost little", () => {
-  const timed = (build: () => string) => {
-    const start = process.cpuUsage();
-    const raw = build();
-    const used = process.cpuUsage(start);
-    assert.ok((used.user + used.system) / 1000 < 150, `${(used.user + used.system) / 1000} ms`);
+test("huge file names, subjects and attached emails from a forwarded email cost little", async () => {
+  /** Times building at n and 2n; returns the message built at 2n, checking its line lengths. */
+  const timed = async (name: string, build: (n: number) => () => string, n: number, ceiling = 50) => {
+    const raw = (await assertLinear(name, build, n, ceiling)).large.value!;
     for (const line of raw.split("\r\n")) assert.ok(line.length <= 998, `line of ${line.length}`);
     return raw;
   };
-  const named = timed(() => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("x"), filename: `${"é".repeat(1024 * 1024)}.pdf` }] }));
+  const named = await timed("file name", (n) => {
+    const filename = `${"é".repeat(n)}.pdf`;
+    return () => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("x"), filename }] });
+  }, 512 * 1024);
   const pdf = leafBodies(named).find((l) => l.type === "application/octet-stream")!;
   const filename = /filename="([^"]*)"/.exec(pdf.headers.find((h) => h.name === "Content-Disposition")!.value)![1];
   assert.equal(filename, `${"é".repeat(251)}.pdf`, "cut to 255 characters, keeping the extension");
-  const subject = timed(() => buildMime({ to: ["a@example.com"], subject: "ab ".repeat(400_000), text: "x" }));
+  const subject = await timed("subject", (n) => {
+    const text = "ab ".repeat(n);
+    return () => buildMime({ to: ["a@example.com"], subject: text, text: "x" });
+  }, 200_000);
   assert.equal(parseHeaders(subject.slice(0, subject.indexOf("\r\n\r\n"))).find((h) => h.name === "Subject")!.value.length, 1000);
   // A MIME type that isn't one is sent as application/octet-stream.
-  const typed = timed(() => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("x"), filename: "a.bin", mimeType: `x/${"y".repeat(5000)}` }] }));
+  const typed = await timed("MIME type", (n) => {
+    const mimeType = `x/${"y".repeat(n)}`;
+    return () => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("x"), filename: "a.bin", mimeType }] });
+  }, 2500);
   assert.match(typed, /Content-Type: application\/octet-stream; name="a\.bin"/);
   const csv = buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: Buffer.from("a,b"), filename: "a.csv", mimeType: 'text/csv; charset="utf-8"' }] });
   assert.match(csv, /Content-Type: text\/csv; charset="utf-8"; name="a\.csv"/, "parameters are kept");
   // Attached emails over 2 MB go as base64, without the 7-bit copies.
-  const eml = Buffer.from(("a".repeat(70) + "\n").repeat(40_000));
-  assert.match(timed(() => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: eml, filename: "m.eml", mimeType: "message/rfc822" }] })), /message\/rfc822[^]*Content-Transfer-Encoding: base64/);
+  const forwarded = await timed("attached email", (n) => {
+    const eml = Buffer.from(("a".repeat(70) + "\n").repeat(n));
+    return () => buildMime({ to: ["a@example.com"], text: "x", attachments: [{ content: eml, filename: "m.eml", mimeType: "message/rfc822" }] });
+  }, 30_000, 100);
+  assert.match(forwarded, /message\/rfc822[^]*Content-Transfer-Encoding: base64/);
 });
 
 test("addresses with control or invisible characters are refused", () => {
@@ -798,14 +825,16 @@ test("only the start of a long body is read, and it reads exactly like the start
   for (const [size, max] of [[2_000_000, 20_000], [200_000, 20_000], [30_000, 20_000], [30_000, 0], [200_000, 3_000]]) {
     const msg = htmlMessage(newsletter(size));
     const all = await formatMessage(msg, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: 0 });
-    const cpu = process.cpuUsage();
     const out = await formatMessage(msg, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: max });
-    const used = process.cpuUsage(cpu);
     assert.equal(out.plaintextBody, max ? limitLength(all.plaintextBody!, max).text : all.plaintextBody, `${size} characters, limit ${max}`);
     if (!max || all.plaintextBody!.length <= max) assert.equal(out.truncated, undefined, "a body within the limit is all there");
     else if (size > 100_000) assert.equal(out.truncated, "Body shortened; the rest is available with maxBodyChars: 0.");
-    assert.ok((used.user + used.system) / 1000 < 100, `${size}: ${(used.user + used.system) / 1000} ms`);
   }
+  // Reading the start of a 2 MB body costs no more than reading the start of a 1 MB one.
+  await assertLinear("start of a long body", (n) => {
+    const msg = htmlMessage(newsletter(n));
+    return () => formatMessage(msg, "PLAIN_TEXT", "me@example.com", none, { shortenLinks: true, maxBodyChars: 20_000 });
+  }, 1_000_000, 50, 1.5);
   // Plain text too, without a link cut at the point where reading stopped.
   const text = ("Read https://click.example.com/" + "y".repeat(300) + " now.\n").repeat(400);
   const plain = { id: "m", threadId: "t", payload: { partId: "", mimeType: "text/plain", headers: [], body: { size: text.length, data: Buffer.from(text).toString("base64url") } } };
